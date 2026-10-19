@@ -71,6 +71,13 @@ jobs:
           Write-Host "MSBuild: $msb"
           "path=$msb" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
+      - name: Sanity check - list driver tree
+        shell: pwsh
+        run: |
+          Write-Host "workspace = $env:GITHUB_WORKSPACE"
+          Get-ChildItem "$env:GITHUB_WORKSPACE\driver" -Recurse -Depth 2 |
+            Select-Object -ExpandProperty FullName | Select-Object -First 40
+
       - name: Build solution (Release x64)
         id: build
         shell: pwsh
@@ -79,13 +86,21 @@ jobs:
           $cfg = "${{ github.event.inputs.configuration }}"
           if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg = "Release" }
           $msb = "${{ steps.msbuild.outputs.path }}"
-          & $msb driver\WomicVirtualMic.sln `
-              /p:Configuration=$cfg /p:Platform=x64 `
-              /p:WindowsTargetPlatformVersion=10.0.26100.0 `
-              /m /nologo /v:minimal `
-              /flp:logfile=build.log;verbosity=detailed
-          Write-Host "MSBuild exit code: $LASTEXITCODE"
-          "exit=$LASTEXITCODE" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $sln = Join-Path $env:GITHUB_WORKSPACE "driver\WomicVirtualMic.sln"
+          if (-not (Test-Path $sln)) {
+            Write-Host "!!! sln 不存在: $sln"
+            "exit=99" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 99
+          }
+          Write-Host "编译: $sln"
+          & $msb $sln `
+              "/p:Configuration=$cfg" "/p:Platform=x64" `
+              "/p:WindowsTargetPlatformVersion=10.0.26100.0" `
+              "/m" "/nologo" "/v:minimal" `
+              "/flp:logfile=build.log;verbosity=detailed"
+          $code = $LASTEXITCODE
+          Write-Host "MSBuild exit code: $code"
+          "exit=$code" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Show build log tail on failure
         if: steps.build.outputs.exit != '0'

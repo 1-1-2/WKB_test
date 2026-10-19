@@ -28,20 +28,27 @@ install_manifest.txt
 compile_commands.json
 
 # ---- IDE / 编辑器 ----
+# 注意：*.sln 与 *.vcxproj* 是 WDK 驱动工程的**源文件**，必须入库，
+#       一旦忽略会导致 CI 报 MSB1009 "Project file does not exist"。
+#       这里只忽略 IDE 产生的用户私有文件。
 .vs/
 .vscode/
 .idea/
 *.user
 *.suo
-*.sln
-*.vcxproj*
+*.sln.docstates
 *.swp
 *~
 
 # ---- WDK / 驱动 ----
-*.inf
+# 注意：*.inf/.inx 是安装信息**源文件**，必须入库，不可忽略。
+#       编译产物落在目标平台目录与 obj 目录，用目录级规则排除。
 objchk_*/
 objfre_*/
+obj/
+**/x64/
+**/ARM64/
+**/Win32/
 *.tmh
 *.tracedata
 
