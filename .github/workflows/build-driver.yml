@@ -127,6 +127,20 @@ jobs:
             exit 99
           }
           Write-Host "编译: $sln"
+          # WDK 的 km 头/库不在 VC 默认搜索路径里（WDK targets 未按当前
+          # WindowsTargetPlatformVersion 拼出 km 路径）。CL.exe/LINK.exe 会读取
+          # INCLUDE / LIB 环境变量，这里显式补上桥接过来的 km 目录。
+          $kits  = "C:\Program Files (x86)\Windows Kits\10"
+          $kmInc = "$kits\Include\10.0.26100.0\km"
+          $kmLib = "$kits\Lib\10.0.26100.0\km\x64"
+          if (Test-Path $kmInc) {
+            $env:INCLUDE = "$kmInc;" + $env:INCLUDE
+            Write-Host "INCLUDE += $kmInc"
+          }
+          if (Test-Path $kmLib) {
+            $env:LIB = "$kmLib;" + $env:LIB
+            Write-Host "LIB += $kmLib"
+          }
           & $msb $sln `
               "/p:Configuration=$cfg" "/p:Platform=x64" `
               "/p:WindowsTargetPlatformVersion=10.0.26100.0" `
