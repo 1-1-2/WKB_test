@@ -9,7 +9,7 @@ on:
       wdk_id:
         description: 'WDK winget package id'
         required: false
-        default: 'Microsoft.WindowsWDK.10.0.26100'
+        default: 'Microsoft.WindowsWDK.10.0.28000'
       configuration:
         description: 'Build configuration'
         required: false
@@ -31,7 +31,7 @@ jobs:
         shell: pwsh
         run: |
           $id = "${{ github.event.inputs.wdk_id }}"
-          if ([string]::IsNullOrWhiteSpace($id)) { $id = "Microsoft.WindowsWDK.10.0.26100" }
+          if ([string]::IsNullOrWhiteSpace($id)) { $id = "Microsoft.WindowsWDK.10.0.28000" }
           Write-Host "安装 WDK: $id"
           winget install --id $id `
             --source winget `
@@ -54,6 +54,9 @@ jobs:
           }
           Write-Host "Include 版本:"
           Get-ChildItem "$kits\Include" -Directory -EA SilentlyContinue | Select-Object -ExpandProperty Name
+          Write-Host "--- portcls.h 定位（驱动编译必需）---"
+          Get-ChildItem "$kits\Include" -Recurse -Filter "portcls.h" -EA SilentlyContinue |
+            ForEach-Object { Write-Host ("  " + $_.FullName) }
           Write-Host "Lib 版本:"
           Get-ChildItem "$kits\Lib" -Directory -EA SilentlyContinue | Select-Object -ExpandProperty Name
 
@@ -95,7 +98,7 @@ jobs:
           Write-Host "编译: $sln"
           & $msb $sln `
               "/p:Configuration=$cfg" "/p:Platform=x64" `
-              "/p:WindowsTargetPlatformVersion=10.0.26100.0" `
+              "/p:WindowsTargetPlatformVersion=10.0.28000.0" `
               "/m" "/nologo" "/v:minimal" `
               "/flp:logfile=build.log;verbosity=detailed"
           $code = $LASTEXITCODE
