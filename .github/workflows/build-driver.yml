@@ -1,0 +1,133 @@
+name: build-driver
+
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+    inputs:
+      wdk_id:
+        description: 'WDK winget package id'
+        required: false
+        default: 'Microsoft.WindowsWDK.10.0.26100'
+      configuration:
+        description: 'Build configuration'
+        required: false
+        default: 'Release'
+
+jobs:
+  build:
+    name: Build WomicVirtualMic (x64)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------
+      # 1. 安装 WDK（runner 自带 VS2026 + SDK 10.0.26100.0，但没带 WDK）
+      # ---------------------------------------------------------------
+      - name: Install WDK
+        shell: pwsh
+        run: |
+          $id = "${{ github.event.inputs.wdk_id }}"
+          if ([string]::IsNullOrWhiteSpace($id)) { $id = "Microsoft.WindowsWDK.10.0.26100" }
+          Write-Host "安装 WDK: $id"
+          winget install --id $id `
+            --source winget `
+            --accept-source-agreements `
+            --accept-package-agreements `
+            --disable-interactivity 2>&1 | Out-String
+          Write-Host "winget exit code: $LASTEXITCODE"
+
+      - name: Verify WDK installed
+        shell: pwsh
+        run: |
+          $kits = "C:\Program Files (x86)\Windows Kits\10"
+          Write-Host "Windows Kits 10 子目录:"
+          Get-ChildItem $kits -Directory -EA SilentlyContinue | Select-Object -ExpandProperty Name
+          if (Test-Path "$kits\build") {
+            Write-Host ">>> WDK build 目录存在，版本:"
+            Get-ChildItem "$kits\build" -Directory -EA SilentlyContinue | Select-Object -ExpandProperty Name
+          } else {
+            Write-Host "!!! WDK build 目录不存在 —— 安装可能失败"
+          }
+          Write-Host "Include 版本:"
+          Get-ChildItem "$kits\Include" -Directory -EA SilentlyContinue | Select-Object -ExpandProperty Name
+          Write-Host "Lib 版本:"
+          Get-ChildItem "$kits\Lib" -Directory -EA SilentlyContinue | Select-Object -ExpandProperty Name
+
+      # ---------------------------------------------------------------
+      # 2. 编译
+      # ---------------------------------------------------------------
+      - name: Locate MSBuild
+        id: msbuild
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $msb = & $vswhere -latest -requires Microsoft.Component.MSBuild `
+                   -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
+          if (-not $msb) { Write-Host "!! MSBuild 未找到"; exit 1 }
+          Write-Host "MSBuild: $msb"
+          "path=$msb" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Build solution (Release x64)
+        id: build
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $cfg = "${{ github.event.inputs.configuration }}"
+          if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg = "Release" }
+          $msb = "${{ steps.msbuild.outputs.path }}"
+          & $msb driver\WomicVirtualMic.sln `
+              /p:Configuration=$cfg /p:Platform=x64 `
+              /p:WindowsTargetPlatformVersion=10.0.26100.0 `
+              /m /nologo /v:minimal `
+              /flp:logfile=build.log;verbosity=detailed
+          Write-Host "MSBuild exit code: $LASTEXITCODE"
+          "exit=$LASTEXITCODE" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Show build log tail on failure
+        if: steps.build.outputs.exit != '0'
+        shell: pwsh
+        run: |
+          if (Test-Path build.log) {
+            Write-Host "===== build.log 最后 200 行 ====="
+            Get-Content build.log -Tail 200
+          } else { Write-Host "无 build.log" }
+
+      # ---------------------------------------------------------------
+      # 3. 收集产物
+      # ---------------------------------------------------------------
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          $found = Get-ChildItem -Path driver -Recurse -Include *.sys,*.inf,*.cat,*.pdb -EA SilentlyContinue
+          if ($found) {
+            Write-Host "找到产物:"
+            $found | ForEach-Object {
+              Write-Host ("  " + $_.FullName + "  (" + $_.Length + " bytes)")
+              Copy-Item $_.FullName -Destination out -Force
+            }
+          } else {
+            Write-Host "!!! 未找到任何 sys/inf/cat/pdb"
+            Write-Host "--- driver 下的 Release/x64 目录 ---"
+            Get-ChildItem -Path driver -Recurse -Directory -EA SilentlyContinue |
+              Where-Object { $_.Name -match "Release|x64" } | Select-Object -ExpandProperty FullName
+          }
+          Get-ChildItem out | Format-Table Name,Length
+
+      - name: Upload driver artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: womic-driver-x64
+          path: out/
+          if-no-files-found: warn
+
+      - name: Fail if build failed
+        if: steps.build.outputs.exit != '0'
+        shell: pwsh
+        run: |
+          Write-Host "::error::编译失败 (exit ${{ steps.build.outputs.exit }})"
+          exit 1

@@ -1,0 +1,53 @@
+# womicserver 配置文件示例
+#
+# 加载方式：womicserver --config womicserver.ini
+# 命令行参数优先级高于本文件；键名支持下划线 / 连字符两种写法。
+# 以 # 或 ; 开头的行是注释。
+
+[network]
+port = 5004
+# 0.0.0.0 / 0 / * 都表示通配地址（监听所有网卡）
+bind = 0.0.0.0
+# SO_RCVBUF：调大以吸收 Wi-Fi 突发抖动（突发时内核队列溢出会静默丢包）
+udp-recv-buf = 262144
+# 超过该时间没收到当前客户端的包就断开，等待下一个客户端
+client-timeout-ms = 3000
+
+[audio]
+# 驱动端点格式：内核驱动只支持 16-bit 单声道，44100 或 48000
+rate = 48000
+channels = 1
+endpoint-bits = 16
+# 手机侧 Opus 采样率；与 rate 不同时由**服务端**重采样（驱动侧绝不做重采样）
+opus-rate = 48000
+frame-ms = 20
+# 抖动缓冲目标延迟的自适应区间（硬上限 120ms）
+jitter-min-ms = 50
+jitter-max-ms = 100
+jitter-target-ms = 50
+# 重采样后端：auto / soxr / speex / none
+resampler = soxr
+resampler-quality = 4
+# 输出增益（dB）与去咔哒
+gain-db = 0
+declick = true
+
+[device]
+# auto：Windows 走 \\.\WomicControl 的 IOCTL；Linux/冒烟测试走 Fake 后端
+backend = auto
+device-path = \\.\WomicControl
+ring-capacity-frames = 8192
+max-write-frames = 1024
+
+[log]
+log-level = info
+level-log = false
+status-interval-ms = 1000
+
+[discovery]
+# 开启后手机端可在本网段广播发现本服务（默认端口 5005）
+discovery = false
+discovery-port = 5005
+discovery-name = Womic Virtual Microphone
+# 0 = 只应答查询；>0 = 每间隔毫秒主动广播一次
+discovery-interval-ms = 0

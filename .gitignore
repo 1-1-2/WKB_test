@@ -1,0 +1,57 @@
+# ---- 构建产物 ----
+build/
+out/
+cmake-build-*/
+*.o
+*.obj
+*.ko
+*.ilk
+*.pdb
+*.lib
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.exp
+*.sys
+*.pdb
+
+# ---- CMake ----
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+install_manifest.txt
+compile_commands.json
+
+# ---- IDE / 编辑器 ----
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln
+*.vcxproj*
+*.swp
+*~
+
+# ---- WDK / 驱动 ----
+*.inf
+objchk_*/
+objfre_*/
+*.tmh
+*.tracedata
+
+# ---- Python / 工具 ----
+__pycache__/
+*.pyc
+.venv/
+
+# ---- 日志与临时 ----
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
