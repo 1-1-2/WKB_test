@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  备份规则：
+    - 采集参数（SharedPreferences）允许随设备备份/迁移，换机后不必重新填 IP；
+    - 但明确排除目标 IP：换机后网络环境通常不同，恢复一个指向旧局域网的 IP 会误导用户。
+-->
+<full-backup-content>
+    <include
+        domain="sharedpref"
+        path="womic_open_prefs.xml" />
+</full-backup-content>
