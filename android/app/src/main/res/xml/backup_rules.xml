@@ -7,5 +7,5 @@
 <full-backup-content>
     <include
         domain="sharedpref"
-        path="womic_open_prefs.xml" />
+        path="miclink_open_prefs.xml" />
 </full-backup-content>

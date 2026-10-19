@@ -1,4 +1,4 @@
-package com.womic.open
+package com.miclink.open
 
 import android.util.Log
 import java.io.IOException
@@ -9,7 +9,11 @@ import java.net.SocketException
 import java.net.UnknownHostException
 
 /**
- * UdpSender -- 把封好的 womic 包发给 Windows 服务端。
+ * UdpSender -- 把封好的 WO Mic 媒体包发给 PC 客户端。
+ *
+ * 目标地址 = PC 客户端 TCP 连接的源地址，目标端口 = CONFIG 消息协商出的
+ * 媒体端口（规格 v1 第 2.3 节；PC 端 WOMicClient.exe @0x414a56 把该端口
+ * 大端写入 102 消息 payload[2..5]）。UDP 单向：手机 -> PC。
  *
  * 设计要点：
  *   - 一个 DatagramSocket 复用到底，避免每帧创建 socket（会显著抬高抖动与 CPU）；
@@ -22,13 +26,6 @@ class UdpSender {
 
     companion object {
         private const val TAG = "UdpSender"
-        /**
-         * 默认音频端口，与 server/src/config.h 的 listen_port 默认值一致。
-         *
-         * 唯一事实来源是 app/build.gradle.kts 的
-         * buildConfigField("DEFAULT_UDP_PORT")，这里只做转发（缺陷 D-11）。
-         */
-        val DEFAULT_PORT: Int = BuildConfig.DEFAULT_UDP_PORT
     }
 
     @Volatile
@@ -37,8 +34,9 @@ class UdpSender {
     @Volatile
     private var targetAddress: InetAddress? = null
 
+    /** 协商出的媒体端口（CONFIG payload[2..5]，大端 u32）；未连接时为 -1。 */
     @Volatile
-    var targetPort: Int = DEFAULT_PORT
+    var targetPort: Int = -1
         private set
 
     /** 最近一次错误信息；null 表示一切正常。 */
@@ -67,8 +65,8 @@ class UdpSender {
     /**
      * 打开 socket 并解析目标地址。
      *
-     * @param host 服务端 IPv4（也可填主机名，但建议直接填 IP，避免 DNS 抖动）
-     * @param port 服务端 UDP 监听端口（默认 5004）
+     * @param host PC 客户端 IP（从 TCP 连接的远端地址取，避免 DNS）
+     * @param port PC 客户端在 CONFIG 中声明的媒体端口
      * @return true 成功
      */
     @Synchronized
@@ -117,14 +115,14 @@ class UdpSender {
         targetPort = port
         packetsSent = 0L
         bytesSent = 0L
-        Log.i(TAG, "已打开 UDP -> ${address.hostAddress}:$port")
+        Log.i(TAG, "已打开 UDP -> ${address.hostAddress}:$port（协商媒体端口）")
         return true
     }
 
     /**
      * 发送一个包。
      *
-     * @param data   封好的完整报文（32 字节头 + payload）
+     * @param data   封好的完整报文（WO Mic 格式 C：11 字节头 + Opus payload）
      * @param length 有效长度（<= data.size）
      * @return true 发送成功
      */

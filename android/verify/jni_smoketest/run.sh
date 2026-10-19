@@ -4,9 +4,9 @@
 #
 #   cd android/verify/jni_smoketest && ./run.sh
 #
-# 做什么：把 opus_jni.cpp 与一个**假的 libopus**实现编成 libwomic_opus.so，
+# 做什么：把 opus_jni.cpp 与一个**假的 libopus**实现编成 libmiclink_opus.so，
 # 再用与 OpusEncoder.kt 同名同签名的 Java 类去加载、调用它，验证：
-#   * JNI 符号名（Java_com_womic_open_OpusEncoder_*）与 Kotlin 声明一致；
+#   * JNI 符号名（Java_com_miclink_open_OpusEncoder_*）与 Kotlin 声明一致；
 #   * 参数签名（long 句柄 / short[] / byte[]）一致；
 #   * 错误码（-1/-2/-3/-5）按契约返回；
 #   * 非法帧长的 create 被拒绝。
@@ -50,7 +50,7 @@ for cand in "${JNI_INC}/linux" "${JNI_INC}/darwin" "${JNI_INC}/win32" "${JNI_INC
     fi
 done
 
-echo "==> 1/3 编译 libwomic_opus.so（链接 stub opus）"
+echo "==> 1/3 编译 libmiclink_opus.so（链接 stub opus）"
 # stubs/opus.h 与 stubs/android/log.h 是假头文件（内容转发到 stub_*.h），
 # 通过 -I 优先命中，从而让 opus_jni.cpp 里的 <opus.h> / <android/log.h> 使用替身。
 g++ -std=c++17 -fPIC -shared -Wall -Wextra \
@@ -58,17 +58,17 @@ g++ -std=c++17 -fPIC -shared -Wall -Wextra \
     -I "${SCRIPT_DIR}/stubs" \
     -I "${JNI_INC}" ${JNI_MD_INC:+-I "${JNI_MD_INC}"} \
     "${JNI_CPP}" "${SCRIPT_DIR}/opus_stub_impl.cpp" \
-    -o "${BUILD_DIR}/libwomic_opus.so"
+    -o "${BUILD_DIR}/libmiclink_opus.so"
 
-if [[ ! -f "${BUILD_DIR}/libwomic_opus.so" ]]; then
-    echo "FAIL: 未生成 libwomic_opus.so" >&2
+if [[ ! -f "${BUILD_DIR}/libmiclink_opus.so" ]]; then
+    echo "FAIL: 未生成 libmiclink_opus.so" >&2
     exit 1
 fi
-echo "  [ok] 生成 ${BUILD_DIR}/libwomic_opus.so"
-nm -D "${BUILD_DIR}/libwomic_opus.so" | grep 'Java_com_womic_open_OpusEncoder' | sed 's/^/       /'
+echo "  [ok] 生成 ${BUILD_DIR}/libmiclink_opus.so"
+nm -D "${BUILD_DIR}/libmiclink_opus.so" | grep 'Java_com_miclink_open_OpusEncoder' | sed 's/^/       /'
 
 echo "==> 2/3 编译 Java 镜像类"
 javac -d "${BUILD_DIR}/classes" "${SCRIPT_DIR}/OpusEncoder.java"
 
 echo "==> 3/3 运行冒烟测试"
-java -cp "${BUILD_DIR}/classes" -Djava.library.path="${BUILD_DIR}" com.womic.open.OpusEncoder
+java -cp "${BUILD_DIR}/classes" -Djava.library.path="${BUILD_DIR}" com.miclink.open.OpusEncoder

@@ -1,4 +1,4 @@
-package com.womic.open
+package com.miclink.open
 
 import android.util.Log
 
@@ -10,7 +10,6 @@ import android.util.Log
  * val enc = OpusEncoder()
  * enc.create(sampleRate = 48000, channels = 1, bitrateBps = 64000, frameSize = 960)
  * val n = enc.encode(pcmShorts, outBytes)   // n > 0 才发送
- * val m = enc.plc(redundantBytes)           // m > 0 表示可发一份前向冗余包
  * enc.destroy()
  * ```
  *
@@ -21,7 +20,7 @@ class OpusEncoder {
     companion object {
         private const val TAG = "OpusEncoder"
 
-        /** 单包 payload 上限，与 Packetizer.MAX_PAYLOAD / WOMIC_PROTO_MAX_PAYLOAD 一致。 */
+        /** 单包 payload 上限（WO Mic 格式 C 头部固定 11 字节，Opus 20ms@48k 远小于此）。 */
         const val MAX_PAYLOAD = 4096
 
         /** Opus 单帧样本数上限（120ms @ 48kHz）。 */
@@ -30,7 +29,7 @@ class OpusEncoder {
         /** native 库加载失败原因；null 表示加载成功。 */
         private var loadError: String? = null
 
-        /** native 库（libwomic_opus.so）是否可用。 */
+        /** native 库（libmiclink_opus.so）是否可用。 */
         fun isLoaded(): Boolean = loadError == null
 
         /** 加载失败原因（用于 UI 提示"请先按 README 放入 opus 源码"）。 */
@@ -38,12 +37,12 @@ class OpusEncoder {
 
         init {
             try {
-                System.loadLibrary("womic_opus")
+                System.loadLibrary("miclink_opus")
             } catch (t: Throwable) {
                 // 常见原因：CMake 未构建成功 / opus 源码缺失 / ABI 不匹配。
                 // 不向上抛，避免类初始化失败导致整个 UI 崩溃；由调用方检查 isLoaded()。
                 loadError = t.message ?: t.toString()
-                Log.e(TAG, "加载 libwomic_opus.so 失败：$loadError", t)
+                Log.e(TAG, "加载 libmiclink_opus.so 失败：$loadError", t)
             }
         }
 
@@ -111,7 +110,7 @@ class OpusEncoder {
     ): Boolean {
         destroy()
         if (!isLoaded()) {
-            Log.e(TAG, "libwomic_opus.so 未加载：$loadError（请按 android/README.md 放入 opus 源码后重新构建）")
+            Log.e(TAG, "libmiclink_opus.so 未加载：$loadError（请按 android/README.md 放入 opus 源码后重新构建）")
             return false
         }
         if (!isValidFrame(sampleRate, frameSize)) {
@@ -185,9 +184,9 @@ class OpusEncoder {
     /**
      * 生成前向冗余包（上一帧 payload 的重发副本）。
      *
-     * 注意：**这不是解码侧的 PLC**。解码侧丢包隐藏由 Windows 服务端
-     * （server/src/opus_decoder.cpp）用 opus_decode(NULL) 完成；本方法只是给服务端
-     * 多一份补救材料，调用方应把结果包的 flags 打上 [Packetizer.FLAG_FEC]。
+     * ⚠️ WO Mic 协议**没有**带内 FEC 通道（格式 C 头部无 flags 字段），
+     * 本方法在当前协议下不再被调用，仅为兼容旧 miclink 链路保留。
+     * 丢包隐藏由 PC 端 opus_decode(NULL) 完成。
      *
      * @return 冗余包字节数；0 表示还没有历史帧；<0 为错误码
      */
