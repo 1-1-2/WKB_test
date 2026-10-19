@@ -66,6 +66,10 @@ msbuild driver\MicLinkVirtualMic.sln -t:rebuild -m -nologo -v:minimal `
 - 版本对应：WDK 包 `10.0.28000.2526` ↔ `_NT_TARGET_VERSION=0xA000012`（NTDDI 码，10.0.28000）。
 - 在装有 WDK 的 VS 2022/2026 里直接打开 `.sln` 也能编译（`Directory.Build.props` 的三个
   Import 都带 `Exists` 条件，没有还原过包时会自动跳过，不影响 IDE 打开）。
+- INF 工具链（StampInf / Inf2Cat / DrvCat）的可执行文件**不在 PATH 里也没关系**：
+  `driver/Directory.Build.props` 会用 glob 在 NuGet 包内定位它们并设置对应的
+  `*ToolPath` 属性（stampinf/drvcat 在包内 `x64` 目录，Inf2Cat 在 `x86` 目录），
+  因此纯 NuGet 环境无需机器安装 WDK 即可完成 INF 盖章与目录生成。
 
 ---
 
