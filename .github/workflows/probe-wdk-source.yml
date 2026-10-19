@@ -1,0 +1,30 @@
+name: probe-wdk-source
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: Find installable WDK package
+    runs-on: windows-latest
+    steps:
+      - name: Search WDK in winget / choco / VS workloads
+        shell: pwsh
+        run: |
+          Write-Host "===== winget search: WDK ====="
+          winget search --id Microsoft.WindowsDriverKit 2>&1 | Out-String
+          Write-Host "===== winget search: DriverKit ====="
+          winget search DriverKit 2>&1 | Out-String
+          Write-Host "===== winget search: WindowsSDK (对照) ====="
+          winget search --id Microsoft.WindowsSDK 2>&1 | Out-String
+          Write-Host "===== choco: windowsdriverkit ====="
+          choco list windowsdriverkit 2>&1 | Out-String
+          choco search driver 2>&1 | Select-Object -First 15 | Out-String
+          Write-Host "===== VS installer: 可用 workload (含 WDK 关键字) ====="
+          $vs = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsdir = & $vs -latest -property installationPath
+          Write-Host "VS dir: $vsdir"
+          $vsInstaller = Join-Path (Split-Path $vsdir) "..\Installer\vs_installer.exe"
+          Write-Host "===== 已存在的 Windows Kits Include/Lib 版本 ====="
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -Directory -EA SilentlyContinue | Select-Object -ExpandProperty Name
+          Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" -Directory -EA SilentlyContinue | Select-Object -ExpandProperty Name
