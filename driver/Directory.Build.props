@@ -39,6 +39,12 @@
        "%(_MicLinkWdkStampInf.RootDir)..."），属性函数
        $([System.IO.Path]::GetDirectoryName(@(Item))) 返回空，均不可用；
     4. 未 restore 包时 WDK_NuGet 为空，本段整体跳过，不产生任何垃圾值。
+
+    ⚠️ 踩坑记录（CI run 39334408777）：本文件绝不要给 ExecutablePath 赋值。
+    C++ 编译目标只在 ExecutablePath 为空时，才把 VC 工具目录
+    （cl.exe / link.exe 所在，由 VsDevShell/VS 安装信息推导）填进去。
+    Directory.Build.props 求值早于 C++ 目标，提前赋值会堵掉该填充，
+    CL/Link 退化为裸名查找，全部以 TRK0005 失败。
   -->
   <ItemGroup Condition="'$(WDK_NuGet)' == 'true'">
     <_MicLinkWdkStampInf Include="$(WDKContentRoot)/bin/**/x64/stampinf.exe" />
@@ -46,8 +52,6 @@
     <_MicLinkWdkDrvCat Include="$(WDKContentRoot)/bin/**/x64/drvcat.exe" />
   </ItemGroup>
   <PropertyGroup Condition="'$(WDK_NuGet)' == 'true'">
-    <ExecutablePath Condition="'$(ExecutablePath)' != ''">$(ExecutablePath);@(_MicLinkWdkStampInf->'%(RootDir)%(Directory)')</ExecutablePath>
-    <ExecutablePath Condition="'$(ExecutablePath)' == ''">@(_MicLinkWdkStampInf->'%(RootDir)%(Directory)')</ExecutablePath>
     <InfToolPath Condition="'$(InfToolPath)' == ''">@(_MicLinkWdkStampInf->'%(RootDir)%(Directory)')</InfToolPath>
     <Inf2CatToolPath Condition="'$(Inf2CatToolPath)' == ''">@(_MicLinkWdkInf2Cat->'%(RootDir)%(Directory)')</Inf2CatToolPath>
     <DrvCatToolPath Condition="'$(DrvCatToolPath)' == ''">@(_MicLinkWdkDrvCat->'%(RootDir)%(Directory)')</DrvCatToolPath>
