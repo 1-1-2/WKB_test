@@ -1,0 +1,53 @@
+name: probe-toolchain
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: Probe WDK / VS / SDK availability
+    runs-on: windows-latest
+    steps:
+      - name: Probe toolchain
+        shell: pwsh
+        run: |
+          Write-Host "===== 1. Visual Studio (vswhere) ====="
+          $vs = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vs) {
+            & $vs -latest -property installationPath
+            & $vs -latest -property displayName
+          } else { Write-Host "vswhere NOT found" }
+
+          Write-Host ""
+          Write-Host "===== 2. Windows Kits (WDK / SDK) ====="
+          $kits = "C:\Program Files (x86)\Windows Kits\10"
+          if (Test-Path $kits) {
+            Write-Host "Windows Kits 10 存在"
+            Get-ChildItem $kits -Directory | Select-Object -ExpandProperty Name
+            Write-Host "--- build dir (WDK 核心) ---"
+            if (Test-Path "$kits\build") { Get-ChildItem "$kits\build" -Directory | Select-Object -ExpandProperty Name }
+            else { Write-Host "NO build dir => WDK 未安装" }
+            Write-Host "--- Extension SDKs / WDK 特征文件 ---"
+            if (Test-Path "$kits\Lib") { Get-ChildItem "$kits\Lib" -Directory | Select-Object -ExpandProperty Name }
+          } else { Write-Host "Windows Kits NOT found => 既无 SDK 也无 WDK" }
+
+          Write-Host ""
+          Write-Host "===== 3. MSBuild ====="
+          $msb = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.Component.MSBuild -find MSBuild\**\Bin\MSBuild.exe 2>$null
+          if ($msb) { Write-Host "MSBuild: $msb" } else { Write-Host "MSBuild NOT found via vswhere" }
+
+          Write-Host ""
+          Write-Host "===== 4. 包管理器 (winget / choco) ====="
+          Write-Host "winget: $((Get-Command winget -ErrorAction SilentlyContinue).Source)"
+          Write-Host "choco : $((Get-Command choco  -ErrorAction SilentlyContinue).Source)"
+
+          Write-Host ""
+          Write-Host "===== 5. 是否有管理员权限 ====="
+          $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $p  = New-Object Security.Principal.WindowsPrincipal($id)
+          Write-Host "IsAdmin: $($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
+
+          Write-Host ""
+          Write-Host "===== 6. 磁盘与内存 ====="
+          Get-PSDrive C | Select-Object Used,Free | Format-List
+          [Math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1GB,1)
