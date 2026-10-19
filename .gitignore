@@ -1,0 +1,65 @@
+# ---- 构建产物 ----
+build/
+out/
+cmake-build-*/
+*.o
+*.obj
+*.ko
+*.ilk
+*.pdb
+*.lib
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.exp
+*.sys
+*.pdb
+
+# ---- Gradle / Android ----
+.gradle/
+local.properties
+# AGP 的 native（CMake/ninja）构建缓存：每次构建可重建，绝不入库
+.cxx/
+# libopus 源码：不内置（体积 + 许可证单独保留），按 android/README.md
+# 下载到 app/src/main/cpp/opus/；CI 现场下载，绝不入库。
+android/app/src/main/cpp/opus/
+
+# ---- IDE / 编辑器 ----
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln.docstates
+*.swp
+*~
+
+# ---- Windows 客户端 ----
+# 第三方已签名驱动（womic.sys / womic.inf / womic.cat，版权归 Wolicheng 所有）
+# 的二进制绝不入库：本仓库是公开仓库，再分发有法律风险（架构文档 R8）。
+# 主理人已拍板：exe 产物内置分发、源码库保持干净。这两个文件都是
+# client/tools/pack_driver.py 的生成物，干净检出时 build.sh 会自动生成
+# 空包（16 B, count=0）兜底；要内置驱动需自备官方驱动目录后重新打包，
+# 详见 client/README.md「构建与驱动包」。
+client/res/drvpkg.bin
+client/src/drvpkg_data.h
+# libopus 交叉编译产物（*.a 已被上面的 *.a 命中，但 include/ 头文件会漏进去）
+# 与 opus 源码构建树：都由 client/tools/build_opus.sh 现场重建，绝不入库。
+client/deps/
+_build/
+
+# ---- Python / 工具 ----
+__pycache__/
+*.pyc
+.venv/
+
+# ---- 日志与临时 ----
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+
+# ---- 本地调试观察脚本（含 PAT，绝不入库）----
+.tmp-*/
