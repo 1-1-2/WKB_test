@@ -24,11 +24,11 @@ Abstract:
 #include "minipairs.h"
 
 //
-// WOMIC 控制设备（\\.\WomicControl）的契约与共享状态。
-// 该头文件位于 Source\Inc\womic\，内部直接 include 三方共享的
-// <repo>\shared\core\include\womic\womic_ioctl.h / womic_ring.h / womic_dsp.h。
+// MICLINK 控制设备（\\.\MicLinkControl）的契约与共享状态。
+// 该头文件位于 Source\Inc\miclink\，内部直接 include 三方共享的
+// <repo>\shared\core\include\miclink\miclink_ioctl.h / miclink_ring.h / miclink_dsp.h。
 //
-#include "womic/womic_ctl.h"
+#include "miclink/miclink_ctl.h"
 
 typedef void (*fnPcDriverUnload) (PDRIVER_OBJECT);
 fnPcDriverUnload gPCDriverUnloadRoutine = NULL;
@@ -123,10 +123,10 @@ Environment:
     }
 
     //
-    // 销毁 WOMIC 控制设备：删符号链接 -> 等句柄归零 -> 断全局指针 ->
-    // 释放环形缓冲 -> IoDeleteDevice（顺序见 WomicDeleteControlDevice）。
+    // 销毁 MICLINK 控制设备：删符号链接 -> 等句柄归零 -> 断全局指针 ->
+    // 释放环形缓冲 -> IoDeleteDevice（顺序见 MicLinkDeleteControlDevice）。
     //
-    WomicDeleteControlDevice();
+    MicLinkDeleteControlDevice();
 
     //
     // Unload WDF driver object. 
@@ -215,7 +215,7 @@ Returns:
     RTL_QUERY_REGISTRY_TABLE    paramTable[] = {
     // QueryRoutine     Flags                                               Name                     EntryContext             DefaultType                                                    DefaultData              DefaultLength
         { NULL,   RTL_QUERY_REGISTRY_DIRECT | RTL_QUERY_REGISTRY_TYPECHECK, L"DoNotCreateDataFiles", &g_DoNotCreateDataFiles, (REG_DWORD << RTL_QUERY_REGISTRY_TYPECHECK_SHIFT) | REG_DWORD, &g_DoNotCreateDataFiles, sizeof(ULONG)},
-        // WOMIC: DisableToneGenerator 已随 ToneGenerator.cpp/.h 一并删除（本驱动
+        // MICLINK: DisableToneGenerator 已随 ToneGenerator.cpp/.h 一并删除（本驱动
         // 从不合成正弦，捕获数据全部来自用户态注入的内核环形缓冲）。保留一个空的
         // 注册表项只会误导运维，故不再查询。
         { NULL,   0,                                                        NULL,                    NULL,                    0,                                                             NULL,                    0}
@@ -358,8 +358,8 @@ Return Value:
     DriverObject->MajorFunction[IRP_MJ_PNP] = PnpHandler;
 
     //
-    // WOMIC: 接管 PortCls 的 CREATE / CLOSE / CLEANUP / DEVICE_CONTROL，
-    // 并创建 \\.\WomicControl 控制设备。
+    // MICLINK: 接管 PortCls 的 CREATE / CLOSE / CLEANUP / DEVICE_CONTROL，
+    // 并创建 \\.\MicLinkControl 控制设备。
     //
     // !!! 顺序不可颠倒 !!!
     // PcInitializeAdapterDriver（上面 347 行）会整体重写 DriverObject->MajorFunction
@@ -368,14 +368,14 @@ Return Value:
     // 我们照抄这个已被官方验证过的模式。
     //
     // 我们的 dispatch 对"不是控制设备"的目标一律用 PcDispatchIrp() 原样回投给
-    // PortCls（见 womicctl.cpp），绝不吞掉 IRP；否则 PortCls 收不到 create，
+    // PortCls（见 miclinkctl.cpp），绝不吞掉 IRP；否则 PortCls 收不到 create，
     // filter/pin 不会实例化，AudioEndpointBuilder 不会枚举出端点，
     // 表现就是"CreateFile 成功但声音设置里看不到麦克风"。
     //
-    ntStatus = WomicInitializeControlDevice(DriverObject);
+    ntStatus = MicLinkInitializeControlDevice(DriverObject);
     IF_FAILED_ACTION_JUMP(
         ntStatus,
-        DPF(D_ERROR, ("WomicInitializeControlDevice failed, 0x%x", ntStatus)),
+        DPF(D_ERROR, ("MicLinkInitializeControlDevice failed, 0x%x", ntStatus)),
         Done);
 
     //
@@ -467,7 +467,7 @@ Return Value:
 } // AddDevice
 
 //
-// WOMIC 只提供捕获端点：扬声器（render）端点已从本驱动中彻底移除，
+// MICLINK 只提供捕获端点：扬声器（render）端点已从本驱动中彻底移除，
 // minipairs.h 里的 g_RenderEndpoints 已删除并改为 `#define g_cRenderEndpoints 0`。
 // 下面这段渲染端点安装代码（以及它唯一的使用者 PowerControlCallback）随之整体停用。
 // 用预处理开关而不是直接删除，是为了将来若需要重新引入渲染端点，
@@ -790,7 +790,7 @@ Return Value:
 
     //
     // Install wave+topology filters for render devices
-    // （WOMIC 已移除扬声器端点，g_cRenderEndpoints == 0，此段被编译掉）
+    // （MICLINK 已移除扬声器端点，g_cRenderEndpoints == 0，此段被编译掉）
     //
 #if (g_cRenderEndpoints != 0)
     ntStatus = InstallAllRenderFilters(DeviceObject, Irp, pAdapterCommon);
@@ -871,10 +871,10 @@ Return Value:
     //     if (ext->m_pCommon != NULL) { ext->m_pCommon->Cleanup(); ext->m_pCommon->Release(); }
     //
     // 这段代码的隐含前提是"收到 PNP IRP 的设备一定是 PortCls FDO"。
-    // 我们的控制设备不是 PortCls FDO，它的 extension 是 WOMIC_CONTROL_EXT。
+    // 我们的控制设备不是 PortCls FDO，它的 extension 是 MICLINK_CONTROL_EXT。
     // 一旦走到那里：
     //   * PortClassDeviceContext 的 m_pCommon 在 64 位下位于偏移 40；
-    //   * 我们的 WOMIC_CONTROL_EXT 偏移 40 处正好落在 Ring / 统计字段上，
+    //   * 我们的 MICLINK_CONTROL_EXT 偏移 40 处正好落在 Ring / 统计字段上，
     //     它通常是非 NULL 的（哪怕全 0，也只要有一个非 0 就会命中）；
     //   * 于是这个野指针会被当成 IAdapterCommon* 去调用虚函数 Cleanup()/Release()
     //     -> 立刻 BSOD。
@@ -883,11 +883,11 @@ Return Value:
     //   1) 不走 Cleanup/Release 分支（那是对 PortCls FDO 的语义）；
     //   2) 也不调用 PcDispatchIrp（控制设备不属于 PortCls，回投没有意义且危险）。
     //
-    // 判定用两段式 WomicIsControlDevice()（指针快拒 + magic 终裁），
+    // 判定用两段式 MicLinkIsControlDevice()（指针快拒 + magic 终裁），
     // 对陌生设备连 extension 都不读。
     // =========================================================================
     //
-    if (WomicIsControlDevice(_DeviceObject))
+    if (MicLinkIsControlDevice(_DeviceObject))
     {
         _Irp->IoStatus.Status      = STATUS_SUCCESS;
         _Irp->IoStatus.Information = 0;

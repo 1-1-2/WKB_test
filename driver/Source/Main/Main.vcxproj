@@ -179,16 +179,16 @@
     </DriverSign>
   </ItemDefinitionGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <TargetName>WomicVirtualMic</TargetName>
+    <TargetName>MicLinkVirtualMic</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
-    <TargetName>WomicVirtualMic</TargetName>
+    <TargetName>MicLinkVirtualMic</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <TargetName>WomicVirtualMic</TargetName>
+    <TargetName>MicLinkVirtualMic</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
-    <TargetName>WomicVirtualMic</TargetName>
+    <TargetName>MicLinkVirtualMic</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <Link>
@@ -326,7 +326,7 @@
     <ClCompile Include="minwavert.cpp" />
     <ClCompile Include="minwavertstream.cpp" />
     <ClCompile Include="newdelete.cpp" />
-    <ClCompile Include="womicctl.cpp">
+    <ClCompile Include="miclinkctl.cpp">
       <!--
         新增文件。当前沙箱无 WDK、无法预编译，因此把"告警当错误"对本文件放宽，
         只屏蔽已知的装饰性告警（未引用形参 / 有符号无符号转换 / 未使用局部函数等），
@@ -335,7 +335,7 @@
       <TreatWarningAsError>false</TreatWarningAsError>
       <DisableSpecificWarnings>4100;4101;4189;4201;4244;4245;4267;4365;4505;4701;4703;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
-    <ResourceCompile Include="WomicVirtualMic.rc" />
+    <ResourceCompile Include="MicLinkVirtualMic.rc" />
   </ItemGroup>
   <ItemGroup>
     <Inf Exclude="@(Inx)" Include="*.inx" />

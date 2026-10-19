@@ -1,5 +1,5 @@
 /*
- * main.cpp -- womicserver 入口：解析参数 -> 校验 -> 启动会话 -> 状态打印 -> 优雅退出。
+ * main.cpp -- miclinkserver 入口：解析参数 -> 校验 -> 启动会话 -> 状态打印 -> 优雅退出。
  *
  * 退出路径（Ctrl+C / SIGINT / SIGTERM）：
  *   设置停止标志 -> 停止 rx/inject 线程 -> flush 重采样残留 -> STOP/RESET/CloseHandle。
@@ -74,7 +74,7 @@ void uninstall_signal_handlers()
     SetConsoleCtrlHandler(console_ctrl_handler, FALSE);
 }
 #else
-void womic_posix_signal_handler(int signo)
+void miclink_posix_signal_handler(int signo)
 {
     (void)signo;
     request_stop();
@@ -83,7 +83,7 @@ void womic_posix_signal_handler(int signo)
 bool install_signal_handlers(std::string *err)
 {
     struct sigaction sa {};
-    sa.sa_handler = womic_posix_signal_handler;
+    sa.sa_handler = miclink_posix_signal_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     if ((sigaction(SIGINT, &sa, nullptr) != 0) || (sigaction(SIGTERM, &sa, nullptr) != 0)) {
@@ -106,9 +106,9 @@ void uninstall_signal_handlers()
 #endif
 
 /** 打印一条状态行（含可选电平与延迟估计）。 */
-void print_status_line(womic::ServerSession &session, const womic::ServerConfig &cfg)
+void print_status_line(miclink::ServerSession &session, const miclink::ServerConfig &cfg)
 {
-    const womic::StatsSnapshot snap = session.stats().snapshot();
+    const miclink::StatsSnapshot snap = session.stats().snapshot();
     const double latency_ms = session.estimate_latency_ms(snap);
 
     std::string line = session.stats().format_line(0.0);
@@ -125,51 +125,51 @@ void print_status_line(womic::ServerSession &session, const womic::ServerConfig 
 
 int main(int argc, char **argv)
 {
-    womic::ServerConfig cfg;
+    miclink::ServerConfig cfg;
     std::string err;
 
-    if (!womic::config_parse(argc, argv, &cfg, &err)) {
+    if (!miclink::config_parse(argc, argv, &cfg, &err)) {
         std::fprintf(stderr, "参数解析失败: %s\n\n", err.c_str());
-        womic::config_print_usage((argc > 0) ? argv[0] : "womicserver");
+        miclink::config_print_usage((argc > 0) ? argv[0] : "miclinkserver");
         return 2;
     }
 
     if (cfg.show_help) {
-        womic::config_print_usage((argc > 0) ? argv[0] : "womicserver");
+        miclink::config_print_usage((argc > 0) ? argv[0] : "miclinkserver");
         return 0;
     }
     if (cfg.show_version) {
-        std::fprintf(stdout, "%s\n", womic::config_version_string());
+        std::fprintf(stdout, "%s\n", miclink::config_version_string());
         return 0;
     }
 
-    womic::log_init(static_cast<womic::LogLevel>(static_cast<int>(cfg.log_level)),
+    miclink::log_init(static_cast<miclink::LogLevel>(static_cast<int>(cfg.log_level)),
                     cfg.log_timestamp);
 
-    if (!womic::config_validate(cfg, &err)) {
+    if (!miclink::config_validate(cfg, &err)) {
         std::fprintf(stderr, "配置校验失败: %s\n", err.c_str());
         return 2;
     }
 
     if (cfg.dry_run) {
-        std::fprintf(stdout, "%s\n", womic::config_to_string(cfg).c_str());
+        std::fprintf(stdout, "%s\n", miclink::config_to_string(cfg).c_str());
         return 0;
     }
 
-    if (!womic::net_startup(&err)) {
+    if (!miclink::net_startup(&err)) {
         std::fprintf(stderr, "网络初始化失败: %s\n", err.c_str());
         return 1;
     }
 
-    womic::ServerSession session;
+    miclink::ServerSession session;
     if (!session.init(cfg, &err)) {
         std::fprintf(stderr, "启动失败: %s\n", err.c_str());
-        womic::net_cleanup();
+        miclink::net_cleanup();
         return 1;
     }
     if (!session.start(&err)) {
         std::fprintf(stderr, "启动失败: %s\n", err.c_str());
-        womic::net_cleanup();
+        miclink::net_cleanup();
         return 1;
     }
 
@@ -177,16 +177,16 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "警告：无法安装退出信号处理器: %s\n", err.c_str());
     }
 
-    std::fprintf(stdout, "%s\n", womic::config_to_string(cfg).c_str());
+    std::fprintf(stdout, "%s\n", miclink::config_to_string(cfg).c_str());
     std::fprintf(stdout, "运行中，按 Ctrl+C 退出。\n");
 
-    uint32_t last_status_ms = womic::steady_now_ms();
+    uint32_t last_status_ms = miclink::steady_now_ms();
     while (!g_stop_requested.load(std::memory_order_acquire)) {
-        womic::sleep_ms(100);
+        miclink::sleep_ms(100);
         if (cfg.status_interval_ms == 0u) {
             continue;
         }
-        const uint32_t now = womic::steady_now_ms();
+        const uint32_t now = miclink::steady_now_ms();
         if ((now - last_status_ms) >= cfg.status_interval_ms) {
             last_status_ms = now;
             print_status_line(session, cfg);
@@ -199,6 +199,6 @@ int main(int argc, char **argv)
     uninstall_signal_handlers();
 
     std::fprintf(stdout, "---- 运行汇总 ----\n%s\n", session.stats().format_summary().c_str());
-    womic::net_cleanup();
+    miclink::net_cleanup();
     return 0;
 }

@@ -6,112 +6,48 @@ on:
       - '**.md'
   workflow_dispatch:
     inputs:
-      wdk_id:
-        description: 'WDK winget package id'
-        required: false
-        default: 'Microsoft.WindowsWDK.10.0.28000'
       configuration:
         description: 'Build configuration'
         required: false
         default: 'Release'
 
+# 驱动编译采用微软官方 Windows-driver-samples 的 CI 模式：
+#   nuget restore driver\packages.config  （WDK 头/库/工具集全部来自 NuGet 包）
+#   msbuild driver\MicLinkVirtualMic.sln -p:_NT_TARGET_VERSION=0xA000012
+# 不安装 WDK、不桥接 SDK 目录、不注入 INCLUDE/LIB 环境变量。
+#
+# 版本对应（变更 WDK 时三处同步改）：
+#   driver/packages.config               包版本 10.0.28000.2526
+#   driver/Directory.Build.props         导入路径里的版本号目录名
+#   本文件                               _NT_TARGET_VERSION = 0xA000012 (NTDDI, 10.0.28000)
+
 jobs:
   build:
-    name: Build WomicVirtualMic (x64)
-    runs-on: windows-latest
+    name: Build MicLinkVirtualMic (x64)
+    runs-on: windows-2025-vs2026
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       # ---------------------------------------------------------------
-      # 1. 安装 WDK（runner 自带 VS2026 + SDK 10.0.26100.0，但没带 WDK）
+      # 1. 还原 WDK NuGet 包（~200MB：WDK.x64 + SDK.CPP[.x64]）
       # ---------------------------------------------------------------
-      - name: Install WDK
+      - name: Restore WDK NuGet packages
         shell: pwsh
         run: |
-          $id = "${{ github.event.inputs.wdk_id }}"
-          if ([string]::IsNullOrWhiteSpace($id)) { $id = "Microsoft.WindowsWDK.10.0.28000" }
-          Write-Host "安装 WDK: $id"
-          winget install --id $id `
-            --source winget `
-            --accept-source-agreements `
-            --accept-package-agreements `
-            --disable-interactivity 2>&1 | Out-String
-          Write-Host "winget exit code: $LASTEXITCODE"
-
-      - name: Verify WDK installed
-        shell: pwsh
-        run: |
-          $kits = "C:\Program Files (x86)\Windows Kits\10"
-          Write-Host "Windows Kits 10 子目录:"
-          Get-ChildItem $kits -Directory -EA SilentlyContinue | Select-Object -ExpandProperty Name
-          if (Test-Path "$kits\build") {
-            Write-Host ">>> WDK build 目录存在，版本:"
-            Get-ChildItem "$kits\build" -Directory -EA SilentlyContinue | Select-Object -ExpandProperty Name
-          } else {
-            Write-Host "!!! WDK build 目录不存在 —— 安装可能失败"
+          nuget restore driver\packages.config -PackagesDirectory driver\packages
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # 自检：包内 km 头与工具集 props 必须就位
+          $km = "driver\packages\Microsoft.Windows.WDK.x64.10.0.28000.2526\c\Include\10.0.28000.0\km\portcls.h"
+          $ts = "driver\packages\Microsoft.Windows.WDK.x64.10.0.28000.2526\c\build\10.0.28000.0\x64\WindowsKernelModeDriver\WDK.x64.WindowsKernelModeDriver.props"
+          foreach ($f in @($km, $ts)) {
+            if (Test-Path $f) { Write-Host "OK: $f" } else { Write-Host "!! 缺失: $f"; exit 1 }
           }
-          Write-Host "Include 版本:"
-          Get-ChildItem "$kits\Include" -Directory -EA SilentlyContinue | Select-Object -ExpandProperty Name
-          Write-Host "--- portcls.h 定位（驱动编译必需）---"
-          Get-ChildItem "$kits\Include" -Recurse -Filter "portcls.h" -EA SilentlyContinue |
-            ForEach-Object { Write-Host ("  " + $_.FullName) }
-          Write-Host "Lib 版本:"
-          Get-ChildItem "$kits\Lib" -Directory -EA SilentlyContinue | Select-Object -ExpandProperty Name
 
       # ---------------------------------------------------------------
-      # 2. 编译
+      # 2. 编译（Release x64）
       # ---------------------------------------------------------------
-      - name: Locate MSBuild
-        id: msbuild
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $msb = & $vswhere -latest -requires Microsoft.Component.MSBuild `
-                   -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
-          if (-not $msb) { Write-Host "!! MSBuild 未找到"; exit 1 }
-          Write-Host "MSBuild: $msb"
-          "path=$msb" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-
-      - name: Bridge WDK km headers into registered SDK dir
-        shell: pwsh
-        run: |
-          $kits = "C:\Program Files (x86)\Windows Kits\10"
-          $reg  = "10.0.26100.0"
-          Write-Host "已注册 SDK 版本 (可选目标):"
-          Get-ChildItem "$kits\Include" -Directory -EA SilentlyContinue | Select-Object -ExpandProperty Name
-          # 找出 WDK 实际安装的那个版本目录（含 km 子目录）
-          $wdkVer = $null
-          foreach ($d in Get-ChildItem "$kits\Include" -Directory -EA SilentlyContinue) {
-            if (Test-Path (Join-Path $d.FullName "km")) { $wdkVer = $d.Name; break }
-          }
-          Write-Host "检测到 WDK 版本目录: $wdkVer"
-          if (-not $wdkVer) { Write-Host "!! 未发现含 km 的 Include 版本目录"; exit 1 }
-          $srcInc = Join-Path "$kits\Include" "$wdkVer\km"
-          $dstInc = Join-Path "$kits\Include" "$reg\km"
-          if ($srcInc -ne $dstInc) {
-            Write-Host "桥接头文件: $srcInc -> $dstInc"
-            Copy-Item $srcInc $dstInc -Recurse -Force -EA SilentlyContinue
-          }
-          $srcLib = Join-Path "$kits\Lib" "$wdkVer\km"
-          $dstLib = Join-Path "$kits\Lib" "$reg\km"
-          if ((Test-Path $srcLib) -and ($srcLib -ne $dstLib)) {
-            Write-Host "桥接库文件: $srcLib -> $dstLib"
-            Copy-Item $srcLib $dstLib -Recurse -Force -EA SilentlyContinue
-          }
-          Write-Host "--- 桥接后验证 portcls.h 是否可在目标 SDK 下找到 ---"
-          if (Test-Path "$dstInc\portcls.h") { Write-Host "OK: $dstInc\portcls.h" }
-          else { Write-Host "!! 仍未找到 portcls.h" }
-
-      - name: Sanity check - list driver tree
-        shell: pwsh
-        run: |
-          Write-Host "workspace = $env:GITHUB_WORKSPACE"
-          Get-ChildItem "$env:GITHUB_WORKSPACE\driver" -Recurse -Depth 2 |
-            Select-Object -ExpandProperty FullName | Select-Object -First 40
-
       - name: Build solution (Release x64)
         id: build
         shell: pwsh
@@ -119,33 +55,21 @@ jobs:
         run: |
           $cfg = "${{ github.event.inputs.configuration }}"
           if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg = "Release" }
-          $msb = "${{ steps.msbuild.outputs.path }}"
-          $sln = Join-Path $env:GITHUB_WORKSPACE "driver\WomicVirtualMic.sln"
+          $sln = Join-Path $env:GITHUB_WORKSPACE "driver\MicLinkVirtualMic.sln"
           if (-not (Test-Path $sln)) {
             Write-Host "!!! sln 不存在: $sln"
             "exit=99" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
             exit 99
           }
-          Write-Host "编译: $sln"
-          # WDK 的 km 头/库不在 VC 默认搜索路径里（WDK targets 未按当前
-          # WindowsTargetPlatformVersion 拼出 km 路径）。CL.exe/LINK.exe 会读取
-          # INCLUDE / LIB 环境变量，这里显式补上桥接过来的 km 目录。
-          $kits  = "C:\Program Files (x86)\Windows Kits\10"
-          $kmInc = "$kits\Include\10.0.26100.0\km"
-          $kmLib = "$kits\Lib\10.0.26100.0\km\x64"
-          if (Test-Path $kmInc) {
-            $env:INCLUDE = "$kmInc;" + $env:INCLUDE
-            Write-Host "INCLUDE += $kmInc"
-          }
-          if (Test-Path $kmLib) {
-            $env:LIB = "$kmLib;" + $env:LIB
-            Write-Host "LIB += $kmLib"
-          }
-          & $msb $sln `
-              "/p:Configuration=$cfg" "/p:Platform=x64" `
-              "/p:WindowsTargetPlatformVersion=10.0.26100.0" `
-              "/m" "/nologo" "/v:minimal" `
-              "/flp:logfile=build.log;verbosity=detailed"
+          Write-Host "编译: $sln ($cfg|x64)"
+          msbuild $sln `
+            -t:rebuild `
+            -nologo -v:minimal -m `
+            "-p:Configuration=$cfg" "-p:Platform=x64" `
+            "-p:TargetVersion=Windows10" `
+            "-p:_NT_TARGET_VERSION=0xA000012" `
+            "-p:InfVerif_AdditionalOptions=/samples" `
+            "-flp:logfile=build.log;verbosity=detailed"
           $code = $LASTEXITCODE
           Write-Host "MSBuild exit code: $code"
           "exit=$code" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -155,8 +79,11 @@ jobs:
         shell: pwsh
         run: |
           if (Test-Path build.log) {
-            Write-Host "===== build.log 最后 200 行 ====="
-            Get-Content build.log -Tail 200
+            Write-Host "===== build.log 错误与末尾 ====="
+            Select-String -Path build.log -Pattern "error|Error" |
+              Select-Object -Last 30 | ForEach-Object { $_.Line }
+            Write-Host "===== 末尾 60 行 ====="
+            Get-Content build.log -Tail 60
           } else { Write-Host "无 build.log" }
 
       # ---------------------------------------------------------------
@@ -175,7 +102,6 @@ jobs:
             }
           } else {
             Write-Host "!!! 未找到任何 sys/inf/cat/pdb"
-            Write-Host "--- driver 下的 Release/x64 目录 ---"
             Get-ChildItem -Path driver -Recurse -Directory -EA SilentlyContinue |
               Where-Object { $_.Name -match "Release|x64" } | Select-Object -ExpandProperty FullName
           }
@@ -184,7 +110,7 @@ jobs:
       - name: Upload driver artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: womic-driver-x64
+          name: miclink-driver-x64
           path: out/
           if-no-files-found: warn
 

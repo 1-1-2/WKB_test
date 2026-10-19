@@ -3,9 +3,9 @@
  *
  * 链路（全部是真东西，只有"内核驱动"被 Fake 后端替换）：
  *
- *   发送线程：合成扫频 -> libopus 编码 -> womic_packet_encode -> 真实 UDP socket
+ *   发送线程：合成扫频 -> libopus 编码 -> miclink_packet_encode -> 真实 UDP socket
  *             -> 127.0.0.1:<port>
- *   服务端  ：udp_receiver（真 socket）-> womic_packet_decode -> opus 解码
+ *   服务端  ：udp_receiver（真 socket）-> miclink_packet_decode -> opus 解码
  *             -> 抖动缓冲 -> (服务端重采样) -> 去咔哒/增益 -> PcmRing
  *             -> Injector -> FakeDeviceBackend（模拟内核消费）
  *
@@ -36,7 +36,7 @@
 #include "net_socket.h"
 #include "session.h"
 #include "threads_sync.h"
-#include "womic/womic_protocol.h"
+#include "miclink/miclink_protocol.h"
 
 namespace {
 
@@ -146,7 +146,7 @@ enum class FecMode {
 class UdpSender {
 public:
     UdpSender(uint32_t rate, uint32_t frame_ms, uint32_t packets, double duration_sec, double loss,
-              const womic::NetEndpoint &dst, FecMode fec_mode = FecMode::kOff,
+              const miclink::NetEndpoint &dst, FecMode fec_mode = FecMode::kOff,
               uint32_t fec_period = 16u)
         : rate_(rate),
           frame_ms_(frame_ms),
@@ -180,13 +180,13 @@ public:
         }
         opus_encoder_ctl(encoder_, OPUS_SET_BITRATE(64000));
 
-        womic::UdpOptions opts;
+        miclink::UdpOptions opts;
         opts.port = 0u; /* 让系统分配源端口 */
         opts.non_blocking = true;
         opts.reuse_addr = true;
         uint16_t bound = 0u;
-        sock_ = womic::udp_open(opts, &bound, err);
-        if (sock_ == womic::kInvalidSocket) {
+        sock_ = miclink::udp_open(opts, &bound, err);
+        if (sock_ == miclink::kInvalidSocket) {
             return false;
         }
 
@@ -218,11 +218,11 @@ private:
     bool emit(uint32_t seq, uint32_t timestamp_ms, const uint8_t *payload, int payload_len,
               uint16_t flags)
     {
-        uint8_t packet[WOMIC_PROTO_MAX_HEADER + WOMIC_PROTO_MAX_PAYLOAD];
-        womic_packet_header header {};
-        header.magic = WOMIC_PROTOCOL_MAGIC;
-        header.version = static_cast<uint16_t>(WOMIC_PROTOCOL_VERSION);
-        header.header_size = static_cast<uint16_t>(WOMIC_PACKET_HEADER_SIZE);
+        uint8_t packet[MICLINK_PROTO_MAX_HEADER + MICLINK_PROTO_MAX_PAYLOAD];
+        miclink_packet_header header {};
+        header.magic = MICLINK_PROTOCOL_MAGIC;
+        header.version = static_cast<uint16_t>(MICLINK_PROTOCOL_VERSION);
+        header.header_size = static_cast<uint16_t>(MICLINK_PACKET_HEADER_SIZE);
         header.seq = seq;
         header.timestamp_ms = timestamp_ms;
         header.sample_rate = rate_;
@@ -232,12 +232,12 @@ private:
         header.flags = flags;
         header.reserved = 0u;
 
-        const int total = womic_packet_encode(&header, payload, packet, sizeof(packet));
+        const int total = miclink_packet_encode(&header, payload, packet, sizeof(packet));
         if (total <= 0) {
             return false;
         }
         std::string send_err;
-        const int n = womic::udp_sendto(sock_, packet, static_cast<size_t>(total), dst_, &send_err);
+        const int n = miclink::udp_sendto(sock_, packet, static_cast<size_t>(total), dst_, &send_err);
         if (n < 0) {
             std::fprintf(stderr, "  [warn] 发送失败: %s\n", send_err.c_str());
             return false;
@@ -256,7 +256,7 @@ private:
         int last_len = 0;
 
         uint32_t seq = 0u;
-        const uint32_t start_ms = womic::steady_now_ms();
+        const uint32_t start_ms = miclink::steady_now_ms();
         for (uint32_t i = 0u; i < packets_; ++i) {
             for (size_t s = 0u; s < pcm.size(); ++s) {
                 pcm[s] = gen.next();
@@ -308,7 +308,7 @@ private:
                      */
                     red_seq = seq;
                 }
-                if (emit(red_seq, frame_ts, last_payload.data(), last_len, WOMIC_FLAG_FEC)) {
+                if (emit(red_seq, frame_ts, last_payload.data(), last_len, MICLINK_FLAG_FEC)) {
                     ++fec_sent_;
                 }
                 if (fec_mode_ == FecMode::kNonConformant) {
@@ -329,9 +329,9 @@ private:
     void pace(uint32_t start_ms, uint32_t index)
     {
         const uint32_t target = start_ms + (index + 1u) * frame_ms_;
-        const uint32_t now = womic::steady_now_ms();
+        const uint32_t now = miclink::steady_now_ms();
         if ((target > now) && ((target - now) < 1000u)) {
-            womic::sleep_ms(target - now);
+            miclink::sleep_ms(target - now);
         }
     }
 
@@ -340,12 +340,12 @@ private:
     uint32_t packets_ = 100u;
     double duration_ = 2.0;
     double loss_ = 0.0;
-    womic::NetEndpoint dst_;
+    miclink::NetEndpoint dst_;
     FecMode fec_mode_ = FecMode::kOff;
     uint32_t fec_period_ = 16u;
     size_t frames_per_packet_ = 0u; /* = rate_ * frame_ms_ / 1000，构造时算好 */
     ::OpusEncoder *encoder_ = nullptr;
-    womic::SocketHandle sock_ = womic::kInvalidSocket;
+    miclink::SocketHandle sock_ = miclink::kInvalidSocket;
     std::thread thread_;
     uint32_t sent_ = 0u;
     uint32_t dropped_ = 0u;
@@ -401,7 +401,7 @@ struct Scenario {
     uint32_t frame_ms;
     double duration_sec;
     double loss_percent;
-    womic::ResamplerBackend resampler;
+    miclink::ResamplerBackend resampler;
     bool check_frequency;
     FecMode fec_mode = FecMode::kOff;
 };
@@ -411,12 +411,12 @@ bool run_scenario(const Scenario &sc)
     check_begin_case(sc.name);
 
     std::string err;
-    if (!womic::net_startup(&err)) {
+    if (!miclink::net_startup(&err)) {
         check(false, "net_startup 失败");
         return false;
     }
 
-    womic::ServerConfig cfg;
+    miclink::ServerConfig cfg;
     cfg.listen_port = 0u; /* 让系统分配端口，避免与并行测试冲突 */
     cfg.endpoint_sample_rate = sc.endpoint_rate;
     cfg.endpoint_channels = 1u;
@@ -435,17 +435,17 @@ bool run_scenario(const Scenario &sc)
     cfg.resampler_quality = 4u;
     cfg.gain_db = 0.0f;
     cfg.declick = true;
-    cfg.log_level = womic::LogLevelValue::kWarn;
+    cfg.log_level = miclink::LogLevelValue::kWarn;
     cfg.enable_level_log = true;
     cfg.status_interval_ms = 0u;
     cfg.client_timeout_ms = 5000u;
 
-    if (!womic::config_validate(cfg, &err)) {
+    if (!miclink::config_validate(cfg, &err)) {
         check_fmt(false, "配置校验失败: %s", err.c_str());
         return false;
     }
 
-    womic::ServerSession session;
+    miclink::ServerSession session;
     if (!session.init(cfg, &err)) {
         check_fmt(false, "会话初始化失败: %s", err.c_str());
         return false;
@@ -455,8 +455,8 @@ bool run_scenario(const Scenario &sc)
         return false;
     }
 
-    womic::FakeDeviceBackend *fake =
-        dynamic_cast<womic::FakeDeviceBackend *>(session.injector().backend());
+    miclink::FakeDeviceBackend *fake =
+        dynamic_cast<miclink::FakeDeviceBackend *>(session.injector().backend());
     if (fake == nullptr) {
         check(false, "设备后端不是 FakeDeviceBackend");
         session.request_stop();
@@ -465,7 +465,7 @@ bool run_scenario(const Scenario &sc)
     }
 
     const uint16_t port = session.receiver().bound_port();
-    const womic::NetEndpoint dst = womic::net_endpoint_from_ipv4(0x7F000001u, port);
+    const miclink::NetEndpoint dst = miclink::net_endpoint_from_ipv4(0x7F000001u, port);
     std::fprintf(stdout, "  服务端监听 127.0.0.1:%u（后端 %s，重采样 %s）\n",
                  static_cast<unsigned>(port), session.injector().backend_name(),
                  session.pipeline().resampler_backend_name());
@@ -498,19 +498,19 @@ bool run_scenario(const Scenario &sc)
         }
     };
 
-    const uint32_t deadline = womic::steady_now_ms() + 20000u;
+    const uint32_t deadline = miclink::steady_now_ms() + 20000u;
     uint64_t last_produced = 0u;
-    uint32_t last_progress_ms = womic::steady_now_ms();
+    uint32_t last_progress_ms = miclink::steady_now_ms();
 
     /*
      * 结束条件：发送端已结束 **且** 产出计数连续 800ms 不再增长 **且**
      * 注入已经把环形缓冲取空。这样能确保抖动缓冲里最后那 target_delay 毫秒
      * 的音频也真的被产出并注入（而不是靠容差提前收工）。
      */
-    while (womic::steady_now_ms() < deadline) {
+    while (miclink::steady_now_ms() < deadline) {
         drain_all();
-        const womic::StatsSnapshot snap = session.stats().snapshot();
-        const uint32_t now = womic::steady_now_ms();
+        const miclink::StatsSnapshot snap = session.stats().snapshot();
+        const uint32_t now = miclink::steady_now_ms();
         if (snap.frames_produced != last_produced) {
             last_produced = snap.frames_produced;
             last_progress_ms = now;
@@ -519,14 +519,14 @@ bool run_scenario(const Scenario &sc)
             (snap.frames_injected >= snap.frames_produced)) {
             break;
         }
-        womic::sleep_ms(1u);
+        miclink::sleep_ms(1u);
     }
 
     sender.join();
 
     /* 退出前先取一次快照：session.join() 会 RESET(clearStats=1) 清零驱动侧计数。 */
     const uint64_t fake_frames_at_stop = fake->frames_written_total();
-    const womic::JitterCounters jc = session.pipeline().jitter().counters();
+    const miclink::JitterCounters jc = session.pipeline().jitter().counters();
 
     session.request_stop();
     session.join();
@@ -544,7 +544,7 @@ bool run_scenario(const Scenario &sc)
         leftover += n;
     }
 
-    const womic::StatsSnapshot snap = session.stats().snapshot();
+    const miclink::StatsSnapshot snap = session.stats().snapshot();
     session.pipeline();
     std::fprintf(stdout,
                  "  发送 %u 包（主动丢弃 %u），收到 %llu 包，解码 %llu 帧，PLC %llu 帧，"
@@ -723,20 +723,20 @@ bool run_discovery_check()
     check_begin_case("E 发现服务往返");
 
     std::string err;
-    if (!womic::net_startup(&err)) {
+    if (!miclink::net_startup(&err)) {
         check(false, "net_startup 失败");
         return false;
     }
 
-    womic::ServerConfig cfg;
+    miclink::ServerConfig cfg;
     cfg.listen_port = 0u;
     cfg.discovery_enabled = true;
     cfg.discovery_port = 0u; /* 由系统分配，避免端口冲突 */
     cfg.device_backend = "fake";
-    cfg.log_level = womic::LogLevelValue::kWarn;
+    cfg.log_level = miclink::LogLevelValue::kWarn;
     cfg.status_interval_ms = 0u;
 
-    womic::ServerSession session;
+    miclink::ServerSession session;
     if (!session.init(cfg, &err) || !session.start(&err)) {
         check_fmt(false, "会话启动失败: %s", err.c_str());
         return false;
@@ -749,42 +749,42 @@ bool run_discovery_check()
         return false;
     }
 
-    womic::UdpOptions opts;
+    miclink::UdpOptions opts;
     opts.port = 0u;
     opts.non_blocking = true;
     opts.enable_broadcast = true;
     uint16_t client_port = 0u;
-    const womic::SocketHandle sock = womic::udp_open(opts, &client_port, &err);
-    if (sock == womic::kInvalidSocket) {
+    const miclink::SocketHandle sock = miclink::udp_open(opts, &client_port, &err);
+    if (sock == miclink::kInvalidSocket) {
         check_fmt(false, "查询端 socket 打开失败: %s", err.c_str());
         session.request_stop();
         session.join();
         return false;
     }
 
-    const std::string query = "WOMIC-DISCOVER 1";
-    const womic::NetEndpoint dst = womic::net_endpoint_from_ipv4(0x7F000001u, discovery_port);
-    const int sent = womic::udp_sendto(sock, reinterpret_cast<const uint8_t *>(query.data()),
+    const std::string query = "MICLINK-DISCOVER 1";
+    const miclink::NetEndpoint dst = miclink::net_endpoint_from_ipv4(0x7F000001u, discovery_port);
+    const int sent = miclink::udp_sendto(sock, reinterpret_cast<const uint8_t *>(query.data()),
                                        query.size(), dst, &err);
     check_fmt(sent == static_cast<int>(query.size()), "已发送发现查询（%d 字节）", sent);
 
     std::string reply;
-    const uint32_t deadline = womic::steady_now_ms() + 3000u;
-    while (womic::steady_now_ms() < deadline) {
+    const uint32_t deadline = miclink::steady_now_ms() + 3000u;
+    while (miclink::steady_now_ms() < deadline) {
         std::string wait_err;
-        if (womic::udp_wait_readable(sock, 100u, &wait_err) <= 0) {
+        if (miclink::udp_wait_readable(sock, 100u, &wait_err) <= 0) {
             continue;
         }
         uint8_t buf[512];
-        womic::NetEndpoint from;
-        const int n = womic::udp_recvfrom(sock, buf, sizeof(buf), &from, &err);
+        miclink::NetEndpoint from;
+        const int n = miclink::udp_recvfrom(sock, buf, sizeof(buf), &from, &err);
         if (n > 0) {
             reply.assign(reinterpret_cast<const char *>(buf), static_cast<size_t>(n));
             break;
         }
     }
 
-    check_fmt(reply.compare(0, 10, "WOMIC-HERE") == 0, "收到发现应答：%s",
+    check_fmt(reply.rfind("MICLINK-HERE", 0) == 0, "收到发现应答：%s",
               reply.empty() ? std::string("(空)").c_str() : reply.c_str());
 
     /* 应答里必须带上音频端口与端点格式，手机端据此直连。 */
@@ -794,7 +794,7 @@ bool run_discovery_check()
               static_cast<unsigned>(session.receiver().bound_port()));
     check_fmt(reply.find("48000") != std::string::npos, "应答中包含端点采样率 48000");
 
-    womic::udp_close(sock);
+    miclink::udp_close(sock);
     session.request_stop();
     session.join();
     return true;
@@ -804,23 +804,23 @@ bool run_discovery_check()
 
 int main()
 {
-    std::fprintf(stdout, "womicserver 端到端流水线测试（Linux，Fake 设备后端 + 真实 UDP/opus）\n");
+    std::fprintf(stdout, "miclinkserver 端到端流水线测试（Linux，Fake 设备后端 + 真实 UDP/opus）\n");
 
     const Scenario scenarios[] = {
         {"A 48k->48k 直通 0% 丢包", 48000u, 48000u, 20u, 2.0, 0.0,
-         womic::ResamplerBackend::kAuto, true},
+         miclink::ResamplerBackend::kAuto, true},
         {"B 48k->48k 直通 5% 丢包", 48000u, 48000u, 20u, 2.0, 5.0,
-         womic::ResamplerBackend::kAuto, false},
+         miclink::ResamplerBackend::kAuto, false},
         {"C 16k->48k soxr 上采样", 16000u, 48000u, 20u, 1.5, 0.0,
-         womic::ResamplerBackend::kSoxr, false},
+         miclink::ResamplerBackend::kSoxr, false},
         {"D 16k->48k speex 上采样", 16000u, 48000u, 20u, 1.5, 0.0,
-         womic::ResamplerBackend::kSpeex, false},
+         miclink::ResamplerBackend::kSpeex, false},
         /* E/F：缺陷 D-01 的回归场景。E 镜像"修复后"的 Android 语义（冗余包复用
            上一帧 seq），F 镜像"修复前"的非合规语义（冗余包占用新 seq）。 */
         {"E FEC 开启（合规语义：冗余包复用上一帧 seq）", 48000u, 48000u, 20u, 2.0, 0.0,
-         womic::ResamplerBackend::kAuto, true, FecMode::kConformant},
+         miclink::ResamplerBackend::kAuto, true, FecMode::kConformant},
         {"F FEC 开启（非合规语义：冗余包占用新 seq）", 48000u, 48000u, 20u, 2.0, 0.0,
-         womic::ResamplerBackend::kAuto, false, FecMode::kNonConformant},
+         miclink::ResamplerBackend::kAuto, false, FecMode::kNonConformant},
     };
 
     for (const Scenario &sc : scenarios) {

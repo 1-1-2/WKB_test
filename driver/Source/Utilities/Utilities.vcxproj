@@ -192,22 +192,22 @@
     <ClCompile Include="hw.cpp" />
     <ClCompile Include="kshelper.cpp" />
     <ClCompile Include="savedata.cpp" />
-    <!-- WOMIC：tonegenerator.cpp 已删除。本驱动从不合成正弦，正弦发生器
+    <!-- MICLINK：tonegenerator.cpp 已删除。本驱动从不合成正弦，正弦发生器
          没有任何调用点（GenerateSine 只出现在注释里），继续编译它是死代码，
          且 DisableToneGenerator 注册表项会误导运维以为还能切回正弦。 -->
     <!--
-      WOMIC：三方共享的纯 C 实现（SPSC 环形缓冲 + 轻量 DSP）。
+      MICLINK：三方共享的纯 C 实现（SPSC 环形缓冲 + 轻量 DSP）。
       这两个是内核态编译单元外壳，内部直接 include
       <repo>\shared\core\src\{ring_buffer,dsp}.c —— 不复制、不改动共享源码。
-      外壳负责在包含共享源之前确定 _KERNEL_MODE，让 womic_atomic.h 走 WDK 分支。
+      外壳负责在包含共享源之前确定 _KERNEL_MODE，让 miclink_atomic.h 走 WDK 分支。
       告警级别单独放宽：共享代码是跨平台纯 C，不应该被内核工程的 /W4 卡住。
     -->
-    <ClCompile Include="womic_shared_ring.c">
+    <ClCompile Include="miclink_shared_ring.c">
       <TreatWarningAsError>false</TreatWarningAsError>
       <WarningLevel>Level3</WarningLevel>
       <DisableSpecificWarnings>4100;4244;4245;4267;4365;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
-    <ClCompile Include="womic_shared_dsp.c">
+    <ClCompile Include="miclink_shared_dsp.c">
       <TreatWarningAsError>false</TreatWarningAsError>
       <WarningLevel>Level3</WarningLevel>
       <DisableSpecificWarnings>4100;4244;4245;4267;4365;4996;%(DisableSpecificWarnings)</DisableSpecificWarnings>

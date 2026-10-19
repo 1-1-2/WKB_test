@@ -12,14 +12,14 @@
  *   Linux  : fd 是 int，-1 表示无效；close()；errno == EAGAIN/EWOULDBLOCK；
  *            fcntl(O_NONBLOCK) 或 MSG_DONTWAIT。
  */
-#ifndef WOMIC_SERVER_NET_SOCKET_H
-#define WOMIC_SERVER_NET_SOCKET_H
+#ifndef MICLINK_SERVER_NET_SOCKET_H
+#define MICLINK_SERVER_NET_SOCKET_H
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 
-namespace womic {
+namespace miclink {
 
 /** 跨平台 socket 句柄抽象。Windows 上是 SOCKET，Linux 上是 int（均非负）。 */
 using SocketHandle = std::uintptr_t;
@@ -109,6 +109,6 @@ int udp_get_recvbuf(SocketHandle sock);
 /** 把最近的 socket 错误码翻译成人类可读字符串。 */
 std::string net_last_error_string(int err);
 
-}  // namespace womic
+}  // namespace miclink
 
-#endif  /* WOMIC_SERVER_NET_SOCKET_H */
+#endif  /* MICLINK_SERVER_NET_SOCKET_H */

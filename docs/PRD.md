@@ -1,4 +1,4 @@
-# womic-open PRD
+# miclink-open PRD
 
 > 版本 v1.0 ｜ 产品经理：许清楚 ｜ 语言：中文
 
@@ -6,7 +6,7 @@
 
 | 项 | 内容 |
 |---|---|
-| 项目名 | `womic_open` |
+| 项目名 | `miclink_open` |
 | 一句话 | 手机麦克风 → Wi-Fi/UDP/Opus → Windows 自带虚拟麦克风驱动，任意应用直接选中即可用，**无需安装第三方虚拟声卡、无需手动路由** |
 | 参考对象 | WO Mic（行为对齐）、MicYou（明确不做其模式） |
 | 技术栈 | WDK/SYSVAD 驱动（C）＋ Windows 服务端（C++/WinUI 或 Qt）＋ Android 端（Kotlin/AudioTrack-Oboe）＋ Opus |
@@ -19,7 +19,7 @@
 
 | # | 目标 | 衡量口径 |
 |---|---|---|
-| G1 | **零第三方虚拟声卡、零手动路由（硬指标）** | 干净 Windows 主机上仅安装本项目驱动 + 服务端；`设置 → 系统 → 声音 → 输入设备` 列表中直接出现 `Womic Virtual Microphone`，可被选为默认输入设备；全过程不出现 VB-Cable / Virtual Audio Cable / 任何第三方音频驱动，用户无需在声音控制面板做任何手工路由配置 |
+| G1 | **零第三方虚拟声卡、零手动路由（硬指标）** | 干净 Windows 主机上仅安装本项目驱动 + 服务端；`设置 → 系统 → 声音 → 输入设备` 列表中直接出现 `MicLink Virtual Microphone`，可被选为默认输入设备；全过程不出现 VB-Cable / Virtual Audio Cable / 任何第三方音频驱动，用户无需在声音控制面板做任何手工路由配置 |
 | G2 | **通用可用性** | Zoom / OBS / Discord / Windows 录音机 四款应用中，**至少 3 款**能不经任何特殊设置直接选中该设备并采集到人声（P0 验证场景为 Zoom / OBS / 录音机） |
 | G3 | **可用性达到"能开会"的音质与延迟** | 局域网内端到端延迟 ≤ 150ms（可接受上限 200ms）；16-bit/48kHz 单声道无爆音、无持续underrun 爆裂声 |
 
@@ -28,7 +28,7 @@
 | 视角 | 用户故事 |
 |---|---|
 | 手机端用户 | 作为一个外出/居家会议的人，我想用手机的高品质麦克风替代笔记本内置麦，这样在安静度和拾音距离上都能明显更好（验证：息屏/免提切换后声音仍然连续） |
-| Windows 端用户（会议） | 作为一个 Zoom 参会者，我想在 Zoom 的"选择麦克风"下拉框里直接看到 `Womic Virtual Microphone` 并选中，这样无需 IT 支持或安装额外的虚拟声卡（验证：Zoom 设置→音频→麦克风下拉可见可选，说话时输入电平条跳动） |
+| Windows 端用户（会议） | 作为一个 Zoom 参会者，我想在 Zoom 的"选择麦克风"下拉框里直接看到 `MicLink Virtual Microphone` 并选中，这样无需 IT 支持或安装额外的虚拟声卡（验证：Zoom 设置→音频→麦克风下拉可见可选，说话时输入电平条跳动） |
 | Windows 端用户（录制） | 作为一个 OBS 主播，我想把手机麦当作一路音频输入源添加到 OBS 场景，这样我能边走动边解说（验证：OBS 音频混合器 → 添加现有源 → 电平条跳动，录音波形正常） |
 | Windows 端用户（快速自检） | 作为普通用户，我想先用一个系统自带工具确认真能录音，这样排查时不必装第三方软件（验证：Windows 录音机录制 10s，回放能听清自己说的话） |
 | 运维/安装者 | 作为需要在一批机器部署的人，我想用一个脚本完成驱动安装，并明确知道当前是测试签名还是正式签名，这样我能判断该不该推给普通员工（验证：`install.ps1 -Mode TestSign` 一键完成；`-Mode Production` 走 EV+Attestation 包） |
@@ -44,7 +44,7 @@
 
 ## 4. 端到端链路概览
 
-手机 App 通过 AudioRecord（VOICE_COMMUNICATION 源）以 48kHz/单声道/16-bit 采集 PCM，按 10ms/20ms 帧交给 libopus 编码（单声道、24–64kbps），封装成带序列号与时间戳的包头后经 UDP 单播发往 Windows 服务端；服务端收包后写入自适应 Jitter Buffer（目标 50–100ms，借鉴 WebRTC NetEq 的自适应调整与丢包隐藏策略），解码出的 PCM 写入 lock-free 环形缓冲；注入线程以**非阻塞**方式从环形缓冲取数据，通过 `DeviceIoControl` 投递到由本驱动在 `DriverEntry` 中独立创建的**控制设备**（与 PortCls 音频设备对象分离），内核侧 miniport 把该 PCM 直接喂给数据流的 DMA/读取路径，从而由 PortCls 呈现为一个真实可用的录音端点 —— 于是任意应用在输入设备列表中看到的 `Womic Virtual Microphone` 与其它硬件麦克风没有区别。整条链路全程不重采样：手机 Opus 采样率、服务端解码采样率、驱动端点格式三者必须一致，不一致时服务端拒绝启动。
+手机 App 通过 AudioRecord（VOICE_COMMUNICATION 源）以 48kHz/单声道/16-bit 采集 PCM，按 10ms/20ms 帧交给 libopus 编码（单声道、24–64kbps），封装成带序列号与时间戳的包头后经 UDP 单播发往 Windows 服务端；服务端收包后写入自适应 Jitter Buffer（目标 50–100ms，借鉴 WebRTC NetEq 的自适应调整与丢包隐藏策略），解码出的 PCM 写入 lock-free 环形缓冲；注入线程以**非阻塞**方式从环形缓冲取数据，通过 `DeviceIoControl` 投递到由本驱动在 `DriverEntry` 中独立创建的**控制设备**（与 PortCls 音频设备对象分离），内核侧 miniport 把该 PCM 直接喂给数据流的 DMA/读取路径，从而由 PortCls 呈现为一个真实可用的录音端点 —— 于是任意应用在输入设备列表中看到的 `MicLink Virtual Microphone` 与其它硬件麦克风没有区别。整条链路全程不重采样：手机 Opus 采样率、服务端解码采样率、驱动端点格式三者必须一致，不一致时服务端拒绝启动。
 
 ```mermaid
 flowchart LR
@@ -58,8 +58,8 @@ flowchart LR
         S3 --> S4["Lock-free RingBuffer<br/>(SPSC)"]
         S4 --> S5["Injector Thread<br/>非阻塞投递"]
     end
-    S5 -->|"DeviceIoControl<br/>IOCTL_WOMIC_WRITE_PCM<br/>自定义控制设备"| K1
-    subgraph Kernel["Windows 内核 (womicdrv.sys)"]
+    S5 -->|"DeviceIoControl<br/>IOCTL_MICLINK_WRITE_PCM<br/>自定义控制设备"| K1
+    subgraph Kernel["Windows 内核 (miclinkdrv.sys)"]
         K1["Control Device<br/>IoCreateDevice + Symlink<br/>IRP_MJ_CREATE/CLOSE"] --> K2["Shared PCM Store"]
         K2 --> K3["SYSVAD simpleaudiosimple<br/>Miniport Mic<br/>(正弦发生器 → 注入 PCM)"]
         K3 --> K4["PortCls Audio Endpoint<br/>录音端点"]
@@ -77,7 +77,7 @@ flowchart LR
 |---|---|---|---|
 | P0-1 | 驱动工程：基于微软官方 SYSVAD 示例的 `simpleaudiosimple` 子目录裁剪，仅保留 miniport mic/speaker | ☐ 源码树含完整的 SYSVAD 公共头/库依赖，移植性完整<br/>☐ 不引入超出 `simpleaudiosimple` 裁剪范围的自定义模块，保持易过 HLK | B |
 | P0-2 | 移除内置正弦波 PCM 生成，改为"从共享内存读取用户态注入的 PCM" | ☐ 驱动不再生成任何正弦波形；静默时输出**零填充**而非 Tone<br/>☐ 代码 diff 可定位到替换点 | B（diff 静态检查 A） |
-| P0-3 | **控制设备与音频设备分离**：`IoCreateDevice` 创建独立控制设备 + 符号链接（`\\.\WomicControl`），不在 PortCls 音频设备对象上建 symlink | ☐ `CreateFile("\\.\WomicControl")` 返回有效句柄<br/>☐ WinObj 中可见独立的 Device 对象与 Symlink，且与 PortCls 音频设备不是同一对象 | B |
+| P0-3 | **控制设备与音频设备分离**：`IoCreateDevice` 创建独立控制设备 + 符号链接（`\\.\MicLinkControl`），不在 PortCls 音频设备对象上建 symlink | ☐ `CreateFile("\\.\MicLinkControl")` 返回有效句柄<br/>☐ WinObj 中可见独立的 Device 对象与 Symlink，且与 PortCls 音频设备不是同一对象 | B |
 | P0-4 | `DriverEntry` 必须挂 `IRP_MJ_CREATE` / `IRP_MJ_CLOSE` / `IRP_MJ_DEVICE_CONTROL` | ☐ 三者均在 dispatch 表中赋值，且 Create/Close 返回 `STATUS_SUCCESS`<br/>☐ 句柄关闭后引用计数归零，重复开关 1000 次无泄漏 | B（代码/guard 静态检查 A） |
 | P0-5 | 正确处理 `PcAddAdapterDevice` / `PcInitializeAdapterDriver` 覆盖 `IRP_MJ_CREATE` 的问题 | ☐ **不出现"CreateFile 成功但声音设置里看不到麦克风"**：两个现象同时满足——控制句柄可打开 **且** 录音端点出现在设备列表<br/>☐ 控制设备创建后清除 `DO_DEVICE_INITIALIZING`；`PcInitializeAdapterDriver` 调用顺序有明确注释说明 | B（顺序检查可静态走查 A） |
 | P0-6 | 音频格式：至少 16-bit/44.1kHz 与 16-bit/48kHz **单声道** | ☐ 端点支持的 WAVEFORMATEX 列表中含这两项<br/>☐ 任一格式下录音波形无失真 | B |
@@ -157,17 +157,17 @@ flowchart LR
 3. 管理员 PowerShell 执行：`bcdedit /set testsigning on` → **重启** → 确认桌面右下角出现"**测试模式**"水印。
 
 ### 用例 B-1：驱动编译（对应 P0-1 / P0-2）
-4. 用 VS 打开 `driver/womicdrv.sln`，配置 `x64 / Debug`，**生成解决方案**。
-5. 预期：0 错误 0 警告（或警告已逐条登记），产出 `womicdrv.sys` + `womicdrv.inf` + `womicdrv.cat`。
+4. 用 VS 打开 `driver/miclinkdrv.sln`，配置 `x64 / Debug`，**生成解决方案**。
+5. 预期：0 错误 0 警告（或警告已逐条登记），产出 `miclinkdrv.sys` + `miclinkdrv.inf` + `miclinkdrv.cat`。
 6. 人工检查：确认 PortCls、WDMSEC 链接正确；确认 Arch/x64 而非 x86。
 
 ### 用例 B-2：安装与端点枚举（对应 P0-3 / P0-5 / P0-6 — **最关键**）
 7. 管理员 PowerShell：`.\tools\install.ps1 -Mode TestSign`。
 8. 预期输出包含"驱动已安装"，且提示重启。重启后：
-9. 打开 `设置 → 系统 → 声音 → 输入`（Win10：声音设置 → 输入设备下拉）。**预期：下拉列表中出现 `Womic Virtual Microphone`**，点击可选为默认设备。
-10. 打开 `控制面板 → 声音 → 录制` 选项卡。**预期：看到名为 `Womic Virtual Microphone` 的录音设备，图标状态正常，非"已禁用/未插入"。**
+9. 打开 `设置 → 系统 → 声音 → 输入`（Win10：声音设置 → 输入设备下拉）。**预期：下拉列表中出现 `MicLink Virtual Microphone`**，点击可选为默认设备。
+10. 打开 `控制面板 → 声音 → 录制` 选项卡。**预期：看到名为 `MicLink Virtual Microphone` 的录音设备，图标状态正常，非"已禁用/未插入"。**
 11. 打开设备管理器 → `音频、视频和游戏控制器` / `声音、视频和游戏控制器`。**预期：无黄色感叹号，无代码 10/52（52 = 签名未通过）条目。**
-12. **反面 TC**：若第 9 步看不到设备但 `CreateFile("\\.\WomicControl")` 却成功 → 即命中 P0-5 描述的经典坑（`PcInitializeAdapterDriver` 覆盖 `IRP_MJ_CREATE` / 控制设备未清 `DO_DEVICE_INITIALIZING`），回到 P0-4/P0-5 排查。**两个现象必须同时满足才算通过。**
+12. **反面 TC**：若第 9 步看不到设备但 `CreateFile("\\.\MicLinkControl")` 却成功 → 即命中 P0-5 描述的经典坑（`PcInitializeAdapterDriver` 覆盖 `IRP_MJ_CREATE` / 控制设备未清 `DO_DEVICE_INITIALIZING`），回到 P0-4/P0-5 排查。**两个现象必须同时满足才算通过。**
 13. 确认清单：整个过程中**没有**出现 VB-Cable / Virtual Audio Cable 相关组件（对应 G1）。
 
 ### 用例 B-3：Windows 录音机（对应 P0-17 场景 1）
@@ -176,11 +176,11 @@ flowchart LR
 16. **预期**：回放清晰可辨，**无正弦/蜂鸣底噪**（蜂鸣 = P0-2 未替换干净），无持续爆裂声（爆裂 = P0-11/P0-12 未做好）。
 
 ### 用例 B-4：OBS（对应 P0-17 场景 2）
-17. OBS → 来源 `+` → `音频输出捕获` / `音频输入捕获` → 设备下拉选择 `Womic Virtual Microphone`。
+17. OBS → 来源 `+` → `音频输出捕获` / `音频输入捕获` → 设备下拉选择 `MicLink Virtual Microphone`。
 18. **预期**：音频混合器中该源电平条随说话跳动；录制 60s 后波形有内容且无周期性断裂。
 
 ### 用例 B-5：Zoom（对应 P0-17 场景 3）
-19. Zoom → 设置 → 音频 → 麦克风下拉 → 选择 `Womic Virtual Microphone`；说话时看输入电平条。
+19. Zoom → 设置 → 音频 → 麦克风下拉 → 选择 `MicLink Virtual Microphone`；说话时看输入电平条。
 20. **预期**：电平条实时跳动；"测试扬声器"之外，加入一场会议测试通话，对端能听清。
 21. Discord / 微信可自选做扩展验证（非必过）。
 
@@ -190,7 +190,7 @@ flowchart LR
 24. 停止服务端 → **预期：驱动输出静音，系统不蓝屏**；重新启动服务端 → 音频自动恢复。
 
 ### 用例 B-7：卸载（对应非功能）
-25. `.\tools\uninstall.ps1` → 重启 → 检查"录制"选项卡中 `Womic Virtual Microphone` 已消失，设备管理器无残留未知设备。
+25. `.\tools\uninstall.ps1` → 重启 → 检查"录制"选项卡中 `MicLink Virtual Microphone` 已消失，设备管理器无残留未知设备。
 
 > **诚实边界声明**：本项目的开发沙箱是 **Linux（Ubuntu）**，无法编译 WDK 内核驱动、无法安装或运行 Windows 驱动、无法运行 Zoom/OBS。因此 **A 类（核心算法单元测试：环形缓冲、Jitter Buffer、Opus 编解码往返、重采样 SNR、协议编解码、静态一致性检查）已在本沙箱内完成并可复跑；B 类（驱动编译、安装、设备枚举、Zoom/OBS 实际采集、稳定性长跑）必须在用户本机 Windows + WDK 环境按上述步骤执行**。任何"已通过"的结论都必须标注属于哪一类。
 

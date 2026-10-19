@@ -17,7 +17,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# protocol_crosscheck -> verify -> android -> womic-open（仓库根）
+# protocol_crosscheck -> verify -> android -> miclink-open（仓库根）
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 
@@ -64,4 +64,4 @@ fi
 
 echo ""
 echo "PASS：Android 端封包与 shared/core 权威实现逐字节一致，"
-echo "      且能被 womic_packet_decode() 正常解回（len=37 = 32 头 + 5 payload）。"
+echo "      且能被 miclink_packet_decode() 正常解回（len=37 = 32 头 + 5 payload）。"

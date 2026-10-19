@@ -22,7 +22,7 @@
 #include <time.h>
 #endif
 
-namespace womic {
+namespace miclink {
 namespace {
 
 constexpr int kLogBufferSize = 1024;
@@ -167,4 +167,4 @@ void log_write(LogLevel level, const char *module, const char *fmt, ...)
     std::fwrite(line, 1, total + 1u, stderr);
 }
 
-}  // namespace womic
+}  // namespace miclink

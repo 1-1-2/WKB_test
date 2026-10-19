@@ -9,31 +9,31 @@
 #include <stdio.h>
 #include <stdint.h>
 
-#include "womic/womic_protocol.h"
+#include "miclink/miclink_protocol.h"
 
 int main(void) {
     uint8_t payload[5] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01};
-    womic_packet_header h;
+    miclink_packet_header h;
     uint8_t dst[128];
     int n;
     int i;
-    womic_packet_header out;
+    miclink_packet_header out;
     const uint8_t *p = NULL;
     int consumed;
 
-    h.magic = WOMIC_PROTOCOL_MAGIC;
-    h.version = WOMIC_PROTOCOL_VERSION;
-    h.header_size = WOMIC_PACKET_HEADER_SIZE;
+    h.magic = MICLINK_PROTOCOL_MAGIC;
+    h.version = MICLINK_PROTOCOL_VERSION;
+    h.header_size = MICLINK_PACKET_HEADER_SIZE;
     h.seq = 0x12345678u;
     h.timestamp_ms = 0x01020304u;
     h.sample_rate = 48000u;
     h.channels = 1u;
     h.frames_per_packet = 960u;
     h.payload_bytes = 5u;
-    h.flags = WOMIC_FLAG_FEC;
+    h.flags = MICLINK_FLAG_FEC;
     h.reserved = 0u;
 
-    n = womic_packet_encode(&h, payload, dst, sizeof(dst));
+    n = miclink_packet_encode(&h, payload, dst, sizeof(dst));
     if (n < 0) {
         printf("encode failed: %d\n", n);
         return 1;
@@ -46,7 +46,7 @@ int main(void) {
     printf("\n");
 
     /* 用权威解码器回读，确认自洽（服务端 decode 必须接受） */
-    consumed = womic_packet_decode(dst, (size_t)n, &out, &p);
+    consumed = miclink_packet_decode(dst, (size_t)n, &out, &p);
     printf("decode=%d seq=%u ts=%u rate=%u ch=%u frames=%u payload=%u flags=%u\n",
            consumed, out.seq, out.timestamp_ms, out.sample_rate, out.channels,
            out.frames_per_packet, out.payload_bytes, out.flags);

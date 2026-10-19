@@ -7,9 +7,9 @@
 
 #include "log.h"
 
-namespace womic {
+namespace miclink {
 
-static constexpr char kWomicLogModule[] = "session";
+static constexpr char kMicLinkLogModule[] = "session";
 
 namespace {
 constexpr uint32_t kRxPollTimeoutMs = 2u;      /* 收包等待上限：同时是播放时钟的推进节拍 */
@@ -85,11 +85,11 @@ bool ServerSession::start(std::string *err)
     if (cfg_.discovery_enabled) {
         std::string discovery_err;
         if (!discovery_.start(cfg_, &discovery_err)) {
-            WOMIC_LOGW("发现服务启动失败（不影响音频）：%s", discovery_err.c_str());
+            MICLINK_LOGW("发现服务启动失败（不影响音频）：%s", discovery_err.c_str());
         }
     }
 
-    WOMIC_LOGI("会话已启动：UDP :%u -> 端点 %u Hz/%u ch（后端 %s）",
+    MICLINK_LOGI("会话已启动：UDP :%u -> 端点 %u Hz/%u ch（后端 %s）",
                static_cast<unsigned>(receiver_.bound_port()), cfg_.endpoint_sample_rate,
                cfg_.endpoint_channels, injector_.backend_name());
     return true;
@@ -117,7 +117,7 @@ void ServerSession::join()
 
 void ServerSession::rx_loop(const std::atomic<bool> &stop)
 {
-    WOMIC_LOGV("rx 线程进入循环");
+    MICLINK_LOGV("rx 线程进入循环");
     while (!stop.load(std::memory_order_acquire)) {
         UdpReceiver::Packet packet;
         const int got = receiver_.poll(kRxPollTimeoutMs, &packet, &stats_);
@@ -125,7 +125,7 @@ void ServerSession::rx_loop(const std::atomic<bool> &stop)
             const AudioPipeline::FeedResult fed =
                 pipeline_.feed(packet.data, packet.size, packet.arrival_ms, stats_);
             if (fed == AudioPipeline::FeedResult::kInvalidPacket) {
-                WOMIC_LOGV("丢弃一个非法包（%zu 字节，来自 %s）", packet.size,
+                MICLINK_LOGV("丢弃一个非法包（%zu 字节，来自 %s）", packet.size,
                            packet.from.to_string().c_str());
             }
         } else if (got < 0) {
@@ -135,7 +135,7 @@ void ServerSession::rx_loop(const std::atomic<bool> &stop)
 
         /*
          * 播放时钟推进：不管有没有收到包都要调用 produce()，
-         * 因为 womic_jb_get 是靠"被调用的时刻"推进播放时间轴的。
+         * 因为 miclink_jb_get 是靠"被调用的时刻"推进播放时间轴的。
          */
         const uint32_t now = steady_now_ms();
         for (int i = 0; i < kMaxProducePerWake; ++i) {
@@ -146,18 +146,18 @@ void ServerSession::rx_loop(const std::atomic<bool> &stop)
             last_produced_seq_ = frame.seq;
             ++produced_frame_count_;
             if (frame.plc) {
-                WOMIC_LOGV("seq %u 缺失，已用 PLC 补齐", frame.seq);
+                MICLINK_LOGV("seq %u 缺失，已用 PLC 补齐", frame.seq);
             }
         }
 
         receiver_.check_client_timeout(now, cfg_.client_timeout_ms, &stats_);
     }
-    WOMIC_LOGV("rx 线程退出（累计产出 %u 帧）", produced_frame_count_);
+    MICLINK_LOGV("rx 线程退出（累计产出 %u 帧）", produced_frame_count_);
 }
 
 void ServerSession::inject_loop(const std::atomic<bool> &stop)
 {
-    WOMIC_LOGV("inject 线程进入循环");
+    MICLINK_LOGV("inject 线程进入循环");
     uint32_t last_status_ms = steady_now_ms();
 
     while (!stop.load(std::memory_order_acquire)) {
@@ -179,13 +179,13 @@ void ServerSession::inject_loop(const std::atomic<bool> &stop)
         const uint32_t now = steady_now_ms();
         if ((now - last_status_ms) >= kStatusPollIntervalMs) {
             last_status_ms = now;
-            WOMIC_STATUS status {};
+            MICLINK_STATUS status {};
             if (injector_.poll_status(&stats_, &status)) {
                 last_status_ = status;
             }
         }
     }
-    WOMIC_LOGV("inject 线程退出");
+    MICLINK_LOGV("inject 线程退出");
 }
 
 double ServerSession::estimate_latency_ms(const StatsSnapshot &snap) const
@@ -206,4 +206,4 @@ double ServerSession::estimate_latency_ms(const StatsSnapshot &snap) const
     return jitter_ms + user_ring_ms + kernel_ring_ms + codec_ms;
 }
 
-}  // namespace womic
+}  // namespace miclink

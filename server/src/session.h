@@ -10,8 +10,8 @@
  * main.cpp 与 tests/test_pipeline.cpp 都用这个类，因此测试跑的就是
  * 生产环境同一套线程编排。
  */
-#ifndef WOMIC_SERVER_SESSION_H
-#define WOMIC_SERVER_SESSION_H
+#ifndef MICLINK_SERVER_SESSION_H
+#define MICLINK_SERVER_SESSION_H
 
 #include <atomic>
 #include <cstdint>
@@ -27,7 +27,7 @@
 #include "threads_sync.h"
 #include "udp_receiver.h"
 
-namespace womic {
+namespace miclink {
 
 class ServerSession {
 public:
@@ -82,10 +82,10 @@ private:
     std::atomic<bool> running_{false};
     uint32_t last_produced_seq_ = 0u;
     uint32_t produced_frame_count_ = 0u;
-    WOMIC_STATUS last_status_ {};
+    MICLINK_STATUS last_status_ {};
     std::vector<int16_t> inject_buf_;
 };
 
-}  // namespace womic
+}  // namespace miclink
 
-#endif  /* WOMIC_SERVER_SESSION_H */
+#endif  /* MICLINK_SERVER_SESSION_H */

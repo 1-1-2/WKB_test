@@ -9,8 +9,8 @@
  * socket 是非阻塞的（ioctlsocket FIONBIO / fcntl O_NONBLOCK），等待由
  * udp_wait_readable(select) 完成，因此收包线程可以在超时后顺带推进播放时钟。
  */
-#ifndef WOMIC_SERVER_UDP_RECEIVER_H
-#define WOMIC_SERVER_UDP_RECEIVER_H
+#ifndef MICLINK_SERVER_UDP_RECEIVER_H
+#define MICLINK_SERVER_UDP_RECEIVER_H
 
 #include <cstdint>
 #include <string>
@@ -18,7 +18,7 @@
 #include "net_socket.h"
 #include "stats.h"
 
-namespace womic {
+namespace miclink {
 
 class UdpReceiver {
 public:
@@ -84,6 +84,6 @@ private:
     uint32_t last_packet_ms_ = 0u;
 };
 
-}  // namespace womic
+}  // namespace miclink
 
-#endif  /* WOMIC_SERVER_UDP_RECEIVER_H */
+#endif  /* MICLINK_SERVER_UDP_RECEIVER_H */

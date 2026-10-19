@@ -1,0 +1,19 @@
+<Project>
+  <!--
+    WDK NuGet 构建接入（对齐 microsoft/Windows-driver-samples 的官方模式）。
+
+    导入顺序很重要：WDK.x64 的 props 会把 WindowsSdkDir 指向包内 c 目录
+    （含 km 头/库与 WindowsKernelModeDriver10.0 工具集），SDK.CPP 系列
+    再补上 CRT/UCRT 的编译与库路径。三个 Import 均带 Exists 条件——
+    没有 restore 过包时静默跳过，工程可正常打开（只是无法编译内核目标）。
+
+    还原命令（CI 与本地一致）：
+        nuget restore driver\packages.config -PackagesDirectory driver\packages
+
+    版本变更时：同步改本文件里的三段版本号目录名、packages.config 的
+    version、以及 CI 的 _NT_TARGET_VERSION（NTDDI 码）。
+  -->
+  <Import Project="packages\Microsoft.Windows.WDK.x64.10.0.28000.2526\build\native\Microsoft.Windows.WDK.x64.props" Condition="Exists('packages\Microsoft.Windows.WDK.x64.10.0.28000.2526\build\native\Microsoft.Windows.WDK.x64.props') and '$(Platform)' == 'x64'" />
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.x64.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'" />
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.props')" />
+</Project>

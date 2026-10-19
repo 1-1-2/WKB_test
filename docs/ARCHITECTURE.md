@@ -1,4 +1,4 @@
-# womic-open 系统架构设计
+# miclink-open 系统架构设计
 
 > 版本 v1.0 ｜ 架构师：高见远 ｜ 语言：中文
 > 上游输入：`docs/PRD.md` v1.0（许清楚）
@@ -20,7 +20,7 @@
 | F-4 | 官方示例 hook PortCls 的 Unload | `adapter.cpp:346-347` | ✅ 一致 |
 | F-5 | `WdfDriverCreate` 设置 `WdfDriverInitNoDispatchOverride` | `adapter.cpp:297-316` | ✅ 一致 |
 | F-6 | 正弦波注入点：`CMiniportWaveRTStream::WriteBytes` | `minwavertstream.cpp:1392-1421`，调用在 **1416 行** | ✅ 一致 |
-| F-7 | ~~`ToneGenerator::Init` 调用~~ | ~~`minwavertstream.cpp:351`~~ | ⛔ **已删除**（基线对照点，现为 `WomicStreamBind`，见 §4.5 / D-04） |
+| F-7 | ~~`ToneGenerator::Init` 调用~~ | ~~`minwavertstream.cpp:351`~~ | ⛔ **已删除**（基线对照点，现为 `MicLinkStreamBind`，见 §4.5 / D-04） |
 | F-8 | ~~ToneGenerator 实现，161 行 `if (m_Mute \|\| g_DisableToneGenerator)`~~ | ~~`driver/Source/Utilities/ToneGenerator.cpp:161`~~ | ⛔ **文件已删除**（D-04） |
 | F-9 | `MicArrayPinSupportedDeviceFormats[]` 当前只有 48kHz/32-bit/2ch 一项 | `micarraywavtable.h:29-61` | ✅ 一致 |
 | F-10 | 端点配对表 | `Source/Filters/minipairs.h` | ✅ 一致 |
@@ -53,12 +53,12 @@ flowchart TB
         JB["jitter_buffer.c/.h<br/>NetEq-lite 自适应<br/>目标 50-100ms · PLC 接口"]
         PR["protocol.c/.h<br/>包头编解码 · magic/ver/seq/ts"]
         DS["dsp.c/.h<br/>增益 · RMS/峰值电平<br/>去咔哒渐变 · 静音填充"]
-        AT["womic_atomic.h<br/>内核/C++11/C89 三态内存序抽象"]
+        AT["miclink_atomic.h<br/>内核/C++11/C89 三态内存序抽象"]
         SR["sample_rate.c/.h<br/>采样率一致性校验"]
     end
 
     subgraph L1["第 1 层：平台绑定"]
-        KD["driver/Source/Main/womicctl.cpp<br/>（内核：NonPagedPool + MemoryBarrier）"]
+        KD["driver/Source/Main/miclinkctl.cpp<br/>（内核：NonPagedPool + MemoryBarrier）"]
         SV["server/（Windows 用户态）<br/>UDP · Opus · Injector · Tray"]
         AN["android/（Kotlin + NDK opus）"]
         TS["tests/（Linux, GoogleTest）"]
@@ -86,7 +86,7 @@ flowchart TB
     AT --> SV
     AT --> TS
     KD --> PC
-    SV -->|"DeviceIoControl<br/>IOCTL_WOMIC_WRITE_PCM"| KD
+    SV -->|"DeviceIoControl<br/>IOCTL_MICLINK_WRITE_PCM"| KD
     AN -->|"UDP / Opus"| SV
     PC --> APP
 ```
@@ -123,7 +123,7 @@ flowchart TB
 
 > **设计决策（保存 vs `PcDispatchIrp`）**：保存原例程**照做**，但**转发路径优先使用 `PcDispatchIrp()`**。
 > 理由：① `PcDispatchIrp` 是 PortCls 官方支持的「拦截器回投」API，且**本示例自己就在 `PnpHandler` 里这么用**（`adapter.cpp:839`），口径一致、可维护性最好；② 直接调保存的裸指针隐含依赖未文档化的调用约定与 IRQL 契约，且会跳过 PortCls 对设备对象的合法性校验，跨 WDK 版本脆弱。
-> 保存下来的指针定位为**兜底与诊断**：若 bring-up 阶段发现 `PcDispatchIrp` 对某类 PortCls 设备返回非预期值，可在编译期宏 `WOMIC_USE_SAVED_DISPATCH` 切换为直接调用保存指针。这是**预案**，不是二选一的赌注。
+> 保存下来的指针定位为**兜底与诊断**：若 bring-up 阶段发现 `PcDispatchIrp` 对某类 PortCls 设备返回非预期值，可在编译期宏 `MICLINK_USE_SAVED_DISPATCH` 切换为直接调用保存指针。这是**预案**，不是二选一的赌注。
 
 ### 2.2 DriverEntry 的精确顺序（不可调换）
 
@@ -134,8 +134,8 @@ flowchart TD
     C --> D["4. PcInitializeAdapterDriver<br/>adapter.cpp:330<br/>⚠ PortCls 在此安装它自己的 dispatch（含 IRP_MJ_CREATE）"]
     D --> E["5. MajorFunction[IRP_MJ_PNP] = PnpHandler<br/>adapter.cpp:341（官方已有，保留）"]
     E --> F["6. ★ 保存 PortCls 原例程 ×4<br/>g_PortClsMj[CREATE/CLOSE/CLEANUP/DEVICE_CONTROL]"]
-    F --> G["7. ★ 覆盖这 4 个 MajorFunction<br/>→ WomicDispatch*"]
-    G --> H["8. ★ WomicCreateControlDevice()<br/>IoCreateDeviceSecure + IoCreateSymbolicLink<br/>⚠ 清 DO_DEVICE_INITIALIZING"]
+    F --> G["7. ★ 覆盖这 4 个 MajorFunction<br/>→ MicLinkDispatch*"]
+    G --> H["8. ★ MicLinkCreateControlDevice()<br/>IoCreateDeviceSecure + IoCreateSymbolicLink<br/>⚠ 清 DO_DEVICE_INITIALIZING"]
     H --> I["9. hook DriverUnload<br/>adapter.cpp:346-347（官方已有，保留）"]
 
     style F fill:#ffe6cc
@@ -155,28 +155,28 @@ flowchart TD
 **设计决策：用「全局指针快速拒绝 + device extension 签名 magic 最终裁定」的两段式判定。**
 
 ```c
-/* driver/Source/Inc/womic/womic_ctl.h */
+/* driver/Source/Inc/miclink/miclink_ctl.h */
 
 /* 4 字节 magic，池 tag 同源命名 */
-#define WOMIC_CONTROL_SIGNATURE  0x574F4D43UL   /* 'WOMC' */
-#define WOMIC_POOLTAG            'CmoW'         /* 调试器显示为 "WomC" */
+#define MICLINK_CONTROL_SIGNATURE  0x574F4D43UL   /* 'WOMC' */
+#define MICLINK_POOLTAG            'CmoW'         /* 调试器显示为 "WomC" */
 
-#define WOMIC_CONTROL_NT_NAME    L"\\Device\\WomicControl"
-#define WOMIC_CONTROL_SYMLINK    L"\\DosDevices\\Global\\WomicControl"   /* 用户态: \\.\WomicControl */
+#define MICLINK_CONTROL_NT_NAME    L"\\Device\\MicLinkControl"
+#define MICLINK_CONTROL_SYMLINK    L"\\DosDevices\\Global\\MicLinkControl"   /* 用户态: \\.\MicLinkControl */
 
-typedef struct _WOMIC_CONTROL_EXT {
-    ULONG            Signature;          /* = WOMIC_CONTROL_SIGNATURE，必须第一个字段 */
+typedef struct _MICLINK_CONTROL_EXT {
+    ULONG            Signature;          /* = MICLINK_CONTROL_SIGNATURE，必须第一个字段 */
     PDEVICE_OBJECT   Self;
     PDEVICE_OBJECT   PhysicalDeviceObject;
     LONG             OpenHandleCount;    /* InterlockedIncrement / Decrement */
     LONG             Injecting;          /* InterlockedExchange */
 
-    WOMIC_FORMAT     InjectFormat;       /* SET_FORMAT 设置的注入格式 */
-    WOMIC_FORMAT     StreamFormat;       /* 当前打开的 capture 流的实际格式 */
+    MICLINK_FORMAT     InjectFormat;       /* SET_FORMAT 设置的注入格式 */
+    MICLINK_FORMAT     StreamFormat;       /* 当前打开的 capture 流的实际格式 */
     LONG             StreamOpen;         /* InterlockedExchange */
 
     /* 内核侧环形缓冲 —— 内存由 NonPagedPool 提供 */
-    womic_ring       Ring;
+    miclink_ring       Ring;
 
     /* 统计（只写侧各自独占，读侧用 Interlocked/volatile 读） */
     volatile LONG64  FramesWritten;
@@ -189,19 +189,19 @@ typedef struct _WOMIC_CONTROL_EXT {
     /* 去咔哒状态（消费者独占） */
     LONG             LastSample;
     LONG             Primed;
-} WOMIC_CONTROL_EXT, *PWOMIC_CONTROL_EXT;
+} MICLINK_CONTROL_EXT, *PMICLINK_CONTROL_EXT;
 
 /* 仅用于生命周期管理（创建/卸载），绝不用于 dispatch 路由 */
-extern PDEVICE_OBJECT g_pWomicControlDevice;
+extern PDEVICE_OBJECT g_pMicLinkControlDevice;
 
 /* 两段式判定：先指针快拒（不读任何内存），再签名终裁 */
-__forceinline BOOLEAN WomicIsControlDevice(_In_ PDEVICE_OBJECT DeviceObject)
+__forceinline BOOLEAN MicLinkIsControlDevice(_In_ PDEVICE_OBJECT DeviceObject)
 {
     if (DeviceObject == NULL)                        { return FALSE; }
-    if (DeviceObject != g_pWomicControlDevice)       { return FALSE; }   /* 快拒：不触碰未知设备的 extension */
+    if (DeviceObject != g_pMicLinkControlDevice)       { return FALSE; }   /* 快拒：不触碰未知设备的 extension */
     if (DeviceObject->DeviceExtension == NULL)       { return FALSE; }
-    return (((PWOMIC_CONTROL_EXT)DeviceObject->DeviceExtension)->Signature
-            == WOMIC_CONTROL_SIGNATURE);                                /* 终裁：防野/已释放指针 */
+    return (((PMICLINK_CONTROL_EXT)DeviceObject->DeviceExtension)->Signature
+            == MICLINK_CONTROL_SIGNATURE);                                /* 终裁：防野/已释放指针 */
 }
 ```
 
@@ -214,31 +214,31 @@ __forceinline BOOLEAN WomicIsControlDevice(_In_ PDEVICE_OBJECT DeviceObject)
 | **★ 两者结合（选定）** | 指针比较先挡掉「读未知设备 extension」的风险；签名比较再挡掉「指针恰好等于已释放地址」的风险。两段都**无需任何锁**，dispatch 热路径零同步。 | 需要保证卸载顺序（先删符号链接 → 再等句柄归零 → 最后 `IoDeleteDevice`） | ✅ 选定 |
 
 **职责边界（硬约定，写进 code review checklist）：**
-- `g_pWomicControlDevice`：只在 `WomicCreateControlDevice` / `WomicDeleteControlDevice` / `DriverUnload` 中读写，**dispatch 中只读**。
+- `g_pMicLinkControlDevice`：只在 `MicLinkCreateControlDevice` / `MicLinkDeleteControlDevice` / `DriverUnload` 中读写，**dispatch 中只读**。
 - `Signature`：**唯一**的路由判据；任何「因为指针相等就直接处理」的写法视为缺陷。
 
 ### 2.4 dispatch 实现（真实代码片段）
 
 ```cpp
-/* driver/Source/Main/womicctl.cpp */
+/* driver/Source/Main/miclinkctl.cpp */
 
 #include "definitions.h"          /* portcls.h / ksdebug.h / wdf.h ... */
 #include <wdmsec.h>               /* IoCreateDeviceSecure —— 需链接 wdmsec.lib */
-#include "womic/womic_ioctl.h"    /* ★ 与服务端/单测三方共享 */
-#include "womic/womic_ring.h"     /* ★ portable ring buffer */
+#include "miclink/miclink_ioctl.h"    /* ★ 与服务端/单测三方共享 */
+#include "miclink/miclink_ring.h"     /* ★ portable ring buffer */
 
-PDEVICE_OBJECT  g_pWomicControlDevice = NULL;
-UNICODE_STRING  g_WomicSymLink;
+PDEVICE_OBJECT  g_pMicLinkControlDevice = NULL;
+UNICODE_STRING  g_MicLinkSymLink;
 
 /*---------------------------------------------------------------
  *  IRP_MJ_CREATE
  *-------------------------------------------------------------*/
 _Use_decl_annotations_
-NTSTATUS WomicDispatchCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+NTSTATUS MicLinkDispatchCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     PAGED_CODE();
 
-    if (!WomicIsControlDevice(DeviceObject))
+    if (!MicLinkIsControlDevice(DeviceObject))
     {
         /*
          * ★★★ 本文件的核心所在 ★★★
@@ -255,8 +255,8 @@ NTSTATUS WomicDispatchCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         return PcDispatchIrp(DeviceObject, Irp);
     }
 
-    PWOMIC_CONTROL_EXT ext = (PWOMIC_CONTROL_EXT)DeviceObject->DeviceExtension;
-    NTSTATUS status = WomicCtlOnOpen(ext);       /* InterlockedIncrement(&OpenHandleCount) */
+    PMICLINK_CONTROL_EXT ext = (PMICLINK_CONTROL_EXT)DeviceObject->DeviceExtension;
+    NTSTATUS status = MicLinkCtlOnOpen(ext);       /* InterlockedIncrement(&OpenHandleCount) */
 
     Irp->IoStatus.Status      = status;
     Irp->IoStatus.Information = 0;
@@ -269,15 +269,15 @@ NTSTATUS WomicDispatchCreate(PDEVICE_OBJECT DeviceObject, PIRP Irp)
  *  ⚠ 可能在 APC_LEVEL / DISPATCH_LEVEL 到达，回调内只允许原子操作
  *-------------------------------------------------------------*/
 _Use_decl_annotations_
-NTSTATUS WomicDispatchClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+NTSTATUS MicLinkDispatchClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-    if (!WomicIsControlDevice(DeviceObject))
+    if (!MicLinkIsControlDevice(DeviceObject))
     {
         return PcDispatchIrp(DeviceObject, Irp);
     }
 
-    PWOMIC_CONTROL_EXT ext = (PWOMIC_CONTROL_EXT)DeviceObject->DeviceExtension;
-    WomicCtlOnClose(ext);   /* 归零则 Injecting=0，驱动输出静音；不删设备对象 */
+    PMICLINK_CONTROL_EXT ext = (PMICLINK_CONTROL_EXT)DeviceObject->DeviceExtension;
+    MicLinkCtlOnClose(ext);   /* 归零则 Injecting=0，驱动输出静音；不删设备对象 */
 
     Irp->IoStatus.Status      = STATUS_SUCCESS;   /* CLOSE 必须成功返回 */
     Irp->IoStatus.Information = 0;
@@ -289,15 +289,15 @@ NTSTATUS WomicDispatchClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
  *  IRP_MJ_CLEANUP —— 进程崩溃 / 句柄未显式关闭时先于 CLOSE 到达
  *-------------------------------------------------------------*/
 _Use_decl_annotations_
-NTSTATUS WomicDispatchCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+NTSTATUS MicLinkDispatchCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-    if (!WomicIsControlDevice(DeviceObject))
+    if (!MicLinkIsControlDevice(DeviceObject))
     {
         return PcDispatchIrp(DeviceObject, Irp);
     }
 
-    PWOMIC_CONTROL_EXT ext = (PWOMIC_CONTROL_EXT)DeviceObject->DeviceExtension;
-    WomicCtlOnCleanup(ext);     /* 释放 per-handle 资源；统计仍保留供诊断 */
+    PMICLINK_CONTROL_EXT ext = (PMICLINK_CONTROL_EXT)DeviceObject->DeviceExtension;
+    MicLinkCtlOnCleanup(ext);     /* 释放 per-handle 资源；统计仍保留供诊断 */
 
     Irp->IoStatus.Status      = STATUS_SUCCESS;
     Irp->IoStatus.Information = 0;
@@ -309,13 +309,13 @@ NTSTATUS WomicDispatchCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
  *  IRP_MJ_DEVICE_CONTROL —— 见 §5 完整 IOCTL 表
  *-------------------------------------------------------------*/
 _Use_decl_annotations_
-NTSTATUS WomicDispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+NTSTATUS MicLinkDispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
-    if (!WomicIsControlDevice(DeviceObject))
+    if (!MicLinkIsControlDevice(DeviceObject))
     {
         return PcDispatchIrp(DeviceObject, Irp);
     }
-    return WomicCtlDispatchIoctl((PWOMIC_CONTROL_EXT)DeviceObject->DeviceExtension,
+    return MicLinkCtlDispatchIoctl((PMICLINK_CONTROL_EXT)DeviceObject->DeviceExtension,
                                  Irp);
 }
 ```
@@ -333,14 +333,14 @@ NTSTATUS PnpHandler(_In_ DEVICE_OBJECT *_DeviceObject, _Inout_ IRP *_Irp)
     /* ... 原有 PAGED_CODE() / ASSERT ... */
 
     /*
-     * ★ womic-open 新增（N-3）：
-     * 控制设备不是 PnP 设备栈成员，其 DeviceExtension 是 WOMIC_CONTROL_EXT，
+     * ★ miclink-open 新增（N-3）：
+     * 控制设备不是 PnP 设备栈成员，其 DeviceExtension 是 MICLINK_CONTROL_EXT，
      * 与 PortClassDeviceContext 布局完全不同。绝不能落入下面的
      * m_pCommon 解析分支，否则野指针解引用 -> BSOD。
      * 按 WDM 惯例：未处理的 PnP 次功能码保持 IoStatus 原值并直接完成，
      * 语义等价于「未处理，取默认行为」。
      */
-    if (WomicIsControlDevice(_DeviceObject))
+    if (MicLinkIsControlDevice(_DeviceObject))
     {
         NTSTATUS status = _Irp->IoStatus.Status;
         IoCompleteRequest(_Irp, IO_NO_INCREMENT);
@@ -359,14 +359,14 @@ NTSTATUS PnpHandler(_In_ DEVICE_OBJECT *_DeviceObject, _Inout_ IRP *_Irp)
 ```cpp
 #pragma code_seg("INIT")
 _Use_decl_annotations_
-NTSTATUS WomicCreateControlDevice(_In_ PDRIVER_OBJECT DriverObject)
+NTSTATUS MicLinkCreateControlDevice(_In_ PDRIVER_OBJECT DriverObject)
 {
     UNICODE_STRING ntName, symLink;
     PDEVICE_OBJECT devObj = NULL;
     NTSTATUS status;
 
-    RtlInitUnicodeString(&ntName,   WOMIC_CONTROL_NT_NAME);
-    RtlInitUnicodeString(&symLink,  WOMIC_CONTROL_SYMLINK);
+    RtlInitUnicodeString(&ntName,   MICLINK_CONTROL_NT_NAME);
+    RtlInitUnicodeString(&symLink,  MICLINK_CONTROL_SYMLINK);
 
     /*
      * ★ 用 IoCreateDeviceSecure 而非 IoCreateDevice：
@@ -377,7 +377,7 @@ NTSTATUS WomicCreateControlDevice(_In_ PDRIVER_OBJECT DriverObject)
      */
     status = IoCreateDeviceSecure(
         DriverObject,
-        sizeof(WOMIC_CONTROL_EXT),
+        sizeof(MICLINK_CONTROL_EXT),
         &ntName,
         FILE_DEVICE_UNKNOWN,
         FILE_DEVICE_SECURE_OPEN,
@@ -388,26 +388,26 @@ NTSTATUS WomicCreateControlDevice(_In_ PDRIVER_OBJECT DriverObject)
 
     if (!NT_SUCCESS(status)) { return status; }
 
-    PWOMIC_CONTROL_EXT ext = (PWOMIC_CONTROL_EXT)devObj->DeviceExtension;
+    PMICLINK_CONTROL_EXT ext = (PMICLINK_CONTROL_EXT)devObj->DeviceExtension;
     RtlZeroMemory(ext, sizeof(*ext));
-    ext->Signature = WOMIC_CONTROL_SIGNATURE;
+    ext->Signature = MICLINK_CONTROL_SIGNATURE;
     ext->Self      = devObj;
 
     /* ★ 环形缓冲：内核侧必须用 NonPagedPool（消费端在 DISPATCH_LEVEL 运行） */
-    if (!WomicRingInitKernel(&ext->Ring, WOMIC_RING_CAPACITY_BYTES)) {
+    if (!MicLinkRingInitKernel(&ext->Ring, MICLINK_RING_CAPACITY_BYTES)) {
         IoDeleteDevice(devObj);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     status = IoCreateSymbolicLink(&symLink, &ntName);
     if (!NT_SUCCESS(status)) {
-        WomicRingDestroyKernel(&ext->Ring);
+        MicLinkRingDestroyKernel(&ext->Ring);
         IoDeleteDevice(devObj);
         return status;
     }
 
-    g_WomicSymLink          = symLink;
-    g_pWomicControlDevice   = devObj;
+    g_MicLinkSymLink          = symLink;
+    g_pMicLinkControlDevice   = devObj;
 
     /*
      * ★★ 关键一行（P0-5 / C-2）★★
@@ -428,10 +428,10 @@ NTSTATUS WomicCreateControlDevice(_In_ PDRIVER_OBJECT DriverObject)
 ```
 
 > 卸载顺序（写进 `DriverUnload`，防止 UAF）：
-> 1. `IoDeleteSymbolicLink(&g_WomicSymLink)` —— 先切断新打开的入口；
-> 2. `g_pWomicControlDevice = NULL` —— dispatch 从此一律转发 PortCls（路由安全）；
+> 1. `IoDeleteSymbolicLink(&g_MicLinkSymLink)` —— 先切断新打开的入口；
+> 2. `g_pMicLinkControlDevice = NULL` —— dispatch 从此一律转发 PortCls（路由安全）；
 > 3. 等待 `OpenHandleCount` 归零（P0 用简单的等待/轮询即可，无 pending IRP）；
-> 4. `WomicRingDestroyKernel` → `IoDeleteDevice`。
+> 4. `MicLinkRingDestroyKernel` → `IoDeleteDevice`。
 
 ### 2.7 CreateFile 时序图
 
@@ -440,23 +440,23 @@ sequenceDiagram
     autonumber
     participant U as 服务端 (用户态)
     participant IO as I/O 管理器
-    participant D as WomicDispatchCreate<br/>(MajorFunction[IRP_MJ_CREATE])
-    participant ID as WomicIsControlDevice
+    participant D as MicLinkDispatchCreate<br/>(MajorFunction[IRP_MJ_CREATE])
+    participant ID as MicLinkIsControlDevice
     participant PC as PcDispatchIrp<br/>(PortCls 原路径)
 
-    Note over U,PC: 场景 A：打开控制设备（符号链接 WomicControl）
-    U->>IO: CreateFileW( "\\\\.\\WomicControl", ... )
+    Note over U,PC: 场景 A：打开控制设备（符号链接 MicLinkControl）
+    U->>IO: CreateFileW( "\\\\.\\MicLinkControl", ... )
     IO->>D: IRP_MJ_CREATE (DeviceObject = 控制设备)
-    D->>ID: WomicIsControlDevice(DeviceObject)
+    D->>ID: MicLinkIsControlDevice(DeviceObject)
     ID-->>D: TRUE（指针相等 && Signature == 'WOMC'）
-    D->>D: WomicCtlOnOpen → InterlockedIncrement(OpenHandleCount)
+    D->>D: MicLinkCtlOnOpen → InterlockedIncrement(OpenHandleCount)
     D->>IO: IoCompleteRequest(STATUS_SUCCESS)
     IO-->>U: 有效句柄 ✅
 
     Note over U,PC: 场景 B：音频应用打开录音端点（PortCls 设备）
     U->>IO: IMMDevice::Activate / CreateFile(audio device)
     IO->>D: IRP_MJ_CREATE (DeviceObject = PortCls FDO)
-    D->>ID: WomicIsControlDevice(DeviceObject)
+    D->>ID: MicLinkIsControlDevice(DeviceObject)
     ID-->>D: FALSE（指针不等，直接返回，不读 extension）
     D->>PC: PcDispatchIrp(DeviceObject, Irp)
     PC->>PC: 实例化 filter / pin 对象
@@ -465,7 +465,7 @@ sequenceDiagram
 
     Note over U,PC: 场景 C：控制设备收到 PNP IRP（N-3 防护）
     IO->>D: IRP_MJ_PNP (DeviceObject = 控制设备)
-    D->>ID: WomicIsControlDevice(DeviceObject)
+    D->>ID: MicLinkIsControlDevice(DeviceObject)
     ID-->>D: TRUE
     D->>IO: IoCompleteRequest(IoStatus.Status 原值)
     Note right of D: 不进入 m_pCommon 解析分支<br/>避免野指针 → BSOD ✅
@@ -475,13 +475,13 @@ sequenceDiagram
 
 | 经典根因 | 本设计的对策 | 对应 PRD |
 |---|---|---|
-| **A. 覆盖 `IRP_MJ_CREATE` 后不转发**，PortCls 收不到 create，filter/pin 不实例化，端点生成器无从枚举 | `WomicDispatchCreate` 对**任何**非控制设备无条件 `PcDispatchIrp()` 回投，PortCls create 路径 100% 保留 | P0-5 |
+| **A. 覆盖 `IRP_MJ_CREATE` 后不转发**，PortCls 收不到 create，filter/pin 不实例化，端点生成器无从枚举 | `MicLinkDispatchCreate` 对**任何**非控制设备无条件 `PcDispatchIrp()` 回投，PortCls create 路径 100% 保留 | P0-5 |
 | **B. 在 `PcInitializeAdapterDriver` 之前覆盖**，被后者静默覆盖，hook 消失 | 覆盖点严格位于 `adapter.cpp:330` **之后**（紧邻官方 341 行的 PNP 覆盖） | P0-5 |
 | **C. 控制设备未清 `DO_DEVICE_INITIALIZING`**，I/O 管理器阻塞打开 | `devObj->Flags &= ~DO_DEVICE_INITIALIZING;`（§2.6 关键一行）。注：音频 FDO 由 `PcAddAdapterDevice` 内部清理，官方注释见 `adapter.cpp:370-372` | P0-5 |
-| **D. 把符号链接建在 PortCls 音频设备对象上**，污染 PortCls 命名空间 | 控制设备由 `IoCreateDeviceSecure` 独立创建，链接建在 `\\Device\\WomicControl` 上，与 PortCls 设备对象无任何关系 | P0-3 / C-1 |
+| **D. 把符号链接建在 PortCls 音频设备对象上**，污染 PortCls 命名空间 | 控制设备由 `IoCreateDeviceSecure` 独立创建，链接建在 `\\Device\\MicLinkControl` 上，与 PortCls 设备对象无任何关系 | P0-3 / C-1 |
 | **E.（本设计新增发现）PNP 处理误解析控制设备扩展** → BSOD | `PnpHandler` 入口短路（§2.5） | 稳定性 |
 
-**验收口径（PRD B-2 第 12 步的反面 TC）：两个现象必须同时成立 —— `CreateFile("\\\\.\\WomicControl")` 成功 **且** `设置 → 系统 → 声音 → 输入` 下拉出现 `Womic Virtual Microphone`。**
+**验收口径（PRD B-2 第 12 步的反面 TC）：两个现象必须同时成立 —— `CreateFile("\\\\.\\MicLinkControl")` 成功 **且** `设置 → 系统 → 声音 → 输入` 下拉出现 `MicLink Virtual Microphone`。**
 
 ---
 
@@ -666,7 +666,7 @@ if ((this->m_DeviceType) == eMicArrayDevice1)
 理由：① 官方示例的 `KSPROPERTY_AUDIO_MIC_ARRAY_GEOMETRY` / `MIC_SNR` / `MIC_SENSITIVITY2` 一整套 property 处理链已按 array 类型打通并验证，改 category 会连带要求增删 property，风险收益比不划算；② 只把几何元素数从 2 降为 1，使「对外声明」与「实际 mono 格式」自洽，HLK 侧无矛盾。
 → 若后续需要「看起来就是普通麦克风」，列为 P1 独立改动项（改 category + 删除 geometry property + 对应 HLK 回归）。
 
-### 4.4 设备名显示为 **"Womic Virtual Microphone"**
+### 4.4 设备名显示为 **"MicLink Virtual Microphone"**
 
 Windows 音频端点的显示名受**三处**影响。PRD/任务书只提到两处，但**第 3 处（`MediaCategories`）在本基线 INF 中缺失**，因此需要**新增**——这是保证名字一定生效的关键。
 
@@ -674,9 +674,9 @@ Windows 音频端点的显示名受**三处**影响。PRD/任务书只提到两�
 
 | # | 位置 | 现状 | 改为 |
 |---|---|---|---|
-| **①** | `[Strings]` 节 `:198` | `SIMPLEAUDIOSAMPLE.WaveMicArray1.szPname="Simple Audio Sample Wave Microphone Array - Front"` | `SIMPLEAUDIOSAMPLE.WaveMicArray1.szPname="Womic Virtual Microphone"` |
-| **①'** | `[Strings]` 节 `:199` | `SIMPLEAUDIOSAMPLE.TopologyMicArray1.szPname="Simple Audio Sample Topology Microphone Array - Front"` | `SIMPLEAUDIOSAMPLE.TopologyMicArray1.szPname="Womic Virtual Microphone"` |
-| **②** | `[Strings]` 节 `:191` | `SIMPLEAUDIOSAMPLE_SA.DeviceDesc="Virtual Audio Device (WDM) - Simple Audio Sample"` | `SIMPLEAUDIOSAMPLE_SA.DeviceDesc="Womic Virtual Microphone"`<br/>（设备管理器 / 声音控制面板「录制」页显示名） |
+| **①** | `[Strings]` 节 `:198` | `SIMPLEAUDIOSAMPLE.WaveMicArray1.szPname="Simple Audio Sample Wave Microphone Array - Front"` | `SIMPLEAUDIOSAMPLE.WaveMicArray1.szPname="MicLink Virtual Microphone"` |
+| **①'** | `[Strings]` 节 `:199` | `SIMPLEAUDIOSAMPLE.TopologyMicArray1.szPname="Simple Audio Sample Topology Microphone Array - Front"` | `SIMPLEAUDIOSAMPLE.TopologyMicArray1.szPname="MicLink Virtual Microphone"` |
+| **②** | `[Strings]` 节 `:191` | `SIMPLEAUDIOSAMPLE_SA.DeviceDesc="Virtual Audio Device (WDM) - Simple Audio Sample"` | `SIMPLEAUDIOSAMPLE_SA.DeviceDesc="MicLink Virtual Microphone"`<br/>（设备管理器 / 声音控制面板「录制」页显示名） |
 | **③** | **新增** `[SIMPLEAUDIOSAMPLE_SA.NT.AddReg]` 节 + `[Strings]` 键 | **缺失** | 注册 KS pin name GUID → 显示名，见下方写法 |
 
 **③ 的具体写法（INF 片段）：**
@@ -696,11 +696,11 @@ AddReg=SIMPLEAUDIOSAMPLE_SA.AddReg
 AddReg=SIMPLEAUDIOSAMPLE_SA.NT.AddReg          ; ← 新增
 
 [SIMPLEAUDIOSAMPLE_SA.NT.AddReg]
-HKLM,\SYSTEM\CurrentControlSet\Control\MediaCategories\%MICARRAY1_CUSTOM_NAME_GUID%,Name,,%WomicMicName%
+HKLM,\SYSTEM\CurrentControlSet\Control\MediaCategories\%MICARRAY1_CUSTOM_NAME_GUID%,Name,,%MicLinkMicName%
 
 [Strings]
 MICARRAY1_CUSTOM_NAME_GUID = "{6AE81FF4-203E-4FE1-88AA-F2D57775CD4A}"
-WomicMicName               = "Womic Virtual Microphone"
+MicLinkMicName               = "MicLink Virtual Microphone"
 ```
 
 > ⚠️ `MICARRAY1_CUSTOM_NAME_GUID` 的值**必须**与 `micarray1toptable.h:20-21` 的 `DEFINE_GUID(MICARRAY1_CUSTOM_NAME, 0x6ae81ff4, 0x203e, 0x4fe1, ...)` 完全一致，否则名字不生效且不报错。
@@ -711,12 +711,12 @@ WomicMicName               = "Womic Virtual Microphone"
 
 | 文件 | 动作 |
 |---|---|
-| `Source/Main/minwavertstream.cpp:1416` | 删除 `m_ToneGenerator.GenerateSine(m_pDmaBuffer + bufferOffset, runWrite);`，改为 `WomicStreamConsume(this, m_pDmaBuffer + bufferOffset, runWrite);` |
-| `Source/Main/minwavertstream.cpp:304-357` | `if (m_bCapture)` 分支内：删除 tone 参数计算（307-350）与 `m_ToneGenerator.Init(...)`（351），改为 `WomicStreamBind(this, m_pWfExt)` 把流绑定到内核环形缓冲 |
+| `Source/Main/minwavertstream.cpp:1416` | 删除 `m_ToneGenerator.GenerateSine(m_pDmaBuffer + bufferOffset, runWrite);`，改为 `MicLinkStreamConsume(this, m_pDmaBuffer + bufferOffset, runWrite);` |
+| `Source/Main/minwavertstream.cpp:304-357` | `if (m_bCapture)` 分支内：删除 tone 参数计算（307-350）与 `m_ToneGenerator.Init(...)`（351），改为 `MicLinkStreamBind(this, m_pWfExt)` 把流绑定到内核环形缓冲 |
 | `Source/Utilities/ToneGenerator.cpp/.h` | **已删除**（缺陷 D-04）：移除正弦注入后 `GenerateSine` 已无任何调用点，继续编译是死代码；`Utilities.vcxproj` 同步移除该项，`adapter.cpp` 不再读取 `DisableToneGenerator` 注册表项 |
 | `Source/Main/Utilities.vcxproj` | 移除 `tonegenerator.cpp` 编译项 |
 
-**静默时输出零填充**（不是 Tone）：`WomicStreamConsume` 在环形缓冲不足时，对缺口部分写 `0`，并施加 §6.4 的去咔哒渐变。
+**静默时输出零填充**（不是 Tone）：`MicLinkStreamConsume` 在环形缓冲不足时，对缺口部分写 `0`，并施加 §6.4 的去咔哒渐变。
 
 ---
 
@@ -728,15 +728,15 @@ WomicMicName               = "Womic Virtual Microphone"
 
 | # | 功能码 | 名称 | CTL_CODE 表达式 | Method | RequiredAccess | 输入 | 输出 |
 |---|---|---|---|---|---|---|---|
-| 1 | `0x900` | `IOCTL_WOMIC_GET_VERSION` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_ANY_ACCESS)` | BUFFERED | `FILE_ANY_ACCESS` | `WOMIC_VERSION` | 同 |
-| 2 | `0x901` | `IOCTL_WOMIC_GET_CAPS` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x901, METHOD_BUFFERED, FILE_ANY_ACCESS)` | BUFFERED | `FILE_ANY_ACCESS` | `WOMIC_CAPS` | 同 |
-| 3 | `0x902` | `IOCTL_WOMIC_GET_FORMAT` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_ANY_ACCESS)` | BUFFERED | `FILE_ANY_ACCESS` | `WOMIC_FORMAT` | 同 |
-| 4 | `0x903` | `IOCTL_WOMIC_SET_FORMAT` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x903, METHOD_BUFFERED, FILE_WRITE_ACCESS)` | BUFFERED | `FILE_WRITE_ACCESS` | `WOMIC_FORMAT` | 同 |
-| 5 | `0x904` | `IOCTL_WOMIC_WRITE_PCM` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x904, METHOD_BUFFERED, FILE_WRITE_ACCESS)` | BUFFERED | `FILE_WRITE_ACCESS` | `WOMIC_WRITE_PCM_IO` + PCM | 无（驱动不写输出缓冲，仅设 `Information` = 已写帧数；见 `womicctl.cpp:793-908`） |
-| 6 | `0x905` | `IOCTL_WOMIC_GET_STATUS` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x905, METHOD_BUFFERED, FILE_ANY_ACCESS)` | BUFFERED | `FILE_ANY_ACCESS` | `WOMIC_STATUS` | 同 |
-| 7 | `0x906` | `IOCTL_WOMIC_RESET` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x906, METHOD_BUFFERED, FILE_WRITE_ACCESS)` | BUFFERED | `FILE_WRITE_ACCESS` | `WOMIC_RESET_IO` | 同 |
-| 8 | `0x907` | `IOCTL_WOMIC_START` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x907, METHOD_BUFFERED, FILE_WRITE_ACCESS)` | BUFFERED | `FILE_WRITE_ACCESS` | `WOMIC_START_IO` | 同 |
-| 9 | `0x908` | `IOCTL_WOMIC_STOP` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x908, METHOD_BUFFERED, FILE_WRITE_ACCESS)` | BUFFERED | `FILE_WRITE_ACCESS` | (空) | 空 |
+| 1 | `0x900` | `IOCTL_MICLINK_GET_VERSION` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_ANY_ACCESS)` | BUFFERED | `FILE_ANY_ACCESS` | `MICLINK_VERSION` | 同 |
+| 2 | `0x901` | `IOCTL_MICLINK_GET_CAPS` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x901, METHOD_BUFFERED, FILE_ANY_ACCESS)` | BUFFERED | `FILE_ANY_ACCESS` | `MICLINK_CAPS` | 同 |
+| 3 | `0x902` | `IOCTL_MICLINK_GET_FORMAT` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x902, METHOD_BUFFERED, FILE_ANY_ACCESS)` | BUFFERED | `FILE_ANY_ACCESS` | `MICLINK_FORMAT` | 同 |
+| 4 | `0x903` | `IOCTL_MICLINK_SET_FORMAT` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x903, METHOD_BUFFERED, FILE_WRITE_ACCESS)` | BUFFERED | `FILE_WRITE_ACCESS` | `MICLINK_FORMAT` | 同 |
+| 5 | `0x904` | `IOCTL_MICLINK_WRITE_PCM` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x904, METHOD_BUFFERED, FILE_WRITE_ACCESS)` | BUFFERED | `FILE_WRITE_ACCESS` | `MICLINK_WRITE_PCM_IO` + PCM | 无（驱动不写输出缓冲，仅设 `Information` = 已写帧数；见 `miclinkctl.cpp:793-908`） |
+| 6 | `0x905` | `IOCTL_MICLINK_GET_STATUS` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x905, METHOD_BUFFERED, FILE_ANY_ACCESS)` | BUFFERED | `FILE_ANY_ACCESS` | `MICLINK_STATUS` | 同 |
+| 7 | `0x906` | `IOCTL_MICLINK_RESET` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x906, METHOD_BUFFERED, FILE_WRITE_ACCESS)` | BUFFERED | `FILE_WRITE_ACCESS` | `MICLINK_RESET_IO` | 同 |
+| 8 | `0x907` | `IOCTL_MICLINK_START` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x907, METHOD_BUFFERED, FILE_WRITE_ACCESS)` | BUFFERED | `FILE_WRITE_ACCESS` | `MICLINK_START_IO` | 同 |
+| 9 | `0x908` | `IOCTL_MICLINK_STOP` | `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x908, METHOD_BUFFERED, FILE_WRITE_ACCESS)` | BUFFERED | `FILE_WRITE_ACCESS` | (空) | 空 |
 
 ### 5.2 Method 选型理由（**这是本节重点**）
 
@@ -747,121 +747,121 @@ WomicMicName               = "Womic Virtual Microphone"
 | **METHOD_NEITHER** | 直接把用户态裸指针放在 `Type3InputBuffer` / `UserBuffer` | ❌ 必须在**调用线程上下文、PASSIVE_LEVEL** 下 `ProbeFor*` + `try/except` 才能访问 —— 与「消费端在 timer DPC 里跑」（N-2）**根本冲突**；❌ 内核安全漏洞头号来源 | ✗ 排除 |
 | **METHOD_OUT_DIRECT** | 为**输出**大缓冲准备的零拷贝 | P0 无「把大块数据读回用户态」的需求 | ✗ 排除 |
 
-> **何时重新考虑 IN_DIRECT**：若未来出现「服务端一次投递 ≥ 256 KB PCM」的需求（例如离线文件灌入），可新增 `IOCTL_WOMIC_WRITE_PCM_DIRECT`（METHOD_IN_DIRECT）作为**可选旁路**，主链路不变。
+> **何时重新考虑 IN_DIRECT**：若未来出现「服务端一次投递 ≥ 256 KB PCM」的需求（例如离线文件灌入），可新增 `IOCTL_MICLINK_WRITE_PCM_DIRECT`（METHOD_IN_DIRECT）作为**可选旁路**，主链路不变。
 
-### 5.3 共享结构体定义（`shared/core/include/womic/womic_ioctl.h`）
+### 5.3 共享结构体定义（`shared/core/include/miclink/miclink_ioctl.h`）
 
 > 约定：**无指针字段、全部定宽类型、自然对齐** → 32 位 / 64 位进程与内核模式布局完全一致，可直接用 `DeviceIoControl` 传递，无需 WOW64 转换。
 
 ```c
-/* womic_ioctl.h —— 内核驱动 / Windows 服务端 / Linux 单测 三方共享
+/* miclink_ioctl.h —— 内核驱动 / Windows 服务端 / Linux 单测 三方共享
  * 纯 C89 兼容（stdint.h 在 MSVC 与 WDK 均可用；如需 C89 严格模式见下方兜底）
  */
-#ifndef WOMIC_IOCTL_H
-#define WOMIC_IOCTL_H
+#ifndef MICLINK_IOCTL_H
+#define MICLINK_IOCTL_H
 
 #include <stdint.h>
 
-#define WOMIC_IOCTL_DEVICE_TYPE  0x00000022u   /* FILE_DEVICE_UNKNOWN */
+#define MICLINK_IOCTL_DEVICE_TYPE  0x00000022u   /* FILE_DEVICE_UNKNOWN */
 
 /* CTL_CODE 位布局：DeviceType<<16 | RequiredAccess<<14 | Function<<2 | Method */
-#define WOMIC_CTL_CODE(fn, method, access) \
-    ((uint32_t)(((WOMIC_IOCTL_DEVICE_TYPE) << 16) | \
+#define MICLINK_CTL_CODE(fn, method, access) \
+    ((uint32_t)(((MICLINK_IOCTL_DEVICE_TYPE) << 16) | \
                 ((uint32_t)(access) << 14)        | \
                 ((uint32_t)(fn) << 2)             | \
                 (uint32_t)(method)))
 
-#define WOMIC_METHOD_BUFFERED 0u
-#define WOMIC_ACCESS_ANY      0u
-#define WOMIC_ACCESS_WRITE    1u   /* FILE_WRITE_ACCESS */
+#define MICLINK_METHOD_BUFFERED 0u
+#define MICLINK_ACCESS_ANY      0u
+#define MICLINK_ACCESS_WRITE    1u   /* FILE_WRITE_ACCESS */
 
-#define WOMIC_IOCTL_GET_VERSION WOMIC_CTL_CODE(0x900, WOMIC_METHOD_BUFFERED, WOMIC_ACCESS_ANY)
-#define WOMIC_IOCTL_GET_CAPS    WOMIC_CTL_CODE(0x901, WOMIC_METHOD_BUFFERED, WOMIC_ACCESS_ANY)
-#define WOMIC_IOCTL_GET_FORMAT  WOMIC_CTL_CODE(0x902, WOMIC_METHOD_BUFFERED, WOMIC_ACCESS_ANY)
-#define WOMIC_IOCTL_SET_FORMAT  WOMIC_CTL_CODE(0x903, WOMIC_METHOD_BUFFERED, WOMIC_ACCESS_WRITE)
-#define WOMIC_IOCTL_WRITE_PCM   WOMIC_CTL_CODE(0x904, WOMIC_METHOD_BUFFERED, WOMIC_ACCESS_WRITE)
-#define WOMIC_IOCTL_GET_STATUS  WOMIC_CTL_CODE(0x905, WOMIC_METHOD_BUFFERED, WOMIC_ACCESS_ANY)
-#define WOMIC_IOCTL_RESET       WOMIC_CTL_CODE(0x906, WOMIC_METHOD_BUFFERED, WOMIC_ACCESS_WRITE)
-#define WOMIC_IOCTL_START       WOMIC_CTL_CODE(0x907, WOMIC_METHOD_BUFFERED, WOMIC_ACCESS_WRITE)
-#define WOMIC_IOCTL_STOP        WOMIC_CTL_CODE(0x908, WOMIC_METHOD_BUFFERED, WOMIC_ACCESS_WRITE)
+#define MICLINK_IOCTL_GET_VERSION MICLINK_CTL_CODE(0x900, MICLINK_METHOD_BUFFERED, MICLINK_ACCESS_ANY)
+#define MICLINK_IOCTL_GET_CAPS    MICLINK_CTL_CODE(0x901, MICLINK_METHOD_BUFFERED, MICLINK_ACCESS_ANY)
+#define MICLINK_IOCTL_GET_FORMAT  MICLINK_CTL_CODE(0x902, MICLINK_METHOD_BUFFERED, MICLINK_ACCESS_ANY)
+#define MICLINK_IOCTL_SET_FORMAT  MICLINK_CTL_CODE(0x903, MICLINK_METHOD_BUFFERED, MICLINK_ACCESS_WRITE)
+#define MICLINK_IOCTL_WRITE_PCM   MICLINK_CTL_CODE(0x904, MICLINK_METHOD_BUFFERED, MICLINK_ACCESS_WRITE)
+#define MICLINK_IOCTL_GET_STATUS  MICLINK_CTL_CODE(0x905, MICLINK_METHOD_BUFFERED, MICLINK_ACCESS_ANY)
+#define MICLINK_IOCTL_RESET       MICLINK_CTL_CODE(0x906, MICLINK_METHOD_BUFFERED, MICLINK_ACCESS_WRITE)
+#define MICLINK_IOCTL_START       MICLINK_CTL_CODE(0x907, MICLINK_METHOD_BUFFERED, MICLINK_ACCESS_WRITE)
+#define MICLINK_IOCTL_STOP        MICLINK_CTL_CODE(0x908, MICLINK_METHOD_BUFFERED, MICLINK_ACCESS_WRITE)
 
-#define WOMIC_ABI_VERSION    1u
-#define WOMIC_DRIVER_VERSION 0x00010000u        /* 1.0.0.0 */
+#define MICLINK_ABI_VERSION    1u
+#define MICLINK_DRIVER_VERSION 0x00010000u        /* 1.0.0.0 */
 
 /* 采样率能力位（P0 仅 44.1k / 48k） */
-#define WOMIC_RATE_44100 0x00000001u
-#define WOMIC_RATE_48000 0x00000002u
+#define MICLINK_RATE_44100 0x00000001u
+#define MICLINK_RATE_48000 0x00000002u
 /* 位深能力位（P0 仅 16-bit） */
-#define WOMIC_BITS_16    0x00000001u
+#define MICLINK_BITS_16    0x00000001u
 
 /* ★ 驱动侧环形缓冲容量（字节）。必须是 2 的幂。
  *   4096 B = 2048 帧 ≈ 42.7 ms @48k ≈ 46.4 ms @44.1k
  *   设计意图：吸收线程调度抖动，同时把驱动侧延迟「结构性封顶」在 ~43 ms。
  *   服务端应把稳态填充量维持在 ~960 B（10 ms）附近，而不是填满。
  */
-#define WOMIC_RING_CAPACITY_BYTES 4096u
+#define MICLINK_RING_CAPACITY_BYTES 4096u
 /* 单次 WRITE_PCM 上限：1 帧 20 ms @48k = 1920 B */
-#define WOMIC_MAX_WRITE_BYTES     1920u
+#define MICLINK_MAX_WRITE_BYTES     1920u
 
 /*---------------- 1) GET_VERSION ----------------*/
-typedef struct womic_version {
-    uint32_t struct_size;      /* in : sizeof(womic_version) */
-    uint32_t abi_version;      /* out: WOMIC_ABI_VERSION     */
-    uint32_t driver_version;   /* out: WOMIC_DRIVER_VERSION  */
+typedef struct miclink_version {
+    uint32_t struct_size;      /* in : sizeof(miclink_version) */
+    uint32_t abi_version;      /* out: MICLINK_ABI_VERSION     */
+    uint32_t driver_version;   /* out: MICLINK_DRIVER_VERSION  */
     uint32_t reserved;
-} womic_version;
+} miclink_version;
 
 /*---------------- 2) GET_CAPS ----------------*/
-typedef struct womic_caps {
+typedef struct miclink_caps {
     uint32_t struct_size;          /* in  */
-    uint32_t sample_rate_mask;     /* out : WOMIC_RATE_* 位掩码 */
-    uint32_t bits_mask;            /* out : WOMIC_BITS_* 位掩码 */
+    uint32_t sample_rate_mask;     /* out : MICLINK_RATE_* 位掩码 */
+    uint32_t bits_mask;            /* out : MICLINK_BITS_* 位掩码 */
     uint32_t max_channels;         /* out : 1 (P0)              */
     uint32_t ring_capacity_bytes;  /* out */
     uint32_t max_write_bytes;      /* out */
     uint32_t default_sample_rate;  /* out : 48000               */
     uint32_t reserved;
-} womic_caps;
+} miclink_caps;
 
 /*---------------- 3) GET_FORMAT / 4) SET_FORMAT ----------------*/
-typedef struct womic_format {
+typedef struct miclink_format {
     uint32_t struct_size;      /* in      */
     uint32_t sample_rate;      /* in /out : 44100 | 48000 */
     uint32_t bits_per_sample;  /* in /out : 16           */
     uint32_t channels;         /* in /out : 1            */
     uint32_t frame_size_bytes; /* out     : channels*bits/8 = 2 */
     uint32_t reserved[3];
-} womic_format;
+} miclink_format;
 
 /*---------------- 5) WRITE_PCM ----------------*/
 /* 溢出策略 */
-#define WOMIC_WRITE_DROP_OLDEST  0x00000000u   /* 默认：丢弃最旧「整帧」腾空间 */
-#define WOMIC_WRITE_REJECT       0x00000001u   /* 空间不足则只写能写下的部分   */
+#define MICLINK_WRITE_DROP_OLDEST  0x00000000u   /* 默认：丢弃最旧「整帧」腾空间 */
+#define MICLINK_WRITE_REJECT       0x00000001u   /* 空间不足则只写能写下的部分   */
 
-typedef struct womic_write_pcm_io {
+typedef struct miclink_write_pcm_io {
     /* --- 输入（用户态填写） --- */
-    uint32_t struct_size;          /* in : sizeof(womic_write_pcm_io) == 32 */
-    uint32_t flags;                /* in : WOMIC_WRITE_*                   */
+    uint32_t struct_size;          /* in : sizeof(miclink_write_pcm_io) == 32 */
+    uint32_t flags;                /* in : MICLINK_WRITE_*                   */
     uint32_t pcm_bytes;            /* in : 必须 % frame_size == 0 且 <= max_write_bytes */
     uint32_t reserved_in;          /* in : 0 */
     /* --- 输出（驱动覆盖填写） --- */
     uint32_t accepted_bytes;       /* out: 实际入环字节数 */
     uint32_t dropped_bytes;        /* out: 为腾空间丢弃的最旧整帧字节数 */
     uint32_t buffered_bytes;       /* out: 写后环内填充量 */
-    uint32_t status_flags;         /* out: WOMIC_STAT_FLAG_* 快照 */
+    uint32_t status_flags;         /* out: MICLINK_STAT_FLAG_* 快照 */
     /* PCM 数据紧随本结构体之后（仅输入方向） */
-} womic_write_pcm_io;
+} miclink_write_pcm_io;
 
 /*---------------- 6) GET_STATUS ----------------*/
 /* 状态位 */
-#define WOMIC_STAT_FLAG_STREAM_OPEN      0x00000001u
-#define WOMIC_STAT_FLAG_INJECTING        0x00000002u
-#define WOMIC_STAT_FLAG_FORMAT_SET       0x00000004u
-#define WOMIC_STAT_FLAG_FORMAT_MISMATCH  0x00000008u
-#define WOMIC_STAT_FLAG_UNDERRUN_LATCHED 0x00000010u
-#define WOMIC_STAT_FLAG_OVERRUN_LATCHED  0x00000020u
+#define MICLINK_STAT_FLAG_STREAM_OPEN      0x00000001u
+#define MICLINK_STAT_FLAG_INJECTING        0x00000002u
+#define MICLINK_STAT_FLAG_FORMAT_SET       0x00000004u
+#define MICLINK_STAT_FLAG_FORMAT_MISMATCH  0x00000008u
+#define MICLINK_STAT_FLAG_UNDERRUN_LATCHED 0x00000010u
+#define MICLINK_STAT_FLAG_OVERRUN_LATCHED  0x00000020u
 
-typedef struct womic_status {
+typedef struct miclink_status {
     uint32_t struct_size;             /* in  */
     uint32_t state_flags;             /* out */
     uint32_t stream_sample_rate;      /* out : 当前打开的 capture 流采样率，0 = 无流 */
@@ -880,28 +880,28 @@ typedef struct womic_status {
     uint64_t overrun_count;
     uint64_t dropped_frames;
     uint64_t reserved[2];
-} womic_status;
+} miclink_status;
 
 /*---------------- 7) RESET ----------------*/
-#define WOMIC_RESET_DROP_BUFFER    0x00000001u
-#define WOMIC_RESET_CLEAR_COUNTERS 0x00000002u
-#define WOMIC_RESET_STOP_INJECTION 0x00000004u
+#define MICLINK_RESET_DROP_BUFFER    0x00000001u
+#define MICLINK_RESET_CLEAR_COUNTERS 0x00000002u
+#define MICLINK_RESET_STOP_INJECTION 0x00000004u
 
-typedef struct womic_reset_io {
+typedef struct miclink_reset_io {
     uint32_t struct_size;   /* in */
-    uint32_t flags;         /* in : WOMIC_RESET_* */
+    uint32_t flags;         /* in : MICLINK_RESET_* */
     uint32_t reserved[2];
-} womic_reset_io;
+} miclink_reset_io;
 
 /*---------------- 8) START / 9) STOP ----------------*/
-typedef struct womic_start_io {
+typedef struct miclink_start_io {
     uint32_t struct_size;   /* in */
     uint32_t flags;         /* in : 0 */
     uint32_t reserved[2];
-} womic_start_io;
+} miclink_start_io;
 /* STOP 无输入结构体，输入输出长度均为 0 */
 
-#endif /* WOMIC_IOCTL_H */
+#endif /* MICLINK_IOCTL_H */
 ```
 
 ### 5.4 错误码约定
@@ -926,7 +926,7 @@ typedef struct womic_start_io {
 
 | 项 | 要求 | 依据 |
 |---|---|---|
-| 环形缓冲内存 | 必须 `ExAllocatePool2(POOL_FLAG_NON_PAGED, size, WOMIC_POOLTAG)` | 消费端 `WriteBytes` 在 **DISPATCH_LEVEL** 运行（N-2） |
+| 环形缓冲内存 | 必须 `ExAllocatePool2(POOL_FLAG_NON_PAGED, size, MICLINK_POOLTAG)` | 消费端 `WriteBytes` 在 **DISPATCH_LEVEL** 运行（N-2） |
 | 系统缓冲 | `METHOD_BUFFERED` 的 `Irp->AssociatedIrp.SystemBuffer` **由 I/O 管理器保证常驻**，驱动可直接读写 | 无需 `ProbeForRead` |
 | 消费端（读侧） | **禁止**：阻塞等待、内存分配、分页内存访问、普通自旋锁获取 | 已在 `m_PositionSpinLock` 之下（N-2），嵌套锁会引入死锁排序风险 |
 | 生产端（写侧，`IRP_MJ_DEVICE_CONTROL`） | PASSIVE_LEVEL，调用线程上下文；允许 `RtlCopyMemory`；**仍不得阻塞** | C-4 |
@@ -955,14 +955,14 @@ typedef struct womic_start_io {
 
 ```
 [服务端注入线程 T3, PASSIVE_LEVEL]
-        │  DeviceIoControl(IOCTL_WOMIC_WRITE_PCM, hdr + PCM)
+        │  DeviceIoControl(IOCTL_MICLINK_WRITE_PCM, hdr + PCM)
         ▼
-[WomicDispatchDeviceControl, PASSIVE_LEVEL]  ── 非控制设备 ──▶ PcDispatchIrp()
+[MicLinkDispatchDeviceControl, PASSIVE_LEVEL]  ── 非控制设备 ──▶ PcDispatchIrp()
         │  IsControlDevice == TRUE
         │  ① 校验长度  ② rb_write(ring, pcm, n, DROP_OLDEST)
         │  ③ 填 accepted/dropped/buffered  ④ IoCompleteRequest(SUCCESS)
         ▼
-[内核环形缓冲 womic_ring, NonPagedPool, SPSC lock-free]
+[内核环形缓冲 miclink_ring, NonPagedPool, SPSC lock-free]
         ▲
         │  rb_read_faded(ring, dst, n)   ← 不足则静音填充 + 去咔哒渐变
         │
@@ -982,8 +982,8 @@ sequenceDiagram
     participant JB as Jitter Buffer
     participant PC as Pacer/解码线程 T3
     participant DC as DeviceIoControl
-    participant KD as WomicDispatchDeviceControl<br/>(内核, PASSIVE_LEVEL)
-    participant RB as womic_ring<br/>(NonPagedPool, SPSC)
+    participant KD as MicLinkDispatchDeviceControl<br/>(内核, PASSIVE_LEVEL)
+    participant RB as miclink_ring<br/>(NonPagedPool, SPSC)
     participant TM as TimerNotifyRT (DPC)<br/>DISPATCH_LEVEL + spinlock
     participant WB as CMiniportWaveRTStream::WriteBytes
     participant AE as PortCls / 音频引擎
@@ -1057,82 +1057,82 @@ sequenceDiagram
 
 | 消费方 | 包含方式 | 内存来源 | 内存序实现 |
 |---|---|---|---|
-| 内核驱动 | `#include "womic/womic_ring.h"`，`driver/Source/Main/womicctl.cpp` 里 `#define WOMIC_KERNEL_MODE` | `ExAllocatePool2(POOL_FLAG_NON_PAGED, ...)` | `ReadAcquire` / `WriteRelease` / `MemoryBarrier()` |
+| 内核驱动 | `#include "miclink/miclink_ring.h"`，`driver/Source/Main/miclinkctl.cpp` 里 `#define MICLINK_KERNEL_MODE` | `ExAllocatePool2(POOL_FLAG_NON_PAGED, ...)` | `ReadAcquire` / `WriteRelease` / `MemoryBarrier()` |
 | Windows 服务端 | 同上，C++17 编译 | `new` / `_aligned_malloc` | `std::atomic` `memory_order_acquire/release` |
 | Linux 单测 | `tests/CMakeLists.txt` 直接编译 `shared/core/src/*.c` | `malloc` / `aligned_alloc` | `__atomic_*` / `__sync_synchronize()` |
 
 ### 7.2 API
 
 ```c
-/* shared/core/include/womic/womic_ring.h */
-#ifndef WOMIC_RING_H
-#define WOMIC_RING_H
+/* shared/core/include/miclink/miclink_ring.h */
+#ifndef MICLINK_RING_H
+#define MICLINK_RING_H
 
 #include <stddef.h>
 #include <stdint.h>
-#include "womic/womic_atomic.h"
+#include "miclink/miclink_atomic.h"
 
 /* 溢出策略 */
 typedef enum {
-    WOMIC_RING_DROP_OLDEST = 0,   /* 丢最旧「整帧」腾空间，实时语音默认 */
-    WOMIC_RING_REJECT      = 1    /* 只写入能装下的整帧，返回实际字节数 */
-} womic_ring_policy;
+    MICLINK_RING_DROP_OLDEST = 0,   /* 丢最旧「整帧」腾空间，实时语音默认 */
+    MICLINK_RING_REJECT      = 1    /* 只写入能装下的整帧，返回实际字节数 */
+} miclink_ring_policy;
 
 /* 单缓存行对齐，避免 head/tail 伪共享 */
-#define WOMIC_CACHELINE 64
+#define MICLINK_CACHELINE 64
 
-typedef struct womic_ring {
+typedef struct miclink_ring {
     unsigned char *data;      /* 由调用方提供的连续内存，长度 == capacity */
     uint32_t       capacity;  /* ★ 必须是 2 的幂，且 >= frame_size */
     uint32_t       mask;      /* == capacity - 1 */
     uint32_t       frame_size;/* 每帧字节数（mono 16-bit = 2） */
 
     /* --- 生产者独占 --- */
-    womic_atomic_u32 head;    /* 累计写入字节数，单调递增，允许自然回绕 */
+    miclink_atomic_u32 head;    /* 累计写入字节数，单调递增，允许自然回绕 */
 
     /* --- 消费者独占 --- */
-    womic_atomic_u32 tail;    /* 累计读取字节数，单调递增，允许自然回绕 */
-} womic_ring;
+    miclink_atomic_u32 tail;    /* 累计读取字节数，单调递增，允许自然回绕 */
+} miclink_ring;
 
 /* capacity 必须是 2 的幂；frame_size > 0；mem 非空。返回 0 成功，非 0 为错误码 */
-int      womic_ring_init(womic_ring *r, void *mem,
+int      miclink_ring_init(miclink_ring *r, void *mem,
                          uint32_t capacity, uint32_t frame_size);
 
-void     womic_ring_reset(womic_ring *r);          /* 仅单线程安全（复位路径） */
+void     miclink_ring_reset(miclink_ring *r);          /* 仅单线程安全（复位路径） */
 
-uint32_t womic_ring_capacity(const womic_ring *r);
-uint32_t womic_ring_frame_size(const womic_ring *r);
+uint32_t miclink_ring_capacity(const miclink_ring *r);
+uint32_t miclink_ring_frame_size(const miclink_ring *r);
 
-uint32_t womic_ring_size(const womic_ring *r);     /* 已填充字节数（生产者视角，偏保守） */
-uint32_t womic_ring_free(const womic_ring *r);
+uint32_t miclink_ring_size(const miclink_ring *r);     /* 已填充字节数（生产者视角，偏保守） */
+uint32_t miclink_ring_free(const miclink_ring *r);
 
 /* 写入。返回实际入环字节数（必为 frame_size 的整数倍）。
  * DROP_OLDEST: 恒等于 bytes；REJECT: <= bytes。 */
-uint32_t womic_ring_write(womic_ring *r, const void *src, uint32_t bytes,
-                          womic_ring_policy policy);
+uint32_t miclink_ring_write(miclink_ring *r, const void *src, uint32_t bytes,
+                          miclink_ring_policy policy);
 
 /* 读取。返回实际读取字节数（frame_size 的整数倍）。不足时读走全部可用数据。 */
-uint32_t womic_ring_read(womic_ring *r, void *dst, uint32_t bytes);
+uint32_t miclink_ring_read(miclink_ring *r, void *dst, uint32_t bytes);
 
 /* 读取并静音补齐 + 边界渐变。返回 dst 中来自真实数据的字节数。
  * ★ 内核 WriteBytes 专用：不足部分写 0，并在接缝处去咔哒。 */
-uint32_t womic_ring_read_faded(womic_ring *r, void *dst, uint32_t bytes,
+uint32_t miclink_ring_read_faded(miclink_ring *r, void *dst, uint32_t bytes,
                                uint32_t ramp_samples,
                                int16_t *last_sample_inout,
                                int *primed_inout);
 
 /* 丢弃最旧数据（整帧对齐）。返回实际丢弃字节数。 */
-uint32_t womic_ring_discard_oldest(womic_ring *r, uint32_t bytes);
+uint32_t miclink_ring_discard_oldest(miclink_ring *r, uint32_t bytes);
 
-#endif /* WOMIC_RING_H */
+#endif /* MICLINK_RING_H */
 ```
 
 ### 7.3 内存序要求与三态抽象
 
 ```c
-/* shared/core/include/womic/womic_atomic.h */
-#ifndef WOMIC_ATOMIC_H
-#define WOMIC_ATOMIC_H
+/* shared/core/include/miclink/miclink_atomic.h */
+#ifndef MICLINK_ATOMIC_H
+#define MICLINK_ATOMIC_H
 
 #include <stdint.h>
 
@@ -1153,52 +1153,52 @@ uint32_t womic_ring_discard_oldest(womic_ring *r, uint32_t bytes);
  * ldar / stlr，语义仍然正确。
  * ========================================================================== */
 
-#if defined(WOMIC_KERNEL_MODE)
+#if defined(MICLINK_KERNEL_MODE)
 #  include <wdm.h>
-   typedef LONG womic_atomic_u32;
-#  define WOMIC_LOAD_ACQUIRE_U32(p)      ((uint32_t)ReadAcquire((LONG volatile *)(p)))
-#  define WOMIC_STORE_RELEASE_U32(p, v)  (WriteRelease((LONG volatile *)(p), (LONG)(v)))
-#  define WOMIC_FENCE_FULL()             MemoryBarrier()
+   typedef LONG miclink_atomic_u32;
+#  define MICLINK_LOAD_ACQUIRE_U32(p)      ((uint32_t)ReadAcquire((LONG volatile *)(p)))
+#  define MICLINK_STORE_RELEASE_U32(p, v)  (WriteRelease((LONG volatile *)(p), (LONG)(v)))
+#  define MICLINK_FENCE_FULL()             MemoryBarrier()
 
 #elif defined(__cplusplus) && (__cplusplus >= 201103L)
 #  include <atomic>
-   typedef std::atomic<uint32_t> womic_atomic_u32;
-#  define WOMIC_LOAD_ACQUIRE_U32(p) \
+   typedef std::atomic<uint32_t> miclink_atomic_u32;
+#  define MICLINK_LOAD_ACQUIRE_U32(p) \
       std::atomic_load_explicit((p), std::memory_order_acquire)
-#  define WOMIC_STORE_RELEASE_U32(p, v) \
+#  define MICLINK_STORE_RELEASE_U32(p, v) \
       std::atomic_store_explicit((p), (uint32_t)(v), std::memory_order_release)
-#  define WOMIC_FENCE_FULL() \
+#  define MICLINK_FENCE_FULL() \
       std::atomic_thread_fence(std::memory_order_seq_cst)
 
 #else
-   typedef uint32_t volatile womic_atomic_u32;
-#  define WOMIC_LOAD_ACQUIRE_U32(p)      (*(uint32_t volatile *)(p))
-#  define WOMIC_STORE_RELEASE_U32(p, v)  (*(uint32_t volatile *)(p) = (uint32_t)(v))
+   typedef uint32_t volatile miclink_atomic_u32;
+#  define MICLINK_LOAD_ACQUIRE_U32(p)      (*(uint32_t volatile *)(p))
+#  define MICLINK_STORE_RELEASE_U32(p, v)  (*(uint32_t volatile *)(p) = (uint32_t)(v))
 #  if defined(__GNUC__) || defined(__clang__)
-#    define WOMIC_FENCE_FULL() __sync_synchronize()
+#    define MICLINK_FENCE_FULL() __sync_synchronize()
 #  else
-#    define WOMIC_FENCE_FULL() _ReadWriteBarrier()
+#    define MICLINK_FENCE_FULL() _ReadWriteBarrier()
 #  endif
 #endif
 
-#endif /* WOMIC_ATOMIC_H */
+#endif /* MICLINK_ATOMIC_H */
 ```
 
 **生产端（写侧，PASSIVE_LEVEL）：**
 ```c
-uint32_t womic_ring_write(womic_ring *r, const void *src, uint32_t bytes,
-                          womic_ring_policy policy)
+uint32_t miclink_ring_write(miclink_ring *r, const void *src, uint32_t bytes,
+                          miclink_ring_policy policy)
 {
-    uint32_t h  = WOMIC_LOAD_ACQUIRE_U32(&r->head);     /* relaxed 即可，acquire 更稳 */
-    uint32_t t  = WOMIC_LOAD_ACQUIRE_U32(&r->tail);     /* ★ acquire：确保读到消费端 release 的 tail */
+    uint32_t h  = MICLINK_LOAD_ACQUIRE_U32(&r->head);     /* relaxed 即可，acquire 更稳 */
+    uint32_t t  = MICLINK_LOAD_ACQUIRE_U32(&r->tail);     /* ★ acquire：确保读到消费端 release 的 tail */
     uint32_t free_bytes = r->capacity - (uint32_t)(h - t);
 
     bytes -= bytes % r->frame_size;                     /* 整帧对齐，防撕裂 */
 
     if (bytes > free_bytes)
     {
-        if (policy == WOMIC_RING_REJECT) { bytes = free_bytes - (free_bytes % r->frame_size); }
-        else { womic_ring_discard_oldest(r, bytes - free_bytes); }
+        if (policy == MICLINK_RING_REJECT) { bytes = free_bytes - (free_bytes % r->frame_size); }
+        else { miclink_ring_discard_oldest(r, bytes - free_bytes); }
     }
 
     uint32_t idx   = h & r->mask;                       /* ★ 掩码代替取模 */
@@ -1206,20 +1206,20 @@ uint32_t womic_ring_write(womic_ring *r, const void *src, uint32_t bytes,
     memcpy(r->data + idx, src, first);
     if (bytes > first) { memcpy(r->data, (const unsigned char*)src + first, bytes - first); }
 
-    WOMIC_STORE_RELEASE_U32(&r->head, h + bytes);       /* ★ release：确保数据先于 head 可见 */
+    MICLINK_STORE_RELEASE_U32(&r->head, h + bytes);       /* ★ release：确保数据先于 head 可见 */
     return bytes;
 }
 ```
 
 **消费端（读侧，DISPATCH_LEVEL + spinlock）：** 对称 —— `acquire` 读 `head`，拷贝数据，`release` 写 `tail`。**无锁、无分配、无阻塞。**
 
-> ⚠️ **为什么热路径不需要全屏障**：SPSC 每侧只需要 store-store 与 load-load/load-store 有序性。x86 TSO 天然满足；ARM64 的 `ldar`/`stlr` 也满足。真正的「store→load 全屏障」需求只出现在 Dekker 互斥这类双方同时读写两个变量的场景，本设计不存在。`WOMIC_FENCE_FULL()` 仅保留给 `reset` 和诊断路径。
+> ⚠️ **为什么热路径不需要全屏障**：SPSC 每侧只需要 store-store 与 load-load/load-store 有序性。x86 TSO 天然满足；ARM64 的 `ldar`/`stlr` 也满足。真正的「store→load 全屏障」需求只出现在 Dekker 互斥这类双方同时读写两个变量的场景，本设计不存在。`MICLINK_FENCE_FULL()` 仅保留给 `reset` 和诊断路径。
 
 ### 7.4 2 的幂次掩码优化
 
 | 项 | 说明 |
 |---|---|
-| 约束 | `capacity` 必须是 2 的幂；`womic_ring_init` 内 `_Static_assert`/运行时断言 `(capacity & (capacity - 1)) == 0 && capacity >= frame_size` |
+| 约束 | `capacity` 必须是 2 的幂；`miclink_ring_init` 内 `_Static_assert`/运行时断言 `(capacity & (capacity - 1)) == 0 && capacity >= frame_size` |
 | 索引 | `idx = pos & r->mask`（`mask = capacity - 1`）—— 1 条 AND 指令，替代 `%`（x86 上 `div` 约 20–40 周期） |
 | 分段 | 一次操作**最多两次 `memcpy`**：`first = min(bytes, capacity - idx)`，回绕部分 `bytes - first` |
 | 计数器 | `head`/`tail` 用 `uint32_t` 单调递增并允许自然溢出；因恒有 `head - tail <= capacity`，无符号回绕减法仍给出正确差值，**无需特殊处理** |
@@ -1228,33 +1228,33 @@ uint32_t womic_ring_write(womic_ring *r, const void *src, uint32_t bytes,
 
 ```mermaid
 classDiagram
-    class womic_ring {
+    class miclink_ring {
         +unsigned char* data
         +uint32_t capacity
         +uint32_t mask
         +uint32_t frame_size
-        +womic_atomic_u32 head
-        +womic_atomic_u32 tail
-        +womic_ring_init(mem, capacity, frame_size) int
-        +womic_ring_reset() void
-        +womic_ring_size() uint32_t
-        +womic_ring_free() uint32_t
-        +womic_ring_write(src, bytes, policy) uint32_t
-        +womic_ring_read(dst, bytes) uint32_t
-        +womic_ring_read_faded(dst, bytes, ramp, last, primed) uint32_t
-        +womic_ring_discard_oldest(bytes) uint32_t
+        +miclink_atomic_u32 head
+        +miclink_atomic_u32 tail
+        +miclink_ring_init(mem, capacity, frame_size) int
+        +miclink_ring_reset() void
+        +miclink_ring_size() uint32_t
+        +miclink_ring_free() uint32_t
+        +miclink_ring_write(src, bytes, policy) uint32_t
+        +miclink_ring_read(dst, bytes) uint32_t
+        +miclink_ring_read_faded(dst, bytes, ramp, last, primed) uint32_t
+        +miclink_ring_discard_oldest(bytes) uint32_t
     }
 
-    class womic_atomic_u32 {
+    class miclink_atomic_u32 {
         <<abstraction>>
-        +WOMIC_LOAD_ACQUIRE_U32(p)
-        +WOMIC_STORE_RELEASE_U32(p, v)
-        +WOMIC_FENCE_FULL()
+        +MICLINK_LOAD_ACQUIRE_U32(p)
+        +MICLINK_STORE_RELEASE_U32(p, v)
+        +MICLINK_FENCE_FULL()
     }
 
-    note for womic_atomic_u32 "三态实现:<br/>WDK内核=ReadAcquire/WriteRelease/MemoryBarrier<br/>C++11=atomic_load/store_explicit<br/>C89=volatile+__sync_synchronize"
+    note for miclink_atomic_u32 "三态实现:<br/>WDK内核=ReadAcquire/WriteRelease/MemoryBarrier<br/>C++11=atomic_load/store_explicit<br/>C89=volatile+__sync_synchronize"
 
-    class WOMIC_FORMAT {
+    class MICLINK_FORMAT {
         +uint32_t struct_size
         +uint32_t sample_rate
         +uint32_t bits_per_sample
@@ -1262,7 +1262,7 @@ classDiagram
         +uint32_t frame_size_bytes
     }
 
-    class WOMIC_WRITE_PCM_IO {
+    class MICLINK_WRITE_PCM_IO {
         +uint32_t struct_size
         +uint32_t flags
         +uint32_t pcm_bytes
@@ -1273,7 +1273,7 @@ classDiagram
         +uint32_t status_flags
     }
 
-    class WOMIC_STATUS {
+    class MICLINK_STATUS {
         +uint32_t struct_size
         +uint32_t state_flags
         +uint32_t stream_sample_rate
@@ -1286,14 +1286,14 @@ classDiagram
         +uint64_t overrun_count
     }
 
-    class WOMIC_CONTROL_EXT {
+    class MICLINK_CONTROL_EXT {
         +ULONG Signature
         +PDEVICE_OBJECT Self
         +LONG OpenHandleCount
         +LONG Injecting
-        +WOMIC_FORMAT InjectFormat
-        +WOMIC_FORMAT StreamFormat
-        +womic_ring Ring
+        +MICLINK_FORMAT InjectFormat
+        +MICLINK_FORMAT StreamFormat
+        +miclink_ring Ring
         +volatile LONG64 FramesWritten
         +volatile LONG64 FramesConsumed
         +volatile LONG64 UnderrunCount
@@ -1303,15 +1303,15 @@ classDiagram
         +LONG Primed
     }
 
-    class WomicDispatch {
+    class MicLinkDispatch {
         <<kernel>>
-        +WomicDispatchCreate(dev, irp) NTSTATUS
-        +WomicDispatchClose(dev, irp) NTSTATUS
-        +WomicDispatchCleanup(dev, irp) NTSTATUS
-        +WomicDispatchDeviceControl(dev, irp) NTSTATUS
-        +WomicIsControlDevice(dev) BOOLEAN
-        +WomicCreateControlDevice(drv) NTSTATUS
-        +WomicDeleteControlDevice() void
+        +MicLinkDispatchCreate(dev, irp) NTSTATUS
+        +MicLinkDispatchClose(dev, irp) NTSTATUS
+        +MicLinkDispatchCleanup(dev, irp) NTSTATUS
+        +MicLinkDispatchDeviceControl(dev, irp) NTSTATUS
+        +MicLinkIsControlDevice(dev) BOOLEAN
+        +MicLinkCreateControlDevice(drv) NTSTATUS
+        +MicLinkDeleteControlDevice() void
     }
 
     class CMiniportWaveRTStream {
@@ -1322,7 +1322,7 @@ classDiagram
         -m_pDmaBuffer BYTE*
         -m_ulDmaBufferSize ULONG
         -m_pWfExt PWAVEFORMATEXTENSIBLE
-        +m_RingView WOMIC_RING_VIEW
+        +m_RingView MICLINK_RING_VIEW
     }
 
     class UdpReceiver {
@@ -1359,19 +1359,19 @@ classDiagram
         +recordLoop() void
     }
 
-    WomicDispatch ..> WOMIC_CONTROL_EXT : owns
-    WOMIC_CONTROL_EXT *-- womic_ring : contains ring
-    WOMIC_CONTROL_EXT *-- WOMIC_FORMAT : inject + stream format
-    womic_ring ..> womic_atomic_u32 : uses
-    CMiniportWaveRTStream ..> womic_ring : reads via WomicStreamConsume
+    MicLinkDispatch ..> MICLINK_CONTROL_EXT : owns
+    MICLINK_CONTROL_EXT *-- miclink_ring : contains ring
+    MICLINK_CONTROL_EXT *-- MICLINK_FORMAT : inject + stream format
+    miclink_ring ..> miclink_atomic_u32 : uses
+    CMiniportWaveRTStream ..> miclink_ring : reads via MicLinkStreamConsume
     UdpReceiver --> JitterBuffer : push(packet)
     JitterBuffer --> OpusDecoderWrapper : pop() → opus payload
     OpusDecoderWrapper --> Injector : PCM16 mono
-    Injector ..> WOMIC_WRITE_PCM_IO : DeviceIoControl
-    Injector ..> WOMIC_STATUS : GET_STATUS polling
+    Injector ..> MICLINK_WRITE_PCM_IO : DeviceIoControl
+    Injector ..> MICLINK_STATUS : GET_STATUS polling
     AudioCaptureService --> UdpReceiver : UDP / Opus
-    WomicDispatch ..> WOMIC_WRITE_PCM_IO : IOCTL dispatch
-    WomicDispatch ..> WOMIC_STATUS : IOCTL dispatch
+    MicLinkDispatch ..> MICLINK_WRITE_PCM_IO : IOCTL dispatch
+    MicLinkDispatch ..> MICLINK_STATUS : IOCTL dispatch
 ```
 
 ---
@@ -1382,16 +1382,16 @@ classDiagram
 
 | 模块 | 目录 | 职责 | 平台依赖 | Linux 可测 |
 |---|---|---|---|---|
-| `Womic.Core` | `server/core/` | 配置、日志接口、格式描述、统计聚合 | 无（portable C/C++） | ✅ |
+| `MicLink.Core` | `server/core/` | 配置、日志接口、格式描述、统计聚合 | 无（portable C/C++） | ✅ |
 | `ring_buffer` | `shared/core/src/ring_buffer.c` | SPSC 环形缓冲 | 无 | ✅ |
 | `jitter_buffer` | `shared/core/src/jitter_buffer.c` | NetEq-lite 自适应 JB + PLC 接口 + 抖动统计 | 无 | ✅ |
 | `protocol` | `shared/core/src/protocol.c` | UDP 包头编解码 | 无 | ✅ |
 | `dsp` | `shared/core/src/dsp.c` | 增益、RMS/峰值电平、去咔哒渐变、静音填充 | 无 | ✅ |
 | `sample_rate` | `shared/core/src/sample_rate.c` | 三方采样率一致性校验 | 无 | ✅ |
-| `Womic.Net` | `server/net/` | UDP socket 收包、控制面、统计上报 | Winsock2 | ❌（逻辑可 mock） |
-| `Womic.Opus` | `server/opus/` | libopus decoder 生命周期与解码封装 | libopus | ✅（往返测试） |
-| `Womic.Inject` | `server/inject/` | `CreateFile` / `DeviceIoControl` 封装、格式校验、状态轮询、错误恢复 | Win32 | ❌ |
-| `Womic.App` | `server/app/` | 托盘图标、菜单、状态显示、配置对话框 | Win32 `Shell_NotifyIcon` | ❌ |
+| `MicLink.Net` | `server/net/` | UDP socket 收包、控制面、统计上报 | Winsock2 | ❌（逻辑可 mock） |
+| `MicLink.Opus` | `server/opus/` | libopus decoder 生命周期与解码封装 | libopus | ✅（往返测试） |
+| `MicLink.Inject` | `server/inject/` | `CreateFile` / `DeviceIoControl` 封装、格式校验、状态轮询、错误恢复 | Win32 | ❌ |
+| `MicLink.App` | `server/app/` | 托盘图标、菜单、状态显示、配置对话框 | Win32 `Shell_NotifyIcon` | ❌ |
 
 ### 8.2 线程模型
 
@@ -1434,7 +1434,7 @@ classDiagram
 
 | 模块 | 路径 | 职责 | 关键 API |
 |---|---|---|---|
-| UI | `android/app/src/main/java/io/womic/ui/` | Jetpack Compose：IP/端口输入、连接/停止、电平条、状态卡 | Compose, `ViewModel` |
+| UI | `android/app/src/main/java/io/miclink/ui/` | Jetpack Compose：IP/端口输入、连接/停止、电平条、状态卡 | Compose, `ViewModel` |
 | 采集服务 | `.../capture/AudioCaptureService.kt` | **前台服务**（常驻通知，可一键停止）；AudioRecord 采集循环 | `startForeground()`, `AudioRecord` |
 | 采集配置 | `.../capture/AudioConfig.kt` | `AudioSource.VOICE_COMMUNICATION`、48 kHz、mono、`ENCODING_PCM_16BIT` | `AudioFormat` |
 | 平台通路透传 | `.../capture/PlatformAec.kt` | `AudioManager.MODE_IN_COMMUNICATION`；**不自研 AEC/NS**，仅开关透传 | `AudioManager` |
@@ -1472,7 +1472,7 @@ classDiagram
 | 文件 | 状态 | 说明 |
 |---|---|---|
 | `README.md` | 原样保留 | 微软原始说明 |
-| `SimpleAudioSample.sln` | **修改** | 重命名工程/产物为 `womicdrv` |
+| `SimpleAudioSample.sln` | **修改** | 重命名工程/产物为 `miclinkdrv` |
 | `Package/package.VcxProj` | **修改** | 输出名、INF 名 |
 | `Package/package.VcxProj.Filters` | 原样保留 | |
 | `Source/Filters/Filters.vcxproj` | **修改** | 删除 `speakertopo.cpp` |
@@ -1488,9 +1488,9 @@ classDiagram
 | `Source/Filters/speakerwavtable.h` | 🗑 **删除** | |
 | `Source/Inc/basetopo.h` | 原样保留 | |
 | `Source/Inc/common.h` | 原样保留 | **保留 `eSpeakerDevice` 枚举值**（见 §3.3-R2） |
-| `Source/Inc/definitions.h` | **修改** | 末尾新增 `#include "womic/womic_types.h"` / `womic_ring.h`（须在 `common.h` 之后） |
+| `Source/Inc/definitions.h` | **修改** | 末尾新增 `#include "miclink/miclink_types.h"` / `miclink_ring.h`（须在 `common.h` 之后） |
 | `Source/Inc/endpoints.h` | 原样保留 | |
-| `Source/Inc/Inc.vcxproj` | **修改** | 新增 womic 头文件项 |
+| `Source/Inc/Inc.vcxproj` | **修改** | 新增 miclink 头文件项 |
 | `Source/Inc/Inc.vcxproj.Filters` | **修改** | 同步 |
 | `Source/Inc/kshelper.h` | 原样保留 | |
 | `Source/Inc/mintopo.h` | 原样保留 | |
@@ -1498,15 +1498,15 @@ classDiagram
 | `Source/Main/adapter.cpp` | ★**修改** | §2.2 顺序 + §2.4 dispatch + §2.5 PNP 短路 + §2.6 控制设备 + 删 render filters |
 | `Source/Main/basetopo.cpp` | 原样保留 | |
 | `Source/Main/common.cpp` | 原样保留 | 2712-2715 行仅为注释，保留 |
-| `Source/Main/Main.vcxproj` | **修改** | 新增 `womicctl.cpp`；改名 |
+| `Source/Main/Main.vcxproj` | **修改** | 新增 `miclinkctl.cpp`；改名 |
 | `Source/Main/Main.vcxproj.Filters` | **修改** | 同步 |
 | `Source/Main/mintopo.cpp` | 原样保留 | |
 | `Source/Main/minwavert.cpp` | ★**修改** | §4.2 `DataRangeIntersection` 多选（含回退分支） |
 | `Source/Main/minwavert.h` | 原样保留 | `IsSystemRenderPin` 保持不动 |
-| `Source/Main/minwavertstream.cpp` | ★**修改** | §4.5 `WriteBytes` → `WomicStreamConsume`；`Init` 绑定 ring |
-| `Source/Main/minwavertstream.h` | **修改** | 新增 `WOMIC_RING_VIEW` / `m_RingView` 成员 |
+| `Source/Main/minwavertstream.cpp` | ★**修改** | §4.5 `WriteBytes` → `MicLinkStreamConsume`；`Init` 绑定 ring |
+| `Source/Main/minwavertstream.h` | **修改** | 新增 `MICLINK_RING_VIEW` / `m_RingView` 成员 |
 | `Source/Main/NewDelete.cpp` | 原样保留 | |
-| `Source/Main/SimpleAudioSample.inx` | ★**修改** | §4.4 三处改名 + 删 speaker 节；建议同步改名 `womicdrv.inx` |
+| `Source/Main/SimpleAudioSample.inx` | ★**修改** | §4.4 三处改名 + 删 speaker 节；建议同步改名 `miclinkdrv.inx` |
 | `Source/Main/SimpleAudioSample.rc` | **修改** | 描述/版本信息 |
 | `Source/Utilities/hw.cpp` / `hw.h` | 原样保留 | |
 | `Source/Utilities/kshelper.cpp` | 原样保留 | |
@@ -1519,21 +1519,21 @@ classDiagram
 
 | 路径 | 说明 |
 |---|---|
-| `shared/core/include/womic/womic_types.h` | 定宽类型、静态断言、导出宏 |
-| `shared/core/include/womic/womic_atomic.h` | 三态内存序抽象（§7.3） |
-| `shared/core/include/womic/ring_buffer.h` | ring buffer API（§7.2） |
+| `shared/core/include/miclink/miclink_types.h` | 定宽类型、静态断言、导出宏 |
+| `shared/core/include/miclink/miclink_atomic.h` | 三态内存序抽象（§7.3） |
+| `shared/core/include/miclink/ring_buffer.h` | ring buffer API（§7.2） |
 | `shared/core/src/ring_buffer.c` | portable C 实现 |
-| `shared/core/include/womic/jitter_buffer.h` | NetEq-lite API |
+| `shared/core/include/miclink/jitter_buffer.h` | NetEq-lite API |
 | `shared/core/src/jitter_buffer.c` | 自适应抖动缓冲 + PLC 接口 |
-| `shared/core/include/womic/protocol.h` | UDP 包头定义 |
+| `shared/core/include/miclink/protocol.h` | UDP 包头定义 |
 | `shared/core/src/protocol.c` | 编解码 + 边界校验 |
-| `shared/core/include/womic/dsp.h` | 增益/电平/渐变/静音 |
+| `shared/core/include/miclink/dsp.h` | 增益/电平/渐变/静音 |
 | `shared/core/src/dsp.c` | 定点实现（禁浮点，见 §5.5） |
-| `shared/core/include/womic/sample_rate.h` | 一致性校验 |
+| `shared/core/include/miclink/sample_rate.h` | 一致性校验 |
 | `shared/core/src/sample_rate.c` | 实现 |
-| `driver/Source/Inc/womic/womic_ioctl.h` | **符号链接/副本** → `shared/core` 同名文件 |
-| `driver/Source/Inc/womic/womic_ctl.h` | 控制设备扩展与函数原型（§2.3） |
-| `driver/Source/Main/womicctl.cpp` | 控制设备 + dispatch + IOCTL 实现（§2.4, §2.6） |
+| `driver/Source/Inc/miclink/miclink_ioctl.h` | **符号链接/副本** → `shared/core` 同名文件 |
+| `driver/Source/Inc/miclink/miclink_ctl.h` | 控制设备扩展与函数原型（§2.3） |
+| `driver/Source/Main/miclinkctl.cpp` | 控制设备 + dispatch + IOCTL 实现（§2.4, §2.6） |
 | `server/**` | 见 §8.1 |
 | `android/**` | 见 §9.1 |
 | `tests/**` | 见 §12.2 |
@@ -1600,9 +1600,9 @@ classDiagram
 
 | ID | 任务名 | 子组件 | 源文件 | 依赖 | 优先级 | 验收类别 |
 |---|---|---|---|---|---|---|
-| **T01** | 仓库基础设施 + `shared/core` portable 骨架 + Linux 单测脚手架 | 工具链 | `README.md`、`.gitignore`、`LICENSE`、`shared/core/include/womic/*.h`、`shared/core/src/*.c`（骨架桩）、`tests/CMakeLists.txt`、`vcpkg.json` | — | **P0** | A |
+| **T01** | 仓库基础设施 + `shared/core` portable 骨架 + Linux 单测脚手架 | 工具链 | `README.md`、`.gitignore`、`LICENSE`、`shared/core/include/miclink/*.h`、`shared/core/src/*.c`（骨架桩）、`tests/CMakeLists.txt`、`vcpkg.json` | — | **P0** | A |
 | **T02** | `shared/core` 算法实现 + 全套 Linux 单元测试（ring / jitter / protocol / dsp / opus 往返 / 一致性 / fuzz） | 工具链 + 核心算法 | `shared/core/src/ring_buffer.c`、`jitter_buffer.c`、`protocol.c`、`dsp.c`、`sample_rate.c`；`tests/test_ring_buffer.cpp`、`test_jitter_buffer.cpp`、`test_protocol.cpp`、`test_opus_roundtrip.cpp`、`test_dsp.cpp`、`test_sample_rate.cpp`、`fuzz_protocol.cpp` | T01 | **P0** | **A（沙箱内真实跑）** |
-| **T03** | 内核驱动改造：控制设备 + dispatch + 端点裁剪 + 格式/命名 + 注入 | 驱动 | `driver/Source/Main/womicctl.cpp`(新)、`adapter.cpp`、`minwavertstream.cpp/.h`、`minwavert.cpp`、`Filters/micarraywavtable.h`、`Filters/minipairs.h`、`Filters/micarray1toptable.h`、`Filters/micarraytopo.cpp`、删除 4 个 speaker 文件、`SimpleAudioSample.inx/.rc`、4 个 `.vcxproj(.Filters)` | T01 | **P0** | B（+A 静态检查） |
+| **T03** | 内核驱动改造：控制设备 + dispatch + 端点裁剪 + 格式/命名 + 注入 | 驱动 | `driver/Source/Main/miclinkctl.cpp`(新)、`adapter.cpp`、`minwavertstream.cpp/.h`、`minwavert.cpp`、`Filters/micarraywavtable.h`、`Filters/minipairs.h`、`Filters/micarray1toptable.h`、`Filters/micarraytopo.cpp`、删除 4 个 speaker 文件、`SimpleAudioSample.inx/.rc`、4 个 `.vcxproj(.Filters)` | T01 | **P0** | B（+A 静态检查） |
 | **T04** | Windows 服务端：UDP RX / Jitter Buffer / Opus 解码 / 一致性校验 / 注入线程 / 托盘 | 服务端 | `server/CMakeLists.txt`、`server/core/*`、`server/net/*`、`server/opus/*`、`server/inject/*`、`server/app/*` | T01, T02 | **P0** | B |
 | **T05** | Android 采集端 + 安装/卸载脚本 + 文档 | Android / 工具链 / 文档 | `android/**`、`tools/install.ps1`、`tools/uninstall.ps1`、`tools/make-test-cert.ps1`、`docs/Windows-Manual-Verification.md`、`docs/Signing-Guide.md` | T01 | **P0** | B |
 
@@ -1653,17 +1653,17 @@ graph LR
 
 | 类别 | 约定 |
 |---|---|
-| **命名前缀** | 全局符号 `Womic`/`womic_`；宏 `WOMIC_`；驱动内部 `WomicCtl*`、`WomicStream*` |
+| **命名前缀** | 全局符号 `MicLink`/`miclink_`；宏 `MICLINK_`；驱动内部 `MicLinkCtl*`、`MicLinkStream*` |
 | **池 tag** | 驱动新增分配统一 `'CmoW'`（调试器显示 `WomC`）。沿用官方的：适配器 `'uAyS'`、WaveRT `'RWNM'`、Topology `'RTNM'`、流 `'RTSM'` |
-| **文件头** | 新增文件保留微软原始版权头；**新增内容追加** `// womic-open modification: <简述>` 注释，便于与上游 diff |
-| **日志宏** | 内核沿用 `DPF(D_TERSE/D_ERROR, (...))`（`definitions.h:47-50`）；服务端 `WOMIC_LOG(level, fmt, ...)` |
-| **错误处理** | 内核：`NTSTATUS` + `IF_FAILED_JUMP` / `IF_FAILED_ACTION_JUMP`（沿用官方宏）；服务端：异常禁用，统一返回 `womic_result` |
+| **文件头** | 新增文件保留微软原始版权头；**新增内容追加** `// miclink-open modification: <简述>` 注释，便于与上游 diff |
+| **日志宏** | 内核沿用 `DPF(D_TERSE/D_ERROR, (...))`（`definitions.h:47-50`）；服务端 `MICLINK_LOG(level, fmt, ...)` |
+| **错误处理** | 内核：`NTSTATUS` + `IF_FAILED_JUMP` / `IF_FAILED_ACTION_JUMP`（沿用官方宏）；服务端：异常禁用，统一返回 `miclink_result` |
 | **IRQL 标注** | 所有内核函数必须写 `_IRQL_requires_max_` / `_IRQL_limited_to_`；分页代码必须 `#pragma code_seg("PAGE")` + `PAGED_CODE()` |
-| **共享头纪律** | `womic_ioctl.h` / `womic_types.h` / `womic_atomic.h` **禁止**包含任何平台头，禁止指针字段，禁止编译器扩展 |
+| **共享头纪律** | `miclink_ioctl.h` / `miclink_types.h` / `miclink_atomic.h` **禁止**包含任何平台头，禁止指针字段，禁止编译器扩展 |
 | **整数 DSP** | `shared/core/src/dsp.c` **禁止浮点**（内核 DISPATCH_LEVEL 约束，见 §5.5） |
 | **格式常量** | 采样率只允许 `44100`/`48000`，位深只允许 `16`，声道数只允许 `1`（P0）——新增格式必须同时改驱动格式表 + 服务端校验表 |
-| **控制设备名** | NT 名 `\\Device\\WomicControl`，符号链接 `\\DosDevices\\Global\\WomicControl`（用户态 `\\.\WomicControl`） |
-| **ABI 版本** | `WOMIC_ABI_VERSION = 1`；驱动与服务端 major 不一致时拒绝启动 |
+| **控制设备名** | NT 名 `\\Device\\MicLinkControl`，符号链接 `\\DosDevices\\Global\\MicLinkControl`（用户态 `\\.\MicLinkControl`） |
+| **ABI 版本** | `MICLINK_ABI_VERSION = 1`；驱动与服务端 major 不一致时拒绝启动 |
 | **禁用事项** | 驱动内**禁止**引入任何第三方音频驱动依赖（G1 硬约束）；**禁止**宣称测试签名可无警告分发（PRD §7） |
 
 ---

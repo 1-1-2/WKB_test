@@ -7,14 +7,14 @@
  * 典型的优先级反转。这里所有计数器都是 std::atomic 的 relaxed 读改写：
  * 无锁、无阻塞、不会反转；统计只用于展示，不要求跨计数器的强一致性。
  */
-#ifndef WOMIC_SERVER_STATS_H
-#define WOMIC_SERVER_STATS_H
+#ifndef MICLINK_SERVER_STATS_H
+#define MICLINK_SERVER_STATS_H
 
 #include <atomic>
 #include <cstdint>
 #include <string>
 
-namespace womic {
+namespace miclink {
 
 struct StatsSnapshot {
     /* 网络 */
@@ -201,6 +201,6 @@ private:
     std::atomic<uint32_t> device_ring_free_{0};
 };
 
-}  // namespace womic
+}  // namespace miclink
 
-#endif  /* WOMIC_SERVER_STATS_H */
+#endif  /* MICLINK_SERVER_STATS_H */

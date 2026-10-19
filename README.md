@@ -1,4 +1,4 @@
-# Womic Open —— Windows 虚拟麦克风（手机当麦克风）
+# MicLink Open —— Windows 虚拟麦克风（手机当麦克风）
 
 把 Android 手机的麦克风，变成 Windows 里一枚**真实的录音设备**：
 Zoom / 腾讯会议 / OBS / 系统录音机都能直接选中它，**不需要安装任何第三方虚拟声卡**（VB-Cable 之类）。
@@ -6,18 +6,18 @@ Zoom / 腾讯会议 / OBS / 系统录音机都能直接选中它，**不需要�
 ```
   Android 手机                         Windows 主机
 ┌──────────────────────┐          ┌──────────────────────────────────────────┐
-│ AudioRecord          │          │ womicserver.exe（用户态）                │
+│ AudioRecord          │          │ miclinkserver.exe（用户态）                │
 │ VOICE_COMMUNICATION  │          │   UDP 收包 → Opus 解码 + PLC             │
 │   ↓ PCM16            │          │   → 抖动缓冲 → 重采样 → 环形缓冲         │
 │ libopus 编码 (JNI)   │  UDP     │        ↓ DeviceIoControl(WRITE_PCM)      │
 │   ↓ Opus payload     │ =======> │ ┌────────────────────────────────────┐   │
-│ Packetizer 32B 头    │ Opus     │ │ womicvirtualmic.sys（内核）        │   │
-│   ↓ UDP 5004         │ 5004     │ │  控制设备 \\.\WomicControl         │   │
+│ Packetizer 32B 头    │ Opus     │ │ miclinkvirtualmic.sys（内核）        │   │
+│   ↓ UDP 5004         │ 5004     │ │  控制设备 \\.\MicLinkControl         │   │
 └──────────────────────┘          │ │  WaveRT 捕获端点（虚拟麦克风）     │   │
                                   │ └───────────────┬────────────────────┘   │
                                   │                 ↓ 音频栈                 │
                                   │   设置 → 系统 → 声音 → 输入设备          │
-                                  │   "Womic Virtual Microphone"             │
+                                  │   "MicLink Virtual Microphone"             │
                                   │        ↓                                 │
                                   │   录音机 / OBS / Zoom / 腾讯会议         │
                                   └──────────────────────────────────────────┘
@@ -52,9 +52,9 @@ Zoom / 腾讯会议 / OBS / 系统录音机都能直接选中它，**不需要�
 ## 目录结构
 
 ```
-womic-open/
+miclink-open/
 ├── shared/core/            三方共用的协议与 DSP 契约（唯一事实来源）
-│   ├── include/womic/      womic_protocol.h / womic_ioctl.h / womic_sample_rate.h ...
+│   ├── include/miclink/      miclink_protocol.h / miclink_ioctl.h / miclink_sample_rate.h ...
 │   └── src/                protocol.c / ring_buffer.c / jitter_buffer.c / dsp.c ...
 ├── driver/                 Windows 内核虚拟麦克风驱动（WDM/KS + WaveRT）
 │   ├── Source/             Main / Filters / Utilities / Inc
@@ -71,8 +71,8 @@ womic-open/
 └── docs/                   构建、签名、人工验证、验证状态
 ```
 
-**契约唯一事实来源**：`shared/core/include/womic/womic_protocol.h`（UDP 包）与
-`womic_ioctl.h`（IOCTL）。驱动、服务端、Android 端**共用同一份头文件**，禁止各自复制结构体定义。
+**契约唯一事实来源**：`shared/core/include/miclink/miclink_protocol.h`（UDP 包）与
+`miclink_ioctl.h`（IOCTL）。驱动、服务端、Android 端**共用同一份头文件**，禁止各自复制结构体定义。
 
 ---
 
@@ -82,13 +82,13 @@ womic-open/
 
 | 步骤 | 命令 / 动作 |
 |---|---|
-| 1. 编译驱动 | 见 [`docs/BUILD.md`](docs/BUILD.md)，产出 `WomicVirtualMic.inf` / `womicvirtualmic.sys` |
-| 2. 编译服务端 | 见 [`server/build_windows.md`](server/build_windows.md)，产出 `womicserver.exe` |
+| 1. 编译驱动 | 见 [`docs/BUILD.md`](docs/BUILD.md)，产出 `MicLinkVirtualMic.inf` / `miclinkvirtualmic.sys` |
+| 2. 编译服务端 | 见 [`server/build_windows.md`](server/build_windows.md)，产出 `miclinkserver.exe` |
 | 3. 测试签名 | `powershell -ExecutionPolicy Bypass -File tools\make-test-cert.ps1` |
 | 4. 安装驱动 | `powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Mode TestSign -Force` |
 | 5. **重启电脑** | 必须；重启后桌面右下角会出现 **“测试模式”水印** |
 | 6. 自动检查 | `powershell -ExecutionPolicy Bypass -File tools\verify.ps1` |
-| 7. 启动服务端 | `womicserver.exe --port 5004 --rate 48000`（若要手机自动发现，加 `--discovery on`） |
+| 7. 启动服务端 | `miclinkserver.exe --port 5004 --rate 48000`（若要手机自动发现，加 `--discovery on`） |
 | 8. 手机采集 | 用 Android Studio 构建 `android/`（先按 `android/README.md` 放入 opus 源码），填 PC 的 IP → 开始采集 |
 | 9. 人工验证 | 按 [`docs/Windows-Manual-Verification.md`](docs/Windows-Manual-Verification.md) 用录音机 / OBS / Zoom 验证 |
 
@@ -130,7 +130,7 @@ womic-open/
 
 | 口径 | 值 | 依据 |
 |---|---|---|
-| **INF 声明的目标 OS**（决定能不能装上） | **Win11 21H2（build 22000）或更高** | `driver/Source/Main/WomicVirtualMic.inx` 的 `[Manufacturer]` 段是 `%MfgName%=WOMIC,NT$ARCH$.10.0...22000`，模型只在 `[WOMIC.NT$ARCH$.10.0...22000]` 段里声明 |
+| **INF 声明的目标 OS**（决定能不能装上） | **Win11 21H2（build 22000）或更高** | `driver/Source/Main/MicLinkVirtualMic.inx` 的 `[Manufacturer]` 段是 `%MfgName%=MICLINK,NT$ARCH$.10.0...22000`，模型只在 `[MICLINK.NT$ARCH$.10.0...22000]` 段里声明 |
 | **源码实际需要的 OS**（决定能不能跑起来） | **Win10 2004（build 19041）或更高** | 驱动用了 `ExAllocatePool2`（`NewDelete.cpp:45`、`adapter.cpp:173`、`minwavertstream.cpp:289` 等）——该 API 自 Win10 2004 起提供；`EX_TIMER_HIGH_RESOLUTION`（`minwavertstream.cpp:262`）自 Win10 1803 起提供 |
 
 也就是说：**在 Win10 19041~21999 上，驱动即便编译通过也装不上** ——
@@ -140,15 +140,15 @@ womic-open/
 
 ```inf
 [Manufacturer]
-%MfgName%=WOMIC,NT$ARCH$.10.0...19041          ; 下限改为 Win10 2004
+%MfgName%=MICLINK,NT$ARCH$.10.0...19041          ; 下限改为 Win10 2004
 
-[WOMIC.NT$ARCH$.10.0...19041]                  ; 段名同步改
-%WOMIC_VM.DeviceDesc%=WOMIC_VM, ROOT\WomicVirtualMic
+[MICLINK.NT$ARCH$.10.0...19041]                  ; 段名同步改
+%MICLINK_VM.DeviceDesc%=MICLINK_VM, ROOT\MicLinkVirtualMic
 ```
 
 改完后必须同步：
 
-* `driver/verify/check_driver_consistency.py`（该脚本断言 `INF Manufacturer 段已改为 WOMIC`，
+* `driver/verify/check_driver_consistency.py`（该脚本断言 `INF Manufacturer 段已改为 MICLINK`，
   里面写死了 `NT$ARCH$.10.0...22000`，改 INF 时这条断言会失败，需要一并更新）；
 * 本文档与 `docs/BUILD.md`、`docs/Windows-Manual-Verification.md` 的版本说明。
 
@@ -167,9 +167,9 @@ womic-open/
 | 延迟大概多少？ | 由抖动缓冲主导，默认目标 50 ms（可调 `--jitter-min-ms/--jitter-max-ms`，硬上限 120 ms）+ 编码/网络开销。 |
 | 支持立体声吗？ | 当前驱动端点为 **16-bit 单声道**（44100/48000）。 |
 | 为什么设备管理器里是黄色感叹号 / 代码 52？ | 签名未通过：确认已 `bcdedit /set testsigning on` **并重启**，且 Secure Boot 已关闭（测试签名场景）。 |
-| `\\.\WomicControl` 能打开但输入设备列表里没有麦克风？ | 典型是 dispatch 覆盖或捕获引脚未正确暴露，排查见 `docs/Windows-Manual-Verification.md` 第 8 节。 |
+| `\\.\MicLinkControl` 能打开但输入设备列表里没有麦克风？ | 典型是 dispatch 覆盖或捕获引脚未正确暴露，排查见 `docs/Windows-Manual-Verification.md` 第 8 节。 |
 | 能直接分发给别人用吗？ | **当前不行**。必须完成生产签名（EV + WHQL/Attestation）后才行，见 `docs/Signing-Guide.md`。 |
-| 手机为什么搜不到服务端？ | 发现走的是**主动扫描**：手机发广播 `WOMIC-DISCOVER 1`，服务端回单播 `WOMIC-HERE`。Android 端**未**申请 `WifiManager.MulticastLock`，因此**被动接收**服务端周期公告在部分 ROM 上收不到；请确保 `--discovery on` 已开启、手机与 PC 同网段且 UDP 5005 未被防火墙拦截。 |
+| 手机为什么搜不到服务端？ | 发现走的是**主动扫描**：手机发广播 `MICLINK-DISCOVER 1`，服务端回单播 `MICLINK-HERE`。Android 端**未**申请 `WifiManager.MulticastLock`，因此**被动接收**服务端周期公告在部分 ROM 上收不到；请确保 `--discovery on` 已开启、手机与 PC 同网段且 UDP 5005 未被防火墙拦截。 |
 
 ---
 

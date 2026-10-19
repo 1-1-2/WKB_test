@@ -1,5 +1,5 @@
 /*
- * ring_adapter.cpp -- womic_ring 的 C++ 薄封装。
+ * ring_adapter.cpp -- miclink_ring 的 C++ 薄封装。
  */
 #include "ring_adapter.h"
 
@@ -7,9 +7,9 @@
 
 #include "log.h"
 
-namespace womic {
+namespace miclink {
 
-static constexpr char kWomicLogModule[] = "ring";
+static constexpr char kMicLinkLogModule[] = "ring";
 
 bool PcmRing::init(uint32_t capacity_frames, uint32_t frame_bytes, std::string *err)
 {
@@ -28,7 +28,7 @@ bool PcmRing::init(uint32_t capacity_frames, uint32_t frame_bytes, std::string *
         return false;
     }
 
-    /* 向下取整到 2 的幂（womic_ring 的硬约束）。 */
+    /* 向下取整到 2 的幂（miclink_ring 的硬约束）。 */
     uint32_t cap = 1u;
     while ((cap << 1u) <= capacity_frames) {
         cap <<= 1u;
@@ -37,11 +37,11 @@ bool PcmRing::init(uint32_t capacity_frames, uint32_t frame_bytes, std::string *
     const size_t samples = static_cast<size_t>(cap) * static_cast<size_t>(frame_bytes / 2u);
     storage_.assign(samples, 0);
 
-    int rc = womic_ring_init(&ring_, storage_.data(), cap, frame_bytes);
-    if (rc != WOMIC_RING_OK) {
+    int rc = miclink_ring_init(&ring_, storage_.data(), cap, frame_bytes);
+    if (rc != MICLINK_RING_OK) {
         if (err != nullptr) {
             char buf[128];
-            std::snprintf(buf, sizeof(buf), "womic_ring_init 失败(%d)", rc);
+            std::snprintf(buf, sizeof(buf), "miclink_ring_init 失败(%d)", rc);
             *err = buf;
         }
         ready_ = false;
@@ -56,7 +56,7 @@ uint32_t PcmRing::write(const int16_t *frames, uint32_t n)
     if (!ready_ || (frames == nullptr) || (n == 0u)) {
         return 0u;
     }
-    return womic_ring_write(&ring_, frames, n);
+    return miclink_ring_write(&ring_, frames, n);
 }
 
 uint32_t PcmRing::read(int16_t *frames, uint32_t n)
@@ -64,7 +64,7 @@ uint32_t PcmRing::read(int16_t *frames, uint32_t n)
     if (!ready_ || (frames == nullptr) || (n == 0u)) {
         return 0u;
     }
-    return womic_ring_read(&ring_, frames, n);
+    return miclink_ring_read(&ring_, frames, n);
 }
 
 uint32_t PcmRing::available() const
@@ -72,7 +72,7 @@ uint32_t PcmRing::available() const
     if (!ready_) {
         return 0u;
     }
-    return womic_ring_available(const_cast<womic_ring *>(&ring_));
+    return miclink_ring_available(const_cast<miclink_ring *>(&ring_));
 }
 
 uint32_t PcmRing::free_frames() const
@@ -80,7 +80,7 @@ uint32_t PcmRing::free_frames() const
     if (!ready_) {
         return 0u;
     }
-    return womic_ring_free(const_cast<womic_ring *>(&ring_));
+    return miclink_ring_free(const_cast<miclink_ring *>(&ring_));
 }
 
 uint32_t PcmRing::capacity() const
@@ -96,7 +96,7 @@ void PcmRing::add_dropped(uint64_t n)
     if (!ready_ || (n == 0u)) {
         return;
     }
-    womic_ring_add_dropped(&ring_, n);
+    miclink_ring_add_dropped(&ring_, n);
 }
 
 void PcmRing::reset()
@@ -104,7 +104,7 @@ void PcmRing::reset()
     if (!ready_) {
         return;
     }
-    womic_ring_reset(&ring_);
+    miclink_ring_reset(&ring_);
 }
 
-}  // namespace womic
+}  // namespace miclink

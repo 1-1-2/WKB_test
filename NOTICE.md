@@ -1,6 +1,6 @@
 # NOTICE
 
-`womic-open` 是一个 Windows 虚拟麦克风系统（手机 → UDP/Opus → Windows 服务端 →
+`miclink-open` 是一个 Windows 虚拟麦克风系统（手机 → UDP/Opus → Windows 服务端 →
 DeviceIoControl → 内核驱动 → Zoom/OBS 可用）。
 
 本项目采用 MIT 许可（见 `LICENSE`），其中内核驱动部分基于微软官方示例代码改编。
@@ -15,9 +15,9 @@ DeviceIoControl → 内核驱动 → Zoom/OBS 可用）。
 - **来源路径**：`audio/simpleaudiosimple`
 - **许可**：MIT License，Copyright (c) Microsoft Corporation.
   原始许可文本见同路径下的 `LICENSE` / 仓库根目录 `LICENSE`。
-- **使用方式**：作为 womic-open 内核音频驱动（虚拟麦克风端点）的骨架基线，
+- **使用方式**：作为 miclink-open 内核音频驱动（虚拟麦克风端点）的骨架基线，
   在此基础上替换数据通路（改为从共享环形缓冲取 PCM）、新增 IOCTL 命令
-  （见 `shared/core/include/womic/womic_ioctl.h`）并移除与本项目无关的示例逻辑。
+  （见 `shared/core/include/miclink/miclink_ioctl.h`）并移除与本项目无关的示例逻辑。
 
 微软原始许可要点（MIT）：
 

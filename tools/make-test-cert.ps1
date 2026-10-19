@@ -19,10 +19,10 @@
     要签名的文件（.sys / .cat）。默认在仓库常见输出目录下搜索。
 
 .PARAMETER CertSubject
-    证书主题，默认 CN=Womic Open Test Signing (DO NOT DISTRIBUTE)。
+    证书主题，默认 CN=MicLink Open Test Signing (DO NOT DISTRIBUTE)。
 
 .PARAMETER PfxPath
-    PFX 输出路径，默认 tools\_out\WomicTestSigning.pfx。
+    PFX 输出路径，默认 tools\_out\MicLinkTestSigning.pfx。
 
 .PARAMETER SignToolPath
     signtool.exe 路径；不指定时自动在 Windows Kits 目录下搜索。
@@ -41,7 +41,7 @@
     powershell -ExecutionPolicy Bypass -File tools\make-test-cert.ps1
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File tools\make-test-cert.ps1 -Files C:\build\womicvirtualmic.sys,C:\build\WomicVirtualMic.cat
+    powershell -ExecutionPolicy Bypass -File tools\make-test-cert.ps1 -Files C:\build\miclinkvirtualmic.sys,C:\build\MicLinkVirtualMic.cat
 #>
 #requires -Version 5.1
 
@@ -51,7 +51,7 @@ param(
     [string[]]$Files = @(),
 
     [Parameter()]
-    [string]$CertSubject = 'CN=Womic Open Test Signing (DO NOT DISTRIBUTE)',
+    [string]$CertSubject = 'CN=MicLink Open Test Signing (DO NOT DISTRIBUTE)',
 
     [Parameter()]
     [string]$PfxPath = '',
@@ -163,7 +163,7 @@ function Resolve-TargetFiles {
     }
 
     $repoRoot = Split-Path -Parent $PSScriptRoot
-    $names = @('womicvirtualmic.sys', 'WomicVirtualMic.cat')
+    $names = @('miclinkvirtualmic.sys', 'MicLinkVirtualMic.cat')
     $found = New-Object System.Collections.Generic.List[string]
     foreach ($n in $names) {
         $hit = Get-ChildItem -Path $repoRoot -Filter $n -Recurse -File -ErrorAction SilentlyContinue |
@@ -175,7 +175,7 @@ function Resolve-TargetFiles {
 未找到要签名的 .sys / .cat。
 请先编译驱动包（见 docs/BUILD.md），或用 -Files 显式指定：
 
-  -Files C:\build\womicvirtualmic.sys,C:\build\WomicVirtualMic.cat
+  -Files C:\build\miclinkvirtualmic.sys,C:\build\MicLinkVirtualMic.cat
 "@
     }
     return , $found.ToArray()
@@ -230,7 +230,7 @@ try {
         -KeyUsage DigitalSignature `
         -CertStoreLocation 'Cert:\CurrentUser\My' `
         -NotAfter $notAfter `
-        -FriendlyName 'Womic Test Signing (DO NOT DISTRIBUTE)' `
+        -FriendlyName 'MicLink Test Signing (DO NOT DISTRIBUTE)' `
         -ErrorAction Stop
 } catch {
     Write-Fail "New-SelfSignedCertificate 失败：$($_.Exception.Message)"
@@ -249,7 +249,7 @@ if ([string]::IsNullOrWhiteSpace($PfxPath)) {
     if (-not (Test-Path -LiteralPath $outDir)) {
         New-Item -ItemType Directory -Path $outDir -Force | Out-Null
     }
-    $PfxPath = Join-Path $outDir 'WomicTestSigning.pfx'
+    $PfxPath = Join-Path $outDir 'MicLinkTestSigning.pfx'
 }
 $plainPassword = New-RandomPassword
 $securePassword = ConvertTo-SecureString -String $plainPassword -AsPlainText -Force

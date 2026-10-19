@@ -47,13 +47,13 @@ Return Value:
     }
 
     //
-    // WOMIC：捕获流关闭，通知控制设备扩展清掉 StreamFormat / StreamOpen。
+    // MICLINK：捕获流关闭，通知控制设备扩展清掉 StreamFormat / StreamOpen。
     // 之后 SET_FORMAT / START 不再受"必须与流格式一致"的约束，
     // 用户态可以在下一次录音开始前自由切换 44.1k / 48k。
     //
     if (m_bCapture)
     {
-        WomicNotifyStreamClosed();
+        MicLinkNotifyStreamClosed();
     }
 
     if (m_pDpc)
@@ -239,10 +239,10 @@ Return Value:
     m_bLastBufferRendered = FALSE;
 
     //
-    // WOMIC：去咔哒状态在这里无条件初始化（不依赖后续是否成功走到捕获分支），
+    // MICLINK：去咔哒状态在这里无条件初始化（不依赖后续是否成功走到捕获分支），
     // 保证 WriteBytes 一旦被调用，m_Declck 一定是已初始化的。
     //
-    womic_declck_init(&m_Declck, WOMIC_DECLCK_DEFAULT_FADE);
+    miclink_declck_init(&m_Declck, MICLINK_DECLCK_DEFAULT_FADE);
 
     m_ulHostCaptureToneFrequency = IsEqualGUID(SignalProcessingMode, AUDIO_SIGNALPROCESSINGMODE_RAW) ? 1000 : 2000;
     m_dwHostCaptureToneAmplitude = 50;
@@ -320,7 +320,7 @@ Return Value:
     if (m_bCapture)
     {
         //
-        // WOMIC: 捕获流不再使用正弦发生器。
+        // MICLINK: 捕获流不再使用正弦发生器。
         //
         // 基线代码在这里做的是：
         //     ReadRegistrySettings();                       // 读注册表里的音调参数
@@ -330,16 +330,16 @@ Return Value:
         // 个通知周期调用 ToneGenerator::GenerateSine() 往 DMA 缓冲里写正弦。
         // 本驱动必须输出"用户态注入的真实 PCM"，因此这一整段被替换掉：
         //
-        //   1) 去咔哒状态已在上面无条件初始化（womic_declck_init）：
+        //   1) 去咔哒状态已在上面无条件初始化（miclink_declck_init）：
         //      初始化后 fade_remaining = fade_len，因此第一段数据会从 0 淡入，
         //      正好消除"启动瞬间从未知电平跳变"的爆音。
         //   2) 把本流协商到的格式上报给控制设备扩展。
         //      驱动侧禁止重采样：后续 SET_FORMAT / START / WRITE_PCM 都会与
         //      StreamFormat 比对，不一致一律拒绝。
         //
-        // 之后由 WriteBytes() 从 WOMIC 环形缓冲取数据；取不到时补静音并去咔哒。
+        // 之后由 WriteBytes() 从 MICLINK 环形缓冲取数据；取不到时补静音并去咔哒。
         //
-        WomicNotifyStreamOpened(pWfEx->nSamplesPerSec,
+        MicLinkNotifyStreamOpened(pWfEx->nSamplesPerSec,
                                 pWfEx->nChannels,
                                 pWfEx->wBitsPerSample);
     }
@@ -1386,11 +1386,11 @@ VOID CMiniportWaveRTStream::WriteBytes
 Routine Description:
 
 This function fills the capture DMA buffer with PCM injected from user mode
-via the WOMIC control device (\.\WomicControl).
+via the MICLINK control device (\.\MicLinkControl).
 
 Baseline behaviour (REMOVED): the sample used to call
     ToneGenerator::GenerateSine(m_pDmaBuffer + bufferOffset, runWrite);
-here, i.e. it synthesised a sine wave. Womic never synthesises audio:
+here, i.e. it synthesised a sine wave. MicLink never synthesises audio:
 if the ring buffer has no data the region is filled with silence and a
 de-click fade-in is applied on resume.
 
@@ -1420,19 +1420,19 @@ ByteDisplacement - # of bytes to process.
     //   * 任何可能降 IRQL 或触发 APC 的调用。
     //
     // 允许的全部动作只有：
-    //   * 读一个全局指针并验签（WomicGetControlExt）；
-    //   * 无锁 SPSC 环形缓冲读取（womic_ring_read_fill_silence，纯整数 + 屏障）；
-    //   * 纯整数 DSP（womic_apply_declck / womic_fill_silence）；
+    //   * 读一个全局指针并验签（MicLinkGetControlExt）；
+    //   * 无锁 SPSC 环形缓冲读取（miclink_ring_read_fill_silence，纯整数 + 屏障）；
+    //   * 纯整数 DSP（miclink_apply_declck / miclink_fill_silence）；
     //   * Interlocked* 原子加（不阻塞）。
     //
-    // 这正是 IOCTL_WOMIC_WRITE_PCM 必须用 METHOD_BUFFERED 且"缓冲满就立刻返回
+    // 这正是 IOCTL_MICLINK_WRITE_PCM 必须用 METHOD_BUFFERED 且"缓冲满就立刻返回
     // STATUS_BUFFER_TOO_SMALL、绝不挂起 IRP 等待空间"的根本原因（坑 3 / N-2）：
     // 生产者若在这里等待，等于让 PASSIVE 线程等一个 DISPATCH 路径腾空间，
     // 而 DISPATCH 路径又不能阻塞 —— 直接死锁。
     // =========================================================================
     //
-    PWOMIC_CONTROL_EXT  controlExt;
-    womic_ring *        ring;
+    PMICLINK_CONTROL_EXT  controlExt;
+    miclink_ring *        ring;
     BOOLEAN             injecting;
     ULONG               bufferOffset;
 
@@ -1440,7 +1440,7 @@ ByteDisplacement - # of bytes to process.
     // 极简访问器：读全局指针 + 验签，无锁无 IO。
     // 控制设备不存在（未创建 / 已卸载）时返回 NULL，本函数随即退化为"全静音"。
     //
-    controlExt = WomicGetControlExt();
+    controlExt = MicLinkGetControlExt();
 
     if (controlExt != NULL)
     {
@@ -1479,14 +1479,14 @@ ByteDisplacement - # of bytes to process.
                 // 返回值 valid = 其中"真实（非补零）"的帧数。
                 // 该函数是 DPC 安全的：无阻塞、无分配、无锁、无浮点。
                 //
-                valid = womic_ring_read_fill_silence(ring, dst, frames);
+                valid = miclink_ring_read_fill_silence(ring, dst, frames);
             }
             else
             {
                 //
                 // 未 START、或控制设备不存在：整段写静音。
                 //
-                womic_fill_silence(dst, frames);
+                miclink_fill_silence(dst, frames);
             }
 
             if (valid < frames)
@@ -1496,7 +1496,7 @@ ByteDisplacement - # of bytes to process.
                 // 通知去咔哒模块"此前发生过数据丢失"，下一段真实数据到达时
                 // 会从 prev_sample 线性淡入，消除阶跃造成的"咔哒"声。
                 //
-                womic_declck_notify_loss(&m_Declck);
+                miclink_declck_notify_loss(&m_Declck);
 
                 if (injecting && (controlExt != NULL))
                 {
@@ -1507,7 +1507,7 @@ ByteDisplacement - # of bytes to process.
             //
             // 去咔哒：纯整数线性淡入，DPC 安全。
             //
-            womic_apply_declck(&m_Declck, dst, frames);
+            miclink_apply_declck(&m_Declck, dst, frames);
 
             if (controlExt != NULL)
             {

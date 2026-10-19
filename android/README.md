@@ -1,9 +1,9 @@
-# Womic Open — Android 采集端
+# MicLink Open — Android 采集端
 
-手机麦克风 → **UDP/Opus** → Windows 服务端（`womicserver`）→ 内核虚拟麦克风驱动。
+手机麦克风 → **UDP/Opus** → Windows 服务端（`miclinkserver`）→ 内核虚拟麦克风驱动。
 本目录是一个**可直接用 Android Studio 打开并构建**的 Gradle 工程。
 
-> 与服务端、驱动共用的协议契约来自 `shared/core/include/womic/womic_protocol.h`（**唯一事实来源**）。
+> 与服务端、驱动共用的协议契约来自 `shared/core/include/miclink/miclink_protocol.h`（**唯一事实来源**）。
 > Android 端不复制结构体，只在 `Packetizer.kt` 里按同一份偏移表做**大端**封包。
 
 ---
@@ -27,12 +27,12 @@ android/
 │       │   ├── CMakeLists.txt            编译 opus_jni.cpp 并链接 libopus
 │       │   ├── opus_jni.cpp              JNI：create / destroy / encode / plc
 │       │   └── opus_jni.h
-│       ├── java/com/womic/open/
+│       ├── java/com/miclink/open/
 │       │   ├── MainActivity.kt           UI：IP/端口/采样率/帧长/码率/开始停止/电平条/状态
 │       │   ├── MicCaptureService.kt      前台服务：AudioRecord → Opus → UDP
 │       │   ├── OpusEncoder.kt            JNI 封装
 │       │   ├── UdpSender.kt              DatagramSocket 发送（含 SocketException 处理）
-│       │   ├── Packetizer.kt             32 字节大端头封包（对齐 womic_protocol.h）
+│       │   ├── Packetizer.kt             32 字节大端头封包（对齐 miclink_protocol.h）
 │       │   ├── Discovery.kt              广播发现服务端（UDP 5005）
 │       │   ├── LevelMeter.kt             RMS / peak 电平
 │       │   ├── Prefs.kt                  SharedPreferences 持久化
@@ -109,7 +109,7 @@ cd android
 
 真机安装后：
 
-1. 先启动 Windows 服务端：`womicserver.exe --port 5004 --rate 48000`；
+1. 先启动 Windows 服务端：`miclinkserver.exe --port 5004 --rate 48000`；
 2. 手机上打开 App → 填 PC 的局域网 IP（或点“发现服务端”，需服务端 `--discovery on`）；
 3. 采样率 / 帧长 / 码率保持与服务端一致（**采样率不一致时服务端会拒绝启动**）；
 4. 点“开始采集”，授予麦克风与通知权限。
@@ -134,13 +134,13 @@ cd android
 | 26 | 2 | flags（bit0 FEC / bit1 DTX） | 冗余重发包置 `FLAG_FEC` |
 | 28 | 4 | reserved | 0 |
 
-服务端 `womic_packet_decode()` 严格要求 `报文长度 == header_size + payload_bytes`，
+服务端 `miclink_packet_decode()` 严格要求 `报文长度 == header_size + payload_bytes`，
 因此 `Packetizer.pack()` 返回的 `ByteArray` **不带任何尾随字节**。
 `Packetizer.selfCheck()` 用与 `protocol.c` 完全一致的规则做一次本地自洽校验（首包日志/排障用）。
 
 ### 4.2 采样率一致性（服务端会拒绝启动）
 
-- 服务端 `shared/core/womic_sample_rate.h` 的规则：
+- 服务端 `shared/core/miclink_sample_rate.h` 的规则：
   - **端点率 != 解码率 → 致命，拒绝启动**；
   - **采集率 != 解码率 → 非致命**，由服务端重采样消化（驱动侧绝不做重采样）。
 - 部分手机在使用 `VOICE_COMMUNICATION` 时会把 48 kHz 强制降到 16 kHz。
@@ -158,8 +158,8 @@ cd android
 ### 4.4 发现协议
 
 ```
-手机 -> 广播 : "WOMIC-DISCOVER 1"
-服务端 -> 单播: "WOMIC-HERE 1 <audio_port> <rate> <channels> <name>"
+手机 -> 广播 : "MICLINK-DISCOVER 1"
+服务端 -> 单播: "MICLINK-HERE 1 <audio_port> <rate> <channels> <name>"
 ```
 服务端需 `--discovery on`（默认关闭），否则不会有应答。
 名字里的空格被服务端替换成 `_`；本端显示时还原成空格。
@@ -198,7 +198,7 @@ cd android
 | 现象 | 排查 |
 |---|---|
 | Gradle 报 `未找到 Opus 源码` | 按第 2 节放入 opus 源码后重新 `Sync` |
-| App 启动显示“native 库未加载” | `libwomic_opus.so` 没打进 APK：确认 ABI 在 `abiFilters` 内、CMake 无报错 |
+| App 启动显示“native 库未加载” | `libmiclink_opus.so` 没打进 APK：确认 ABI 在 `abiFilters` 内、CMake 无报错 |
 | 点开始立刻报 `AudioRecord 初始化失败` | 未授予 `RECORD_AUDIO`，或麦克风被其他应用（电话/录音/会议）独占 |
 | 服务端日志无包 | PC 防火墙放行 UDP 5004；确认手机填的是 PC 的**局域网** IP；确认手机与 PC 同网段 |
 | 服务端拒绝启动 | 采样率链路致命错误：端点率与解码率不一致，改 `--rate` 或手机端采样率 |
@@ -230,4 +230,4 @@ cd android/verify/jni_smoketest && ./run.sh
 
 本工程在本仓库的 Linux 沙箱内**没有编译过**（沙箱无 Android SDK/NDK/Kotlin 编译器）。
 Kotlin 与 JNI 代码经过人工自审（import、生命周期、权限、前台服务通知渠道、协议偏移），
-**属于“待真机构建验证”项**。首次联调建议先跑 `womicserver --dry-run` 并观察首包日志。
+**属于“待真机构建验证”项**。首次联调建议先跑 `miclinkserver --dry-run` 并观察首包日志。

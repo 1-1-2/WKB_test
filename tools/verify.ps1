@@ -6,13 +6,13 @@
     检查项：
       1)  管理员权限
       2)  测试签名状态（bcdedit testsigning）—— 测试签名模式下必须为开
-      3)  驱动服务 WomicVirtualMic 是否存在
+      3)  驱动服务 MicLinkVirtualMic 是否存在
       4)  INF 是否已注册到 Driver Store
       5)  PnP 设备是否存在且状态 OK
       6)  设备管理器问题码（重点：无代码 52 = 签名未通过）
-      7)  WMI Win32_SoundDevice 中是否出现 "Womic Virtual Microphone"
+      7)  WMI Win32_SoundDevice 中是否出现 "MicLink Virtual Microphone"
       8)  Core Audio 捕获端点（注册表 MMDevices）中是否出现该设备
-      9)  控制设备 \\.\WomicControl 能否被 CreateFile 打开
+      9)  控制设备 \\.\MicLinkControl 能否被 CreateFile 打开
       10) IOCTL GET_VERSION 是否能返回版本号
       M)  录音机 / OBS / Zoom 的真实采集验证 —— **必须人工执行**（标记为 MANUAL）
 
@@ -36,9 +36,9 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$script:DriverFriendlyName = 'Womic Virtual Microphone'
-$script:DriverServiceName = 'WomicVirtualMic'
-$script:ControlDevicePath = '\\.\WomicControl'
+$script:DriverFriendlyName = 'MicLink Virtual Microphone'
+$script:DriverServiceName = 'MicLinkVirtualMic'
+$script:ControlDevicePath = '\\.\MicLinkControl'
 $script:Results = New-Object System.Collections.Generic.List[object]
 
 function Write-Banner {
@@ -80,19 +80,19 @@ function Get-TestSigningState {
     return ($raw -match 'testsigning\s+(Yes|是|True)')
 }
 
-function Get-WomicPnpDevices {
+function Get-MicLinkPnpDevices {
     $all = @(Get-PnpDevice -ErrorAction SilentlyContinue)
     if ($null -eq $all) { return @() }
     return @($all | Where-Object {
             ($_.FriendlyName -like "*$script:DriverFriendlyName*") -or
-            ($_.InstanceId -like '*WomicVirtualMic*')
+            ($_.InstanceId -like '*MicLinkVirtualMic*')
         })
 }
 
-function Get-WomicDriverPackages {
+function Get-MicLinkDriverPackages {
     $raw = & pnputil.exe /enum-drivers 2>&1
     $text = ($raw | Out-String)
-    return @($text -split "`r?`n" | Where-Object { $_ -match 'WomicVirtualMic' })
+    return @($text -split "`r?`n" | Where-Object { $_ -match 'MicLinkVirtualMic' })
 }
 
 # ---------------------------------------------------------------------------
@@ -100,12 +100,12 @@ function Get-WomicDriverPackages {
 # ---------------------------------------------------------------------------
 $script:NativeReady = $false
 try {
-    if (-not ([System.Management.Automation.PSTypeName]'WomicVerifyNative').Type) {
+    if (-not ([System.Management.Automation.PSTypeName]'MicLinkVerifyNative').Type) {
         Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 
-public class WomicVerifyNative {
+public class MicLinkVerifyNative {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode,
         IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
@@ -131,7 +131,7 @@ public class WomicVerifyNative {
         return (h == IntPtr.Zero) || (h.ToInt64() == -1L);
     }
 
-    /// <summary>WOMIC_IOCTL_GET_VERSION：返回 4 个 uint32（major/minor/patch/build）。</summary>
+    /// <summary>MICLINK_IOCTL_GET_VERSION：返回 4 个 uint32（major/minor/patch/build）。</summary>
     public static int GetVersion(IntPtr h, out uint[] version, out uint win32Error) {
         version = new uint[4];
         win32Error = 0;
@@ -157,7 +157,7 @@ public class WomicVerifyNative {
 }
 
 # ---------------------------------------------------------------------------
-Write-Banner 'Womic 虚拟麦克风 —— 安装后自动验证' 'Cyan'
+Write-Banner 'MicLink 虚拟麦克风 —— 安装后自动验证' 'Cyan'
 
 # 1) 管理员权限
 Write-Step '检查管理员权限…'
@@ -189,16 +189,16 @@ if ($null -ne $service) {
 
 # 4) INF 注册
 Write-Step '检查 Driver Store 中的 INF…'
-$pkgLines = Get-WomicDriverPackages
+$pkgLines = Get-MicLinkDriverPackages
 if ($pkgLines.Count -gt 0) {
     Add-Result -Item 'INF 已注册到 Driver Store' -Result 'PASS' -Detail "匹配 $($pkgLines.Count) 行：$(($pkgLines[0]).Trim())"
 } else {
-    Add-Result -Item 'INF 已注册到 Driver Store' -Result 'FAIL' -Detail 'pnputil /enum-drivers 中没有 WomicVirtualMic，需重新安装'
+    Add-Result -Item 'INF 已注册到 Driver Store' -Result 'FAIL' -Detail 'pnputil /enum-drivers 中没有 MicLinkVirtualMic，需重新安装'
 }
 
 # 5) / 6) PnP 设备与问题码
 Write-Step '检查 PnP 设备与问题码…'
-$devices = Get-WomicPnpDevices
+$devices = Get-MicLinkPnpDevices
 if ($devices.Count -eq 0) {
     Add-Result -Item 'PnP 设备存在' -Result 'FAIL' -Detail "未找到名称包含 '$script:DriverFriendlyName' 的设备"
     Add-Result -Item '设备无问题码（无代码 52）' -Result 'FAIL' -Detail '设备不存在，无法判定'
@@ -222,12 +222,12 @@ if ($devices.Count -eq 0) {
 # 7) WMI 声音设备
 Write-Step '检查 WMI Win32_SoundDevice…'
 $soundDevices = @(Get-CimInstance -ClassName Win32_SoundDevice -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -like '*Womic*' -or $_.Caption -like '*Womic*' })
+    Where-Object { $_.Name -like '*MicLink*' -or $_.Caption -like '*MicLink*' })
 if ($soundDevices.Count -gt 0) {
     Add-Result -Item 'WMI Win32_SoundDevice 出现该设备' -Result 'PASS' -Detail `
         "$($soundDevices[0].Name)（状态=$($soundDevices[0].Status)）"
 } else {
-    Add-Result -Item 'WMI Win32_SoundDevice 出现该设备' -Result 'FAIL' -Detail '未找到名称含 Womic 的声音设备'
+    Add-Result -Item 'WMI Win32_SoundDevice 出现该设备' -Result 'FAIL' -Detail '未找到名称含 MicLink 的声音设备'
 }
 
 # 8) Core Audio 捕获端点（注册表）
@@ -245,7 +245,7 @@ if (Test-Path -Path $mmRoot) {
         if ([string]::IsNullOrWhiteSpace($fn)) {
             $fn = Get-ItemPropertyValue -Path $propPath -Name $descKey -ErrorAction SilentlyContinue
         }
-        if (-not [string]::IsNullOrWhiteSpace($fn) -and $fn -like '*Womic*') {
+        if (-not [string]::IsNullOrWhiteSpace($fn) -and $fn -like '*MicLink*') {
             $endpointFound = $true
             $endpointDetail = "$fn（端点 GUID：$(Split-Path -Leaf $sub.PSPath)）"
             break
@@ -255,15 +255,15 @@ if (Test-Path -Path $mmRoot) {
 Add-Result -Item 'Core Audio 捕获端点出现该设备' -Result $(if ($endpointFound) { 'PASS' } else { 'FAIL' }) -Detail $endpointDetail
 
 # 9) 控制设备 CreateFile
-Write-Step '检查控制设备 \\.\WomicControl…'
+Write-Step '检查控制设备 \\.\MicLinkControl…'
 $handle = [IntPtr]::Zero
 $opened = $false
 $openDetail = ''
 if ($script:NativeReady) {
-    $handle = [WomicVerifyNative]::Open($script:ControlDevicePath)
-    if ([WomicVerifyNative]::IsInvalid($handle)) {
+    $handle = [MicLinkVerifyNative]::Open($script:ControlDevicePath)
+    if ([MicLinkVerifyNative]::IsInvalid($handle)) {
         $opened = $false
-        $err = [WomicVerifyNative]::GetLastError()
+        $err = [MicLinkVerifyNative]::GetLastError()
         $openDetail = "CreateFile 失败，GetLastError=$err（5=拒绝访问/权限，2=找不到设备）"
     } else {
         $opened = $true
@@ -272,14 +272,14 @@ if ($script:NativeReady) {
 } else {
     $openDetail = '无法加载 native 探针（Add-Type 失败），未执行'
 }
-Add-Result -Item '控制设备 \\.\WomicControl 可打开' -Result $(if ($opened) { 'PASS' } else { 'FAIL' }) -Detail $openDetail
+Add-Result -Item '控制设备 \\.\MicLinkControl 可打开' -Result $(if ($opened) { 'PASS' } else { 'FAIL' }) -Detail $openDetail
 
 # 10) IOCTL GET_VERSION
 Write-Step '检查 IOCTL GET_VERSION…'
 if ($opened -and $script:NativeReady) {
     $version = New-Object 'System.UInt32[]' 4
     $win32Error = 0u
-    $rc = [WomicVerifyNative]::GetVersion($handle, [ref]$version, [ref]$win32Error)
+    $rc = [MicLinkVerifyNative]::GetVersion($handle, [ref]$version, [ref]$win32Error)
     if ($rc -eq 0) {
         Add-Result -Item 'IOCTL GET_VERSION 返回版本号' -Result 'PASS' -Detail `
             "v$($version[0]).$($version[1]).$($version[2]).$($version[3])"
@@ -292,13 +292,13 @@ if ($opened -and $script:NativeReady) {
     Add-Result -Item 'IOCTL GET_VERSION 返回版本号' -Result 'FAIL' -Detail '控制设备未打开，跳过'
 }
 if ($opened -and $script:NativeReady) {
-    try { [void][WomicVerifyNative]::CloseHandle($handle) } catch { /* ignore */ }
+    try { [void][MicLinkVerifyNative]::CloseHandle($handle) } catch { /* ignore */ }
 }
 
 # M) 人工验证项
-Add-Result -Item 'Windows 录音机能采到 Womic 麦克风' -Result 'MANUAL' -Detail '见 docs\Windows-Manual-Verification.md 第 5 节'
-Add-Result -Item 'OBS 能添加 Womic 麦克风并看到电平' -Result 'MANUAL' -Detail '见 docs\Windows-Manual-Verification.md 第 6 节'
-Add-Result -Item 'Zoom 能选择 Womic 麦克风并被对方听到' -Result 'MANUAL' -Detail '见 docs\Windows-Manual-Verification.md 第 7 节'
+Add-Result -Item 'Windows 录音机能采到 MicLink 麦克风' -Result 'MANUAL' -Detail '见 docs\Windows-Manual-Verification.md 第 5 节'
+Add-Result -Item 'OBS 能添加 MicLink 麦克风并看到电平' -Result 'MANUAL' -Detail '见 docs\Windows-Manual-Verification.md 第 6 节'
+Add-Result -Item 'Zoom 能选择 MicLink 麦克风并被对方听到' -Result 'MANUAL' -Detail '见 docs\Windows-Manual-Verification.md 第 7 节'
 Add-Result -Item '24 小时稳定性（无掉设备/无爆音）' -Result 'MANUAL' -Detail '长跑观察，见 docs\VERIFICATION.md B 类清单'
 
 # ---------------------------------------------------------------------------
@@ -331,10 +331,10 @@ if ($failItems.Count -gt 0) {
         Write-Host "  * $($f.Item)：$($f.Detail)" -ForegroundColor Yellow
     }
     Write-Host ''
-    Write-Host '  【典型坑】若 \\.\WomicControl 能打开，但声音输入列表里看不到麦克风：' -ForegroundColor Yellow
+    Write-Host '  【典型坑】若 \\.\MicLinkControl 能打开，但声音输入列表里看不到麦克风：' -ForegroundColor Yellow
     Write-Host '    多半是驱动的 IRP_MJ_* dispatch 例程覆盖了 KS 过滤器所需的处理路径，' -ForegroundColor Yellow
     Write-Host '    或端点/拓扑 miniport 未正确暴露捕获引脚（capture pin）。' -ForegroundColor Yellow
-    Write-Host '    排查：check driver/Source/Main/womicctl.cpp 与 adapter.cpp 的 dispatch 设置、' -ForegroundColor Yellow
+    Write-Host '    排查：check driver/Source/Main/miclinkctl.cpp 与 adapter.cpp 的 dispatch 设置、' -ForegroundColor Yellow
     Write-Host '    micarraytopo.cpp / minwavertstream.cpp 的引脚描述符与数据格式范围。' -ForegroundColor Yellow
     Write-Host '    详见 docs\Windows-Manual-Verification.md 第 8 节"反面检查"。' -ForegroundColor Yellow
     Write-Banner '存在 FAIL 项，请先修复后再做人工验证' 'Red'

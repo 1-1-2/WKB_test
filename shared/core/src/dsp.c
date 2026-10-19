@@ -6,12 +6,12 @@
  */
 #include <stddef.h>
 
-#include "womic/womic_dsp.h"
+#include "miclink/miclink_dsp.h"
 
 /* ------------------------------------------------------------------ *
  * 内部：Newton 迭代求平方根（不使用 libm）
  * ------------------------------------------------------------------ */
-static double womic_sqrt_f64(double x)
+static double miclink_sqrt_f64(double x)
 {
     double g;
     double prev;
@@ -39,7 +39,7 @@ static double womic_sqrt_f64(double x)
 }
 
 /** @brief 判断 float 是否为有限值（非 NaN、非 Inf），不依赖 math.h。 */
-static int womic_f32_is_finite(float v)
+static int miclink_f32_is_finite(float v)
 {
     return (v == v) && (v <= 3.402823466e+38f) && (v >= -3.402823466e+38f);
 }
@@ -48,14 +48,14 @@ static int womic_f32_is_finite(float v)
  * 增益
  * ------------------------------------------------------------------ */
 
-void womic_apply_gain(int16_t *samples, uint32_t nframes, float linear_gain)
+void miclink_apply_gain(int16_t *samples, uint32_t nframes, float linear_gain)
 {
     uint32_t i;
 
     if ((samples == NULL) || (nframes == 0u)) {
         return;
     }
-    if (!womic_f32_is_finite(linear_gain)) {
+    if (!miclink_f32_is_finite(linear_gain)) {
         return; /* NaN/Inf：拒绝处理，绝不把未定义值写回样本 */
     }
 
@@ -82,7 +82,7 @@ void womic_apply_gain(int16_t *samples, uint32_t nframes, float linear_gain)
  * 电平测量
  * ------------------------------------------------------------------ */
 
-void womic_measure_level(const int16_t *s, uint32_t nframes, float *out_rms, float *out_peak)
+void miclink_measure_level(const int16_t *s, uint32_t nframes, float *out_rms, float *out_peak)
 {
     uint64_t sum_sq = 0u;
     uint32_t peak = 0u;
@@ -110,7 +110,7 @@ void womic_measure_level(const int16_t *s, uint32_t nframes, float *out_rms, flo
     }
 
     mean_sq = (double)sum_sq / (double)nframes;
-    rms = womic_sqrt_f64(mean_sq) / 32767.0;
+    rms = miclink_sqrt_f64(mean_sq) / 32767.0;
 
     if (out_rms != NULL) {
         float v = (float)rms;
@@ -132,7 +132,7 @@ void womic_measure_level(const int16_t *s, uint32_t nframes, float *out_rms, flo
  * 静音填充
  * ------------------------------------------------------------------ */
 
-void womic_fill_silence(int16_t *dst, uint32_t nframes)
+void miclink_fill_silence(int16_t *dst, uint32_t nframes)
 {
     uint32_t i;
 
@@ -148,12 +148,12 @@ void womic_fill_silence(int16_t *dst, uint32_t nframes)
  * 去咔哒（declick）
  * ------------------------------------------------------------------ */
 
-void womic_declck_init(womic_declck *d, uint32_t fade_len_samples)
+void miclink_declck_init(miclink_declck *d, uint32_t fade_len_samples)
 {
     if (d == NULL) {
         return;
     }
-    d->fade_len = (fade_len_samples == 0u) ? WOMIC_DECLCK_DEFAULT_FADE : fade_len_samples;
+    d->fade_len = (fade_len_samples == 0u) ? MICLINK_DECLCK_DEFAULT_FADE : fade_len_samples;
     if (d->fade_len > 4096u) {
         d->fade_len = 4096u; /* 上限保护：防止异常配置导致整段被淡入抹平 */
     }
@@ -162,26 +162,26 @@ void womic_declck_init(womic_declck *d, uint32_t fade_len_samples)
     d->fade_remaining = (int)d->fade_len;
 }
 
-void womic_declck_reset(womic_declck *d)
+void miclink_declck_reset(miclink_declck *d)
 {
     if (d == NULL) {
         return;
     }
     /* 视为发生了一次断流：从静音重新开始淡入 */
     d->prev_sample = 0;
-    d->fade_remaining = (int)((d->fade_len == 0u) ? WOMIC_DECLCK_DEFAULT_FADE : d->fade_len);
+    d->fade_remaining = (int)((d->fade_len == 0u) ? MICLINK_DECLCK_DEFAULT_FADE : d->fade_len);
 }
 
-void womic_declck_notify_loss(womic_declck *d)
+void miclink_declck_notify_loss(miclink_declck *d)
 {
     if (d == NULL) {
         return;
     }
     /* 保留 prev_sample（它是断流前最后一个真实样本），仅重新武装淡入 */
-    d->fade_remaining = (int)((d->fade_len == 0u) ? WOMIC_DECLCK_DEFAULT_FADE : d->fade_len);
+    d->fade_remaining = (int)((d->fade_len == 0u) ? MICLINK_DECLCK_DEFAULT_FADE : d->fade_len);
 }
 
-void womic_apply_declck(womic_declck *d, int16_t *samples, uint32_t nframes)
+void miclink_apply_declck(miclink_declck *d, int16_t *samples, uint32_t nframes)
 {
     uint32_t i;
     uint32_t fade_n;
@@ -190,7 +190,7 @@ void womic_apply_declck(womic_declck *d, int16_t *samples, uint32_t nframes)
         return;
     }
     if (d->fade_len == 0u) {
-        d->fade_len = WOMIC_DECLCK_DEFAULT_FADE;
+        d->fade_len = MICLINK_DECLCK_DEFAULT_FADE;
     }
     if (d->fade_remaining <= 0) {
         /* 无需淡入：只更新 prev_sample */

@@ -17,18 +17,18 @@ Abstract:
 #include "savedata.h"
 
 //
-// WOMIC 控制设备契约（Source\Inc\womic\womic_ctl.h）。
-// 它会顺带拉入三方共享的 womic_ioctl.h / womic_ring.h / womic_dsp.h ——
-// womic_declck（去咔哒状态）就定义在后者里。
+// MICLINK 控制设备契约（Source\Inc\miclink\miclink_ctl.h）。
+// 它会顺带拉入三方共享的 miclink_ioctl.h / miclink_ring.h / miclink_dsp.h ——
+// miclink_declck（去咔哒状态）就定义在后者里。
 //
-#include "womic/womic_ctl.h"
+#include "miclink/miclink_ctl.h"
 
 //
 // 注意：ToneGenerator.h 的 include、`ToneGenerator` 类型的成员，以及
 // Utilities\ToneGenerator.cpp / .h 本身都已被删除（缺陷 D-04：正弦发生器
 // 在移除正弦注入后已无任何调用点，继续编译属于死代码，DisableToneGenerator
 // 注册表项也会误导运维以为还能切回正弦）。
-// 本驱动不再生成任何正弦波；捕获数据全部来自上面的 WOMIC 环形缓冲。
+// 本驱动不再生成任何正弦波；捕获数据全部来自上面的 MICLINK 环形缓冲。
 //
 
 //
@@ -130,9 +130,9 @@ protected:
     //
     // 去咔哒状态。它会被 WriteBytes 在 DISPATCH_LEVEL 的 DPC 中使用，
     // 因此必须是内联成员（本对象本身分配在 NonPagedPool），
-    // 并且只能用 womic_declck_* 这组纯整数实现（不得引入浮点）。
+    // 并且只能用 miclink_declck_* 这组纯整数实现（不得引入浮点）。
     //
-    womic_declck                m_Declck;
+    miclink_declck                m_Declck;
 
     GUID                        m_SignalProcessingMode;
     BOOLEAN                     m_bEoSReceived;

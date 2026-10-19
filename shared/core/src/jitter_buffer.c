@@ -13,7 +13,7 @@
  *
  * 2) 目标延迟（95 分位 + 线性映射）
  *    单纯的 J 对“偶发大抖动 + 长期平稳”的网络反应过慢，所以额外维护最近
- *    WOMIC_JB_DEV_WINDOW(64) 个 |D| 的滑动窗口，取 95 分位 p95（对 64 个样本做
+ *    MICLINK_JB_DEV_WINDOW(64) 个 |D| 的滑动窗口，取 95 分位 p95（对 64 个样本做
  *    插入排序，无内存分配、执行时间可预测，可在 DISPATCH_LEVEL 调用）：
  *        target = clamp(min_delay + k * p95, min_delay, max_delay),  k = 2
  *    k=2 的含义：目标延迟要能覆盖约 2 倍于“典型抖动上限”的偏差，
@@ -21,7 +21,7 @@
  *
  * 3) 衰老 / 回退（hysteresis）
  *    上调要快：每次 put 立即把 target 提升到位，网络一变差就马上加深缓冲；
- *    下调要慢：只有在“连续 WOMIC_JB_DECREASE_STREAK(100) 帧都无需因欠缓冲而等待”
+ *    下调要慢：只有在“连续 MICLINK_JB_DECREASE_STREAK(100) 帧都无需因欠缓冲而等待”
  *    且“实测 p95 确实已经下降到支持更低的 target”时，才把 target 下调 1 帧。
  *    这样避免 target 在临界点附近来回震荡（震荡会同时带来延迟抖动与音质抖动）。
  *
@@ -33,14 +33,14 @@
  *
  * 平台中立：纯 C99，无 libc/libm/动态内存，slot 表与 PCM 全部来自调用方 storage。
  */
-#include "womic/womic_jitter.h"
+#include "miclink/miclink_jitter.h"
 
 /* ------------------------------------------------------------------ *
  * 内部工具
  * ------------------------------------------------------------------ */
 
 /** @brief 计算配置对应的每帧样本数（0 表示参数非法）。 */
-static uint32_t jb_samples_per_frame(const womic_jb_config *cfg)
+static uint32_t jb_samples_per_frame(const miclink_jb_config *cfg)
 {
     uint32_t per_ms;
 
@@ -66,7 +66,7 @@ static uint32_t jb_samples_per_frame(const womic_jb_config *cfg)
 }
 
 /** @brief 归一化配置：填默认值、夹紧上下限，并返回应使用的槽位容量。 */
-static uint32_t jb_capacity_for(const womic_jb_config *cfg)
+static uint32_t jb_capacity_for(const miclink_jb_config *cfg)
 {
     uint32_t max_delay;
     uint32_t min_frames;
@@ -74,10 +74,10 @@ static uint32_t jb_capacity_for(const womic_jb_config *cfg)
 
     max_delay = cfg->max_delay_ms;
     if (max_delay == 0u) {
-        max_delay = WOMIC_JB_DEFAULT_MAX;
+        max_delay = MICLINK_JB_DEFAULT_MAX;
     }
-    if (max_delay > WOMIC_JB_HARD_MAX_DELAY) {
-        max_delay = WOMIC_JB_HARD_MAX_DELAY; /* 硬上限 120ms */
+    if (max_delay > MICLINK_JB_HARD_MAX_DELAY) {
+        max_delay = MICLINK_JB_HARD_MAX_DELAY; /* 硬上限 120ms */
     }
     min_frames = max_delay / cfg->frame_ms + 2u;
     cap = cfg->capacity_frames;
@@ -91,9 +91,9 @@ static uint32_t jb_capacity_for(const womic_jb_config *cfg)
 }
 
 /** @brief 对最近的 |D| 窗口取 95 分位（插入排序，无分配）。 */
-static uint32_t jb_percentile95(const womic_jitter *jb)
+static uint32_t jb_percentile95(const miclink_jitter *jb)
 {
-    uint32_t tmp[WOMIC_JB_DEV_WINDOW];
+    uint32_t tmp[MICLINK_JB_DEV_WINDOW];
     uint32_t n = jb->dev_count;
     uint32_t i;
     uint32_t j;
@@ -140,7 +140,7 @@ static void jb_zero_frame(int16_t *dst, uint32_t n)
 }
 
 /** @brief RFC3550 抖动更新 + 窗口维护。 */
-static void jb_update_jitter(womic_jitter *jb, uint32_t seq, uint32_t now_ms)
+static void jb_update_jitter(miclink_jitter *jb, uint32_t seq, uint32_t now_ms)
 {
     if (jb->have_last && (seq > jb->last_seq)) {
         int32_t d_ts = (int32_t)((seq - jb->last_seq) * jb->cfg.frame_ms);
@@ -172,8 +172,8 @@ static void jb_update_jitter(womic_jitter *jb, uint32_t seq, uint32_t now_ms)
         jb->jitter_x16 = j16;
 
         jb->dev_window[jb->dev_pos] = abs_d;
-        jb->dev_pos = (jb->dev_pos + 1u) % (uint32_t)WOMIC_JB_DEV_WINDOW;
-        if (jb->dev_count < (uint32_t)WOMIC_JB_DEV_WINDOW) {
+        jb->dev_pos = (jb->dev_pos + 1u) % (uint32_t)MICLINK_JB_DEV_WINDOW;
+        if (jb->dev_count < (uint32_t)MICLINK_JB_DEV_WINDOW) {
             jb->dev_count++;
         }
     }
@@ -183,16 +183,16 @@ static void jb_update_jitter(womic_jitter *jb, uint32_t seq, uint32_t now_ms)
 }
 
 /** @brief 根据当前 p95 重算目标延迟（只做“快上调”，下调另走慢路径）。 */
-static void jb_update_target_fast(womic_jitter *jb)
+static void jb_update_target_fast(miclink_jitter *jb)
 {
     uint32_t desired;
     uint32_t max_delay = jb->cfg.max_delay_ms;
 
     if (max_delay == 0u) {
-        max_delay = WOMIC_JB_DEFAULT_MAX;
+        max_delay = MICLINK_JB_DEFAULT_MAX;
     }
-    if (max_delay > WOMIC_JB_HARD_MAX_DELAY) {
-        max_delay = WOMIC_JB_HARD_MAX_DELAY;
+    if (max_delay > MICLINK_JB_HARD_MAX_DELAY) {
+        max_delay = MICLINK_JB_HARD_MAX_DELAY;
     }
 
     jb->p95_ms = jb_percentile95(jb);
@@ -209,19 +209,19 @@ static void jb_update_target_fast(womic_jitter *jb)
 }
 
 /** @brief 慢速下调：连续稳定且实测抖动支持时，每次只降 1 帧。 */
-static void jb_maybe_lower_target(womic_jitter *jb)
+static void jb_maybe_lower_target(miclink_jitter *jb)
 {
     uint32_t desired;
     uint32_t max_delay = jb->cfg.max_delay_ms;
 
     if (max_delay == 0u) {
-        max_delay = WOMIC_JB_DEFAULT_MAX;
+        max_delay = MICLINK_JB_DEFAULT_MAX;
     }
-    if (max_delay > WOMIC_JB_HARD_MAX_DELAY) {
-        max_delay = WOMIC_JB_HARD_MAX_DELAY;
+    if (max_delay > MICLINK_JB_HARD_MAX_DELAY) {
+        max_delay = MICLINK_JB_HARD_MAX_DELAY;
     }
 
-    if (jb->stable_frames < (uint32_t)WOMIC_JB_DECREASE_STREAK) {
+    if (jb->stable_frames < (uint32_t)MICLINK_JB_DECREASE_STREAK) {
         return;
     }
     if (jb->target_delay_ms <= jb->cfg.min_delay_ms) {
@@ -243,7 +243,7 @@ static void jb_maybe_lower_target(womic_jitter *jb)
 }
 
 /** @brief 找到当前缓冲中最小的 seq。 */
-static int jb_find_min_seq(const womic_jitter *jb, uint32_t *out_seq)
+static int jb_find_min_seq(const miclink_jitter *jb, uint32_t *out_seq)
 {
     uint32_t i;
     int found = 0;
@@ -264,7 +264,7 @@ static int jb_find_min_seq(const womic_jitter *jb, uint32_t *out_seq)
 }
 
 /** @brief 清空所有槽位。 */
-static void jb_clear_slots(womic_jitter *jb)
+static void jb_clear_slots(miclink_jitter *jb)
 {
     uint32_t i;
     for (i = 0u; i < jb->capacity; ++i) {
@@ -275,7 +275,7 @@ static void jb_clear_slots(womic_jitter *jb)
 }
 
 /** @brief 若出现超过 max_delay 的巨大断裂，直接跳到最早可用帧（避免无界追赶）。 */
-static void jb_resync_huge_gap(womic_jitter *jb)
+static void jb_resync_huge_gap(miclink_jitter *jb)
 {
     uint32_t min_seq = 0u;
     uint32_t tolerance;
@@ -298,7 +298,7 @@ static void jb_resync_huge_gap(womic_jitter *jb)
 }
 
 /** @brief 若 head_seq 处有数据则取出一帧。返回 1 表示已取出。 */
-static int jb_emit_at_head(womic_jitter *jb, int16_t *out_frames, uint32_t nframes)
+static int jb_emit_at_head(miclink_jitter *jb, int16_t *out_frames, uint32_t nframes)
 {
     uint32_t idx = jb->head_seq % jb->capacity;
 
@@ -316,7 +316,7 @@ static int jb_emit_at_head(womic_jitter *jb, int16_t *out_frames, uint32_t nfram
 }
 
 /** @brief 播放时钟推进（带漂移校正：长时间停顿后直接对齐当前时刻）。 */
-static void jb_advance_clock(womic_jitter *jb, uint32_t now_ms)
+static void jb_advance_clock(miclink_jitter *jb, uint32_t now_ms)
 {
     if ((now_ms - jb->last_play_ms) > (2u * jb->cfg.frame_ms)) {
         jb->last_play_ms = now_ms;
@@ -329,7 +329,7 @@ static void jb_advance_clock(womic_jitter *jb, uint32_t now_ms)
  * 公开 API
  * ------------------------------------------------------------------ */
 
-size_t womic_jb_storage_bytes(const womic_jb_config *cfg)
+size_t miclink_jb_storage_bytes(const miclink_jb_config *cfg)
 {
     uint32_t spf;
     uint32_t cap;
@@ -352,7 +352,7 @@ size_t womic_jb_storage_bytes(const womic_jb_config *cfg)
     return total;
 }
 
-int womic_jb_init(womic_jitter *jb, const womic_jb_config *cfg, void *storage, size_t storage_bytes)
+int miclink_jb_init(miclink_jitter *jb, const miclink_jb_config *cfg, void *storage, size_t storage_bytes)
 {
     uint32_t spf;
     uint32_t cap;
@@ -403,13 +403,13 @@ int womic_jb_init(womic_jitter *jb, const womic_jb_config *cfg, void *storage, s
 
     jb->cfg = *cfg;
     if (jb->cfg.min_delay_ms == 0u) {
-        jb->cfg.min_delay_ms = WOMIC_JB_DEFAULT_MIN;
+        jb->cfg.min_delay_ms = MICLINK_JB_DEFAULT_MIN;
     }
     if (jb->cfg.max_delay_ms == 0u) {
-        jb->cfg.max_delay_ms = WOMIC_JB_DEFAULT_MAX;
+        jb->cfg.max_delay_ms = MICLINK_JB_DEFAULT_MAX;
     }
-    if (jb->cfg.max_delay_ms > WOMIC_JB_HARD_MAX_DELAY) {
-        jb->cfg.max_delay_ms = WOMIC_JB_HARD_MAX_DELAY;
+    if (jb->cfg.max_delay_ms > MICLINK_JB_HARD_MAX_DELAY) {
+        jb->cfg.max_delay_ms = MICLINK_JB_HARD_MAX_DELAY;
     }
     if (jb->cfg.max_delay_ms < jb->cfg.min_delay_ms) {
         jb->cfg.max_delay_ms = jb->cfg.min_delay_ms;
@@ -438,7 +438,7 @@ int womic_jb_init(womic_jitter *jb, const womic_jb_config *cfg, void *storage, s
     return 0;
 }
 
-void womic_jb_reset(womic_jitter *jb)
+void miclink_jb_reset(miclink_jitter *jb)
 {
     if ((jb == NULL) || (!jb->initialized)) {
         return;
@@ -465,7 +465,7 @@ void womic_jb_reset(womic_jitter *jb)
     jb->last_sample = 0;
 }
 
-int womic_jb_put(womic_jitter *jb, uint32_t seq, int16_t *frames, uint32_t nframes, uint32_t now_ms)
+int miclink_jb_put(miclink_jitter *jb, uint32_t seq, int16_t *frames, uint32_t nframes, uint32_t now_ms)
 {
     uint32_t idx;
 
@@ -525,7 +525,7 @@ int womic_jb_put(womic_jitter *jb, uint32_t seq, int16_t *frames, uint32_t nfram
     return 0;
 }
 
-int womic_jb_get(womic_jitter *jb, int16_t *out_frames, uint32_t nframes, int *out_missing, uint32_t now_ms)
+int miclink_jb_get(miclink_jitter *jb, int16_t *out_frames, uint32_t nframes, int *out_missing, uint32_t now_ms)
 {
     uint32_t depth_ms;
 
@@ -597,7 +597,7 @@ int womic_jb_get(womic_jitter *jb, int16_t *out_frames, uint32_t nframes, int *o
     return 1;
 }
 
-uint32_t womic_jb_target_delay_ms(const womic_jitter *jb)
+uint32_t miclink_jb_target_delay_ms(const miclink_jitter *jb)
 {
     if ((jb == NULL) || (!jb->initialized)) {
         return 0u;
@@ -605,7 +605,7 @@ uint32_t womic_jb_target_delay_ms(const womic_jitter *jb)
     return jb->target_delay_ms;
 }
 
-uint32_t womic_jb_depth_ms(const womic_jitter *jb)
+uint32_t miclink_jb_depth_ms(const miclink_jitter *jb)
 {
     if ((jb == NULL) || (!jb->initialized)) {
         return 0u;

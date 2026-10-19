@@ -3,8 +3,8 @@
  *
  * 不依赖 GTest（避免联网下载），全部头文件内联实现，C++17。
  */
-#ifndef WOMIC_TEST_UTIL_H
-#define WOMIC_TEST_UTIL_H
+#ifndef MICLINK_TEST_UTIL_H
+#define MICLINK_TEST_UTIL_H
 
 #include <cstdint>
 #include <cstdio>
@@ -12,7 +12,7 @@
 #include <cmath>
 #include <string>
 
-namespace womic_test {
+namespace miclink_test {
 
 inline int &failure_count()
 {
@@ -113,23 +113,23 @@ inline int finish(const char *suite)
     return 1;
 }
 
-}  // namespace womic_test
+}  // namespace miclink_test
 
-#define WOMIC_CHECK(cond) \
-    ::womic_test::check_bool((cond) ? true : false, #cond, __FILE__, __LINE__)
+#define MICLINK_CHECK(cond) \
+    ::miclink_test::check_bool((cond) ? true : false, #cond, __FILE__, __LINE__)
 
-#define WOMIC_CHECK_EQ(a, b) \
-    ::womic_test::check_eq_impl((long double)(a), (long double)(b), #a, #b, __FILE__, __LINE__)
+#define MICLINK_CHECK_EQ(a, b) \
+    ::miclink_test::check_eq_impl((long double)(a), (long double)(b), #a, #b, __FILE__, __LINE__)
 
-#define WOMIC_CHECK_NEAR(a, b, eps) \
-    ::womic_test::check_near_impl((long double)(a), (long double)(b), (long double)(eps), \
+#define MICLINK_CHECK_NEAR(a, b, eps) \
+    ::miclink_test::check_near_impl((long double)(a), (long double)(b), (long double)(eps), \
                                   #a, #b, __FILE__, __LINE__)
 
-#define WOMIC_TEST_MAIN(suite, body) \
+#define MICLINK_TEST_MAIN(suite, body) \
     int main()                       \
     {                                \
         body;                        \
-        return ::womic_test::finish(#suite); \
+        return ::miclink_test::finish(#suite); \
     }
 
-#endif /* WOMIC_TEST_UTIL_H */
+#endif /* MICLINK_TEST_UTIL_H */

@@ -5,14 +5,14 @@
  * 而生产代码只通过 IDeviceBackend 抽象使用它，两者互不污染。
  *
  * 语义与真实驱动一一对应，便于在非 Windows 平台上验证驱动状态机：
- *   - 未 START                      -> WOMIC_ERR_NOT_READY
- *   - 帧字节数与 SET_FORMAT 不一致  -> WOMIC_ERR_FORMAT_MISMATCH（驱动绝不做重采样）
- *   - 环形缓冲满                    -> WOMIC_ERR_BUFFER_FULL，且一个样本都不接纳
+ *   - 未 START                      -> MICLINK_ERR_NOT_READY
+ *   - 帧字节数与 SET_FORMAT 不一致  -> MICLINK_ERR_FORMAT_MISMATCH（驱动绝不做重采样）
+ *   - 环形缓冲满                    -> MICLINK_ERR_BUFFER_FULL，且一个样本都不接纳
  *   - GET_STATUS                    -> 返回真实的读写序号与统计
  * 唯一区别：数据由 drain() 手动取走，而不是被内核 DMA 中断取走。
  */
-#ifndef WOMIC_SERVER_FAKE_DEVICE_H
-#define WOMIC_SERVER_FAKE_DEVICE_H
+#ifndef MICLINK_SERVER_FAKE_DEVICE_H
+#define MICLINK_SERVER_FAKE_DEVICE_H
 
 #include <cstdint>
 #include <cstring>
@@ -21,13 +21,13 @@
 #include "injector.h"
 #include "log.h"
 #include "ring_adapter.h"
-#include "womic/womic_ioctl.h"
+#include "miclink/miclink_ioctl.h"
 
-namespace womic {
+namespace miclink {
 
 /*
  * 本头文件会被 injector.cpp 与测试同时包含，因此这里**不**定义
- * kWomicLogModule（会与 injector.cpp 里的同名常量冲突），直接把模块名
+ * kMicLinkLogModule（会与 injector.cpp 里的同名常量冲突），直接把模块名
  * 以字面量传给 log_write()。
  */
 class FakeDeviceBackend final : public IDeviceBackend {
@@ -44,7 +44,7 @@ public:
         if (err != nullptr) {
             err->clear();
         }
-        ::womic::log_write(::womic::LogLevel::kInfo, "fake", "Fake 设备后端已打开（容量 %u 帧）",
+        ::miclink::log_write(::miclink::LogLevel::kInfo, "fake", "Fake 设备后端已打开（容量 %u 帧）",
                            capacity_);
         return true;
     }
@@ -55,7 +55,7 @@ public:
         started_ = false;
     }
 
-    bool get_version(WOMIC_VERSION *out, std::string *err) override
+    bool get_version(MICLINK_VERSION *out, std::string *err) override
     {
         if (!opened_) {
             if (err != nullptr) {
@@ -72,7 +72,7 @@ public:
         return true;
     }
 
-    bool get_caps(WOMIC_CAPS *out, std::string *err) override
+    bool get_caps(MICLINK_CAPS *out, std::string *err) override
     {
         if (!opened_) {
             if (err != nullptr) {
@@ -92,7 +92,7 @@ public:
         return true;
     }
 
-    bool set_format(const WOMIC_FORMAT &fmt, std::string *err) override
+    bool set_format(const MICLINK_FORMAT &fmt, std::string *err) override
     {
         if (!opened_) {
             if (err != nullptr) {
@@ -120,7 +120,7 @@ public:
         return true;
     }
 
-    bool start(const WOMIC_START_IO &io, std::string *err) override
+    bool start(const MICLINK_START_IO &io, std::string *err) override
     {
         if (!opened_ || !format_set_) {
             if (err != nullptr) {
@@ -142,8 +142,8 @@ public:
         }
         fill_silence_ = (io.fillSilence != 0u);
         started_ = true;
-        state_ = WOMIC_STATE_RUNNING;
-        ::womic::log_write(::womic::LogLevel::kInfo, "fake",
+        state_ = MICLINK_STATE_RUNNING;
+        ::miclink::log_write(::miclink::LogLevel::kInfo, "fake",
                            "Fake 设备已启动：%u Hz / %u ch / %u bit，静音填充=%d",
                            format_.sampleRate, format_.channels, format_.bitsPerSample,
                            static_cast<int>(fill_silence_));
@@ -153,14 +153,14 @@ public:
     bool stop(std::string *err) override
     {
         started_ = false;
-        state_ = WOMIC_STATE_STOPPED;
+        state_ = MICLINK_STATE_STOPPED;
         if (err != nullptr) {
             err->clear();
         }
         return true;
     }
 
-    bool reset(const WOMIC_RESET_IO &io, std::string *err) override
+    bool reset(const MICLINK_RESET_IO &io, std::string *err) override
     {
         ring_.reset();
         if (io.clearStats != 0u) {
@@ -172,17 +172,17 @@ public:
         }
         if (io.keepFormat == 0u) {
             format_set_ = false;
-            format_ = WOMIC_FORMAT {};
+            format_ = MICLINK_FORMAT {};
         }
         started_ = false;
-        state_ = WOMIC_STATE_STOPPED;
+        state_ = MICLINK_STATE_STOPPED;
         if (err != nullptr) {
             err->clear();
         }
         return true;
     }
 
-    bool get_status(WOMIC_STATUS *out, std::string *err) override
+    bool get_status(MICLINK_STATUS *out, std::string *err) override
     {
         if (out == nullptr) {
             if (err != nullptr) {
@@ -218,18 +218,18 @@ public:
             if (err != nullptr) {
                 *err = "Fake 设备未启动";
             }
-            return WOMIC_ERR_NOT_READY;
+            return MICLINK_ERR_NOT_READY;
         }
         if ((pcm == nullptr) || (frames == 0u)) {
-            return WOMIC_ERR_INVALID_PARAM;
+            return MICLINK_ERR_INVALID_PARAM;
         }
         const uint32_t frame_samples = frame_bytes_ / 2u;
         if (frame_samples == 0u) {
-            return WOMIC_ERR_INVALID_PARAM;
+            return MICLINK_ERR_INVALID_PARAM;
         }
         if ((static_cast<uint64_t>(frames) * static_cast<uint64_t>(frame_bytes_)) >
             (64u * 1024u)) {
-            return WOMIC_ERR_INVALID_PARAM; /* 超过 maxFrameBytesPerIoctl */
+            return MICLINK_ERR_INVALID_PARAM; /* 超过 maxFrameBytesPerIoctl */
         }
 
         const uint32_t written = ring_.write(pcm, frames);
@@ -238,7 +238,7 @@ public:
             if (err != nullptr) {
                 err->clear();
             }
-            return WOMIC_ERR_BUFFER_FULL;
+            return MICLINK_ERR_BUFFER_FULL;
         }
         if (written < frames) {
             frames_dropped_ += static_cast<uint64_t>(frames - written);
@@ -255,7 +255,7 @@ public:
         if (err != nullptr) {
             err->clear();
         }
-        return WOMIC_OK;
+        return MICLINK_OK;
     }
 
     /* ---- 测试辅助：模拟内核侧的 DMA 消费 ---- */
@@ -287,9 +287,9 @@ private:
     bool format_set_ = false;
     bool started_ = false;
     bool fill_silence_ = true;
-    uint32_t state_ = WOMIC_STATE_STOPPED;
+    uint32_t state_ = MICLINK_STATE_STOPPED;
     uint32_t frame_bytes_ = 0u;
-    WOMIC_FORMAT format_ {};
+    MICLINK_FORMAT format_ {};
     PcmRing ring_;
     uint64_t frames_written_ = 0u;
     uint64_t frames_consumed_ = 0u;
@@ -299,6 +299,6 @@ private:
     uint32_t high_watermark_ = 0u;
 };
 
-}  // namespace womic
+}  // namespace miclink
 
-#endif  /* WOMIC_SERVER_FAKE_DEVICE_H */
+#endif  /* MICLINK_SERVER_FAKE_DEVICE_H */

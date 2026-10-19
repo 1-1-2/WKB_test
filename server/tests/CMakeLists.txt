@@ -10,14 +10,14 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(OPUS REQUIRED opus)
 find_package(Threads REQUIRED)
 
-set(WOMIC_TEST_WARNING_FLAGS -Wall -Wextra -Werror)
+set(MICLINK_TEST_WARNING_FLAGS -Wall -Wextra -Werror)
 
 add_executable(test_pipeline test_pipeline.cpp)
 target_include_directories(test_pipeline PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
     ${OPUS_INCLUDE_DIRS})
-target_compile_options(test_pipeline PRIVATE ${WOMIC_TEST_WARNING_FLAGS})
-target_link_libraries(test_pipeline PRIVATE womic_server_core ${OPUS_LIBRARIES} Threads::Threads)
+target_compile_options(test_pipeline PRIVATE ${MICLINK_TEST_WARNING_FLAGS})
+target_link_libraries(test_pipeline PRIVATE miclink_server_core ${OPUS_LIBRARIES} Threads::Threads)
 target_link_directories(test_pipeline PRIVATE ${OPUS_LIBRARY_DIRS})
 
 add_test(NAME test_pipeline COMMAND test_pipeline)

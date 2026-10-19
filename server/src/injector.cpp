@@ -2,7 +2,7 @@
  * injector.cpp -- 设备后端与注入器实现。
  *
  * Windows 分支（CreateFileW / DeviceIoControl）在 Linux 沙箱中无法编译验证；
- * 所有共享结构体均直接 include shared/core/include/womic/womic_ioctl.h，
+ * 所有共享结构体均直接 include shared/core/include/miclink/miclink_ioctl.h，
  * 未做任何本地复制，因此字段布局由该头文件的静态断言保证一致。
  */
 #include "injector.h"
@@ -14,7 +14,7 @@
 #include "log.h"
 #include "ring_adapter.h"
 #include "threads_sync.h"
-#include "womic/womic_ring.h"
+#include "miclink/miclink_ring.h"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -24,45 +24,45 @@
 #include <winioctl.h>
 #endif
 
-namespace womic {
+namespace miclink {
 
-static constexpr char kWomicLogModule[] = "inject";
+static constexpr char kMicLinkLogModule[] = "inject";
 
 /* WRITE_PCM 遇到缓冲满时的退避上限：最多 8 次 × 1ms = 8ms。
    音频线程绝不允许在这里长时间阻塞（否则端点会欠载、听感上是咔哒）。 */
 constexpr int kMaxWriteAttempts = 8;
 constexpr uint32_t kBackoffMs = 1u;
 
-const char *womic_error_string(uint32_t code)
+const char *miclink_error_string(uint32_t code)
 {
     switch (code) {
-        case WOMIC_OK:
+        case MICLINK_OK:
             return "OK";
-        case WOMIC_ERR_NOT_READY:
+        case MICLINK_ERR_NOT_READY:
             return "NOT_READY";
-        case WOMIC_ERR_BUFFER_FULL:
+        case MICLINK_ERR_BUFFER_FULL:
             return "BUFFER_FULL";
-        case WOMIC_ERR_FORMAT_MISMATCH:
+        case MICLINK_ERR_FORMAT_MISMATCH:
             return "FORMAT_MISMATCH";
-        case WOMIC_ERR_INVALID_PARAM:
+        case MICLINK_ERR_INVALID_PARAM:
             return "INVALID_PARAM";
-        case WOMIC_ERR_NO_STREAM:
+        case MICLINK_ERR_NO_STREAM:
             return "NO_STREAM";
         default:
             return "UNKNOWN";
     }
 }
 
-const char *womic_state_string(uint32_t state)
+const char *miclink_state_string(uint32_t state)
 {
     switch (state) {
-        case WOMIC_STATE_STOPPED:
+        case MICLINK_STATE_STOPPED:
             return "STOPPED";
-        case WOMIC_STATE_STARTED:
+        case MICLINK_STATE_STARTED:
             return "STARTED";
-        case WOMIC_STATE_RUNNING:
+        case MICLINK_STATE_RUNNING:
             return "RUNNING";
-        case WOMIC_STATE_ERROR:
+        case MICLINK_STATE_ERROR:
             return "ERROR";
         default:
             return "UNKNOWN";
@@ -93,8 +93,8 @@ public:
             return true;
         }
         /*
-         *  \\.\WomicControl 是驱动创建的控制设备（IoCreateDeviceSecure +
-         *  IoCreateSymbolicLink 到 \DosDevices\Global\WomicControl）。
+         *  \\.\MicLinkControl 是驱动创建的控制设备（IoCreateDeviceSecure +
+         *  IoCreateSymbolicLink 到 \DosDevices\Global\MicLinkControl）。
          *  参数说明：
          *    dwShareMode = 0            —— 独占，避免第二个进程注入造成交错写；
          *    dwFlagsAndAttributes = FILE_ATTRIBUTE_NORMAL —— 这里**不**用
@@ -113,11 +113,11 @@ public:
             }
             return false;
         }
-        WOMIC_LOGI("已打开控制设备 %s", path_.c_str());
+        MICLINK_LOGI("已打开控制设备 %s", path_.c_str());
         return true;
 #else
         if (err != nullptr) {
-            *err = "IOCTL 设备后端只能在 Windows 上使用（当前平台无 \\\\.\\WomicControl）";
+            *err = "IOCTL 设备后端只能在 Windows 上使用（当前平台无 \\\\.\\MicLinkControl）";
         }
         return false;
 #endif
@@ -129,50 +129,50 @@ public:
         if (handle_ != INVALID_HANDLE_VALUE) {
             CloseHandle(handle_);
             handle_ = INVALID_HANDLE_VALUE;
-            WOMIC_LOGI("已关闭控制设备 %s", path_.c_str());
+            MICLINK_LOGI("已关闭控制设备 %s", path_.c_str());
         }
 #endif
     }
 
-    bool get_version(WOMIC_VERSION *out, std::string *err) override
+    bool get_version(MICLINK_VERSION *out, std::string *err) override
     {
-        return ioctl_call(WOMIC_IOCTL_GET_VERSION, nullptr, 0u, out,
-                          (out != nullptr) ? sizeof(*out) : 0u, err) == WOMIC_OK;
+        return ioctl_call(MICLINK_IOCTL_GET_VERSION, nullptr, 0u, out,
+                          (out != nullptr) ? sizeof(*out) : 0u, err) == MICLINK_OK;
     }
 
-    bool get_caps(WOMIC_CAPS *out, std::string *err) override
+    bool get_caps(MICLINK_CAPS *out, std::string *err) override
     {
-        return ioctl_call(WOMIC_IOCTL_GET_CAPS, nullptr, 0u, out,
-                          (out != nullptr) ? sizeof(*out) : 0u, err) == WOMIC_OK;
+        return ioctl_call(MICLINK_IOCTL_GET_CAPS, nullptr, 0u, out,
+                          (out != nullptr) ? sizeof(*out) : 0u, err) == MICLINK_OK;
     }
 
-    bool set_format(const WOMIC_FORMAT &fmt, std::string *err) override
+    bool set_format(const MICLINK_FORMAT &fmt, std::string *err) override
     {
-        WOMIC_FORMAT in = fmt; /* 共享结构体，按值传，无指针字段 */
-        return ioctl_call(WOMIC_IOCTL_SET_FORMAT, &in, sizeof(in), nullptr, 0u, err) == WOMIC_OK;
+        MICLINK_FORMAT in = fmt; /* 共享结构体，按值传，无指针字段 */
+        return ioctl_call(MICLINK_IOCTL_SET_FORMAT, &in, sizeof(in), nullptr, 0u, err) == MICLINK_OK;
     }
 
-    bool start(const WOMIC_START_IO &io, std::string *err) override
+    bool start(const MICLINK_START_IO &io, std::string *err) override
     {
-        WOMIC_START_IO in = io;
-        return ioctl_call(WOMIC_IOCTL_START, &in, sizeof(in), nullptr, 0u, err) == WOMIC_OK;
+        MICLINK_START_IO in = io;
+        return ioctl_call(MICLINK_IOCTL_START, &in, sizeof(in), nullptr, 0u, err) == MICLINK_OK;
     }
 
     bool stop(std::string *err) override
     {
-        return ioctl_call(WOMIC_IOCTL_STOP, nullptr, 0u, nullptr, 0u, err) == WOMIC_OK;
+        return ioctl_call(MICLINK_IOCTL_STOP, nullptr, 0u, nullptr, 0u, err) == MICLINK_OK;
     }
 
-    bool reset(const WOMIC_RESET_IO &io, std::string *err) override
+    bool reset(const MICLINK_RESET_IO &io, std::string *err) override
     {
-        WOMIC_RESET_IO in = io;
-        return ioctl_call(WOMIC_IOCTL_RESET, &in, sizeof(in), nullptr, 0u, err) == WOMIC_OK;
+        MICLINK_RESET_IO in = io;
+        return ioctl_call(MICLINK_IOCTL_RESET, &in, sizeof(in), nullptr, 0u, err) == MICLINK_OK;
     }
 
-    bool get_status(WOMIC_STATUS *out, std::string *err) override
+    bool get_status(MICLINK_STATUS *out, std::string *err) override
     {
-        return ioctl_call(WOMIC_IOCTL_GET_STATUS, nullptr, 0u, out,
-                          (out != nullptr) ? sizeof(*out) : 0u, err) == WOMIC_OK;
+        return ioctl_call(MICLINK_IOCTL_GET_STATUS, nullptr, 0u, out,
+                          (out != nullptr) ? sizeof(*out) : 0u, err) == MICLINK_OK;
     }
 
     uint32_t write_pcm(const int16_t *pcm, uint32_t frames, uint32_t flags,
@@ -182,26 +182,26 @@ public:
             *out_written_frames = 0u;
         }
         if ((pcm == nullptr) || (frames == 0u)) {
-            return WOMIC_ERR_INVALID_PARAM;
+            return MICLINK_ERR_INVALID_PARAM;
         }
 
         /*
-         * METHOD_BUFFERED：输入缓冲区 = [WOMIC_WRITE_PCM_IO][PCM...]，
+         * METHOD_BUFFERED：输入缓冲区 = [MICLINK_WRITE_PCM_IO][PCM...]，
          * 由系统内核在用户态与内核态之间整体拷贝一次，驱动直接拿到连续内存。
          * 因此这里必须自己把头和数据拼成一个连续块（不能用两个指针）。
          */
         const uint32_t frame_bytes = frame_bytes_;
         if (frame_bytes == 0u) {
-            return WOMIC_ERR_INVALID_PARAM;
+            return MICLINK_ERR_INVALID_PARAM;
         }
         const size_t payload_bytes = static_cast<size_t>(frames) * static_cast<size_t>(frame_bytes);
-        const size_t total = sizeof(WOMIC_WRITE_PCM_IO) + payload_bytes;
+        const size_t total = sizeof(MICLINK_WRITE_PCM_IO) + payload_bytes;
 
         if (scratch_.size() < total) {
             scratch_.resize(total);
         }
 
-        WOMIC_WRITE_PCM_IO header {};
+        MICLINK_WRITE_PCM_IO header {};
         header.frameCount = frames;
         header.frameBytes = frame_bytes;
         header.flags = flags;
@@ -209,16 +209,16 @@ public:
         std::memcpy(scratch_.data(), &header, sizeof(header));
         std::memcpy(scratch_.data() + sizeof(header), pcm, payload_bytes);
 
-        WOMIC_STATUS status_out {};
-        uint32_t rc = ioctl_call(WOMIC_IOCTL_WRITE_PCM, scratch_.data(), total, &status_out,
+        MICLINK_STATUS status_out {};
+        uint32_t rc = ioctl_call(MICLINK_IOCTL_WRITE_PCM, scratch_.data(), total, &status_out,
                                  sizeof(status_out), err);
-        if (rc == WOMIC_OK) {
+        if (rc == MICLINK_OK) {
             if (out_written_frames != nullptr) {
                 *out_written_frames = frames;
             }
-            return WOMIC_OK;
+            return MICLINK_OK;
         }
-        if (rc == WOMIC_ERR_BUFFER_FULL) {
+        if (rc == MICLINK_ERR_BUFFER_FULL) {
             /*
              * 缓冲满：驱动一个样本都没接纳。返回让上层退避重试。
              * 这里**不**睡眠 —— 睡眠属于调用方策略（Injector::write_frames），
@@ -227,7 +227,7 @@ public:
             if (err != nullptr) {
                 err->clear();
             }
-            return WOMIC_ERR_BUFFER_FULL;
+            return MICLINK_ERR_BUFFER_FULL;
         }
         return rc;
     }
@@ -245,7 +245,7 @@ private:
             if (err != nullptr) {
                 *err = "控制设备未打开";
             }
-            return WOMIC_ERR_NOT_READY;
+            return MICLINK_ERR_NOT_READY;
         }
         DWORD returned = 0;
         BOOL ok = DeviceIoControl(handle_, static_cast<DWORD>(code),
@@ -255,7 +255,7 @@ private:
             if (err != nullptr) {
                 err->clear();
             }
-            return WOMIC_OK;
+            return MICLINK_OK;
         }
         const DWORD e = GetLastError();
         uint32_t mapped = map_win32_error(e);
@@ -263,7 +263,7 @@ private:
             char buf[256];
             std::snprintf(buf, sizeof(buf), "DeviceIoControl(0x%08X) 失败，GetLastError=%lu -> %s",
                           static_cast<unsigned>(code), static_cast<unsigned long>(e),
-                          womic_error_string(mapped));
+                          miclink_error_string(mapped));
             *err = buf;
         }
         return mapped;
@@ -273,19 +273,19 @@ private:
     {
         switch (e) {
             case ERROR_NOT_READY:             /* 21  */
-                return WOMIC_ERR_NOT_READY;
+                return MICLINK_ERR_NOT_READY;
             case ERROR_INSUFFICIENT_BUFFER:   /* 122 */
             case ERROR_MORE_DATA:             /* 234 */
-                return WOMIC_ERR_BUFFER_FULL;
+                return MICLINK_ERR_BUFFER_FULL;
             case ERROR_NOT_SUPPORTED:         /* 50  */
             case ERROR_INVALID_FUNCTION:      /* 1   */
-                return WOMIC_ERR_FORMAT_MISMATCH;
+                return MICLINK_ERR_FORMAT_MISMATCH;
             case ERROR_INVALID_PARAMETER:     /* 87  */
-                return WOMIC_ERR_INVALID_PARAM;
+                return MICLINK_ERR_INVALID_PARAM;
             case ERROR_NO_DATA:               /* 232 */
-                return WOMIC_ERR_NO_STREAM;
+                return MICLINK_ERR_NO_STREAM;
             default:
-                return WOMIC_ERR_INVALID_PARAM;
+                return MICLINK_ERR_INVALID_PARAM;
         }
     }
 
@@ -320,7 +320,7 @@ private:
         if (err != nullptr) {
             *err = "IOCTL 设备后端只能在 Windows 上使用";
         }
-        return WOMIC_ERR_NOT_READY;
+        return MICLINK_ERR_NOT_READY;
     }
 #endif
 
@@ -342,7 +342,7 @@ std::unique_ptr<IDeviceBackend> create_device_backend(const std::string &name,
 
     bool want_fake = (lower == "fake");
     if (lower == "auto") {
-#if defined(WOMIC_WITH_FAKE_DEVICE)
+#if defined(MICLINK_WITH_FAKE_DEVICE)
         /* 该开关打开时（Linux CI / 冒烟测试默认打开）auto 优先解析为 Fake。 */
         want_fake = true;
 #elif !defined(_WIN32)
@@ -356,7 +356,7 @@ std::unique_ptr<IDeviceBackend> create_device_backend(const std::string &name,
         return std::unique_ptr<IDeviceBackend>(new FakeDeviceBackend(fake_capacity_frames));
     }
     if ((lower == "ioctl") || (lower == "auto")) {
-        return std::unique_ptr<IDeviceBackend>(new IoctlDeviceBackend("\\\\.\\WomicControl"));
+        return std::unique_ptr<IDeviceBackend>(new IoctlDeviceBackend("\\\\.\\MicLinkControl"));
     }
     if (err != nullptr) {
         *err = "未知设备后端 '" + name + "'（可选 auto/ioctl/fake）";
@@ -389,19 +389,19 @@ bool Injector::open(const ServerConfig &cfg, std::string *err)
         return false;
     }
 
-    WOMIC_VERSION version {};
+    MICLINK_VERSION version {};
     if (!backend_->get_version(&version, err)) {
         return false;
     }
-    WOMIC_LOGI("驱动版本 %u.%u.%u.%u", version.major, version.minor, version.patch, version.build);
+    MICLINK_LOGI("驱动版本 %u.%u.%u.%u", version.major, version.minor, version.patch, version.build);
 
     if (!backend_->get_caps(&caps_, err)) {
         return false;
     }
-    WOMIC_LOGI("驱动能力：环形容量 %u 帧，单次写入上限 %u 字节，静音填充=%u，声道掩码=0x%x",
+    MICLINK_LOGI("驱动能力：环形容量 %u 帧，单次写入上限 %u 字节，静音填充=%u，声道掩码=0x%x",
                caps_.ringCapacityFrames, caps_.maxFrameBytesPerIoctl, caps_.supportsSilenceFill,
                caps_.supportedChannels);
-    WOMIC_LOGI("驱动支持采样率：%u %u %u %u %u %u %u %u", caps_.supportedRates[0],
+    MICLINK_LOGI("驱动支持采样率：%u %u %u %u %u %u %u %u", caps_.supportedRates[0],
                caps_.supportedRates[1], caps_.supportedRates[2], caps_.supportedRates[3],
                caps_.supportedRates[4], caps_.supportedRates[5], caps_.supportedRates[6],
                caps_.supportedRates[7]);
@@ -446,7 +446,7 @@ bool Injector::open(const ServerConfig &cfg, std::string *err)
     if (!backend_->set_format(format_, err)) {
         return false;
     }
-    WOMIC_LOGI("已设置端点格式：%u Hz / %u ch / %u bit（帧 %u 字节）", format_.sampleRate,
+    MICLINK_LOGI("已设置端点格式：%u Hz / %u ch / %u bit（帧 %u 字节）", format_.sampleRate,
                format_.channels, format_.bitsPerSample, frame_bytes_);
 
     /* 让派生后端知道帧大小（真实 IOCTL 后端需要它拼 WRITE_PCM 的包体）。 */
@@ -467,7 +467,7 @@ bool Injector::open(const ServerConfig &cfg, std::string *err)
         max_chunk_frames_ = 1u;
     }
 
-    WOMIC_START_IO start_io {};
+    MICLINK_START_IO start_io {};
     start_io.sampleRate = cfg.endpoint_sample_rate;
     start_io.channels = cfg.endpoint_channels;
     start_io.fillSilence = 1u; /* 缓冲排空时补静音，避免端点返回 NO_STREAM */
@@ -477,7 +477,7 @@ bool Injector::open(const ServerConfig &cfg, std::string *err)
     }
 
     opened_ = true;
-    WOMIC_LOGI("端点已启动（后端 %s），等待 PCM 注入", backend_->name());
+    MICLINK_LOGI("端点已启动（后端 %s），等待 PCM 注入", backend_->name());
     return true;
 }
 
@@ -493,15 +493,15 @@ void Injector::close()
 
     std::string err;
     if (!backend_->stop(&err)) {
-        WOMIC_LOGW("STOP 失败：%s", err.c_str());
+        MICLINK_LOGW("STOP 失败：%s", err.c_str());
     }
-    WOMIC_RESET_IO reset_io {};
+    MICLINK_RESET_IO reset_io {};
     reset_io.keepFormat = 0u;
     reset_io.clearStats = 1u;
     reset_io.reserved[0] = 0u;
     reset_io.reserved[1] = 0u;
     if (!backend_->reset(reset_io, &err)) {
-        WOMIC_LOGW("RESET 失败：%s", err.c_str());
+        MICLINK_LOGW("RESET 失败：%s", err.c_str());
     }
     backend_->close();
     /*
@@ -509,7 +509,7 @@ void Injector::close()
      * （测试与 --dry-run 诊断会用到）；下一次 open() 会直接替换它。
      */
     opened_ = false;
-    WOMIC_LOGI("端点已停止并复位");
+    MICLINK_LOGI("端点已停止并复位");
 }
 
 uint32_t Injector::write_frames(const int16_t *pcm, uint32_t frames, Stats *stats)
@@ -531,10 +531,10 @@ uint32_t Injector::write_frames(const int16_t *pcm, uint32_t frames, Stats *stat
         uint32_t rc = backend_->write_pcm(pcm + static_cast<size_t>(total_written) *
                                                     static_cast<size_t>(frame_samples),
                                           chunk, 0u, &written, &err);
-        if (rc == WOMIC_OK) {
+        if (rc == MICLINK_OK) {
             if (written == 0u) {
                 /* 后端报告成功但没接纳：视为满，按退避处理。 */
-                rc = WOMIC_ERR_BUFFER_FULL;
+                rc = MICLINK_ERR_BUFFER_FULL;
             } else {
                 total_written += written;
                 if (stats != nullptr) {
@@ -544,7 +544,7 @@ uint32_t Injector::write_frames(const int16_t *pcm, uint32_t frames, Stats *stat
             }
         }
 
-        if (rc == WOMIC_ERR_BUFFER_FULL) {
+        if (rc == MICLINK_ERR_BUFFER_FULL) {
             if (stats != nullptr) {
                 stats->on_device_full();
             }
@@ -554,7 +554,7 @@ uint32_t Injector::write_frames(const int16_t *pcm, uint32_t frames, Stats *stat
                 if (stats != nullptr) {
                     stats->on_device_drop(frames - total_written);
                 }
-                WOMIC_LOGV("WRITE_PCM 连续 %d 次缓冲满，丢弃剩余 %u 帧", kMaxWriteAttempts,
+                MICLINK_LOGV("WRITE_PCM 连续 %d 次缓冲满，丢弃剩余 %u 帧", kMaxWriteAttempts,
                            frames - total_written);
                 break;
             }
@@ -564,8 +564,8 @@ uint32_t Injector::write_frames(const int16_t *pcm, uint32_t frames, Stats *stat
 
         /* 其余错误（NOT_READY / FORMAT_MISMATCH / INVALID_PARAM / NO_STREAM）：
            不是"等一会儿就好"，继续重试无意义，直接放弃本次并对严重者告警。 */
-        if (rc != WOMIC_ERR_NO_STREAM) {
-            WOMIC_LOGW("WRITE_PCM 失败：%s（%s）", womic_error_string(rc), err.c_str());
+        if (rc != MICLINK_ERR_NO_STREAM) {
+            MICLINK_LOGW("WRITE_PCM 失败：%s（%s）", miclink_error_string(rc), err.c_str());
         }
         if (stats != nullptr) {
             stats->on_device_drop(frames - total_written);
@@ -576,15 +576,15 @@ uint32_t Injector::write_frames(const int16_t *pcm, uint32_t frames, Stats *stat
     return total_written;
 }
 
-bool Injector::poll_status(Stats *stats, WOMIC_STATUS *out)
+bool Injector::poll_status(Stats *stats, MICLINK_STATUS *out)
 {
     if ((backend_ == nullptr) || !opened_) {
         return false;
     }
-    WOMIC_STATUS status {};
+    MICLINK_STATUS status {};
     std::string err;
     if (!backend_->get_status(&status, &err)) {
-        WOMIC_LOGW("GET_STATUS 失败：%s", err.c_str());
+        MICLINK_LOGW("GET_STATUS 失败：%s", err.c_str());
         return false;
     }
     if (out != nullptr) {
@@ -599,4 +599,4 @@ bool Injector::poll_status(Stats *stats, WOMIC_STATUS *out)
     return true;
 }
 
-}  // namespace womic
+}  // namespace miclink

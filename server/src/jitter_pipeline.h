@@ -1,24 +1,24 @@
 /*
- * jitter_pipeline.h -- 对 shared/core 的 womic_jitter 的服务端封装。
+ * jitter_pipeline.h -- 对 shared/core 的 miclink_jitter 的服务端封装。
  *
  * 职责：
- *   - 管理 jitter 所需的 storage（womic_jitter 本身不分配内存，storage 由调用方给）；
- *   - 把 womic_jb_put / womic_jb_get 的返回码翻译成可读的统计量
+ *   - 管理 jitter 所需的 storage（miclink_jitter 本身不分配内存，storage 由调用方给）；
+ *   - 把 miclink_jb_put / miclink_jb_get 的返回码翻译成可读的统计量
  *     （重复、迟到、驱逐、PLC 占位、重缓冲次数）；
  *   - 支持运行期按"每包实际采样率/帧长"重建配置（手机换机、切采样率时）。
  *
  * 播放时钟由调用方传入的 now_ms 驱动（单调毫秒），本模块不自己取时间。
  */
-#ifndef WOMIC_SERVER_JITTER_PIPELINE_H
-#define WOMIC_SERVER_JITTER_PIPELINE_H
+#ifndef MICLINK_SERVER_JITTER_PIPELINE_H
+#define MICLINK_SERVER_JITTER_PIPELINE_H
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
-#include "womic/womic_jitter.h"
+#include "miclink/miclink_jitter.h"
 
-namespace womic {
+namespace miclink {
 
 struct JitterCounters {
     uint64_t inserted = 0;   /* 正常入队帧数 */
@@ -30,7 +30,7 @@ struct JitterCounters {
     uint32_t stalls = 0;     /* 起播后重新缓冲的事件次数 */
 };
 
-/** put() 的返回语义（与 womic_jb_put 一致，另加参数错误）。 */
+/** put() 的返回语义（与 miclink_jb_put 一致，另加参数错误）。 */
 enum class JitterPushResult : int {
     kAccepted = 0,
     kDuplicate = 1,
@@ -39,7 +39,7 @@ enum class JitterPushResult : int {
     kTooLarge = -2,
 };
 
-/** get() 的返回语义（与 womic_jb_get 一致）。 */
+/** get() 的返回语义（与 miclink_jb_get 一致）。 */
 enum class JitterPullResult : int {
     kProduced = 1,
     kNotReady = 0,
@@ -109,7 +109,7 @@ public:
     void reset();
 
 private:
-    womic_jitter jb_ {};
+    miclink_jitter jb_ {};
     std::vector<uint8_t> storage_;
     bool ready_ = false;
     uint32_t sample_rate_ = 0u;
@@ -118,6 +118,6 @@ private:
     uint32_t samples_per_frame_ = 0u;
 };
 
-}  // namespace womic
+}  // namespace miclink
 
-#endif  /* WOMIC_SERVER_JITTER_PIPELINE_H */
+#endif  /* MICLINK_SERVER_JITTER_PIPELINE_H */

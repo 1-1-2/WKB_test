@@ -18,7 +18,7 @@
 #include <unistd.h>
 #endif
 
-namespace womic {
+namespace miclink {
 
 #ifdef _WIN32
 
@@ -235,4 +235,4 @@ void set_current_thread_name(const char *name)
 
 #endif
 
-}  // namespace womic
+}  // namespace miclink

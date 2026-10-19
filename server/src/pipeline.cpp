@@ -8,11 +8,11 @@
 #include <cstring>
 
 #include "log.h"
-#include "womic/womic_protocol.h"
+#include "miclink/miclink_protocol.h"
 
-namespace womic {
+namespace miclink {
 
-static constexpr char kWomicLogModule[] = "pipe";
+static constexpr char kMicLinkLogModule[] = "pipe";
 
 namespace {
 /* 60ms @ 48kHz @ 2ch = 5760 样本，是本流水线能接受的单个最大帧。 */
@@ -38,10 +38,10 @@ bool AudioPipeline::init(const ServerConfig &cfg, std::string *err)
         return false;
     }
     if ((cfg.gain_db != 0.0f) && !decoder_.set_gain_db(cfg.gain_db, &decoder_err)) {
-        WOMIC_LOGW("设置 Opus 解码增益失败（改用 womic_apply_gain 兜底）：%s",
+        MICLINK_LOGW("设置 Opus 解码增益失败（改用 miclink_apply_gain 兜底）：%s",
                    decoder_err.c_str());
     }
-    /* 输出侧增益统一由 womic_apply_gain 施加（带饱和 clamp），
+    /* 输出侧增益统一由 miclink_apply_gain 施加（带饱和 clamp），
        Opus 侧的 SET_GAIN 只作为额外调节手段，两者互不冲突。 */
     linear_gain_ = std::pow(10.0f, cfg.gain_db / 20.0f);
 
@@ -79,7 +79,7 @@ bool AudioPipeline::init(const ServerConfig &cfg, std::string *err)
         }
         return false;
     }
-    WOMIC_LOGI("重采样：%u Hz -> %u Hz，后端 %s", capture_rate_, endpoint_rate_,
+    MICLINK_LOGI("重采样：%u Hz -> %u Hz，后端 %s", capture_rate_, endpoint_rate_,
                resampler_.backend_name());
 
     const uint32_t frame_bytes = endpoint_channels_ * (cfg.endpoint_bits_per_sample / 8u);
@@ -94,7 +94,7 @@ bool AudioPipeline::init(const ServerConfig &cfg, std::string *err)
     decode_buf_.assign(kMaxFrameSamples, 0);
     out_buf_.assign(kMaxFrameSamples, 0);
 
-    womic_declck_init(&declck_, WOMIC_DECLCK_DEFAULT_FADE);
+    miclink_declck_init(&declck_, MICLINK_DECLCK_DEFAULT_FADE);
 
     ready_ = true;
     return true;
@@ -108,7 +108,7 @@ bool AudioPipeline::ensure_capture_format(uint32_t rate, uint32_t channels, uint
         return true;
     }
 
-    WOMIC_LOGI("采集格式切换：%u Hz/%u ch/%u ms -> %u Hz/%u ch/%u ms（重建解码器与抖动缓冲）",
+    MICLINK_LOGI("采集格式切换：%u Hz/%u ch/%u ms -> %u Hz/%u ch/%u ms（重建解码器与抖动缓冲）",
                capture_rate_, capture_channels_, capture_frame_ms_, rate, channels, frame_ms);
 
     capture_rate_ = rate;
@@ -125,7 +125,7 @@ bool AudioPipeline::ensure_capture_format(uint32_t rate, uint32_t channels, uint
     if (cfg_.gain_db != 0.0f) {
         std::string gain_err;
         if (!decoder_.set_gain_db(cfg_.gain_db, &gain_err)) {
-            WOMIC_LOGW("重建解码器后设置增益失败：%s", gain_err.c_str());
+            MICLINK_LOGW("重建解码器后设置增益失败：%s", gain_err.c_str());
         }
     }
 
@@ -154,7 +154,7 @@ bool AudioPipeline::ensure_capture_format(uint32_t rate, uint32_t channels, uint
         }
         return false;
     }
-    WOMIC_LOGI("重采样已重建：%u Hz -> %u Hz，后端 %s", rate, endpoint_rate_,
+    MICLINK_LOGI("重采样已重建：%u Hz -> %u Hz，后端 %s", rate, endpoint_rate_,
                resampler_.backend_name());
     return true;
 }
@@ -166,12 +166,12 @@ AudioPipeline::FeedResult AudioPipeline::feed(const uint8_t *buf, size_t len, ui
         return FeedResult::kInvalidPacket;
     }
 
-    womic_packet_header header {};
+    miclink_packet_header header {};
     const uint8_t *payload = nullptr;
-    int consumed = womic_packet_decode(buf, len, &header, &payload);
+    int consumed = miclink_packet_decode(buf, len, &header, &payload);
     if (consumed < 0) {
         stats.on_packet_invalid();
-        WOMIC_LOGV("协议头校验失败（%d），丢弃 %zu 字节", consumed, len);
+        MICLINK_LOGV("协议头校验失败（%d），丢弃 %zu 字节", consumed, len);
         return FeedResult::kInvalidPacket;
     }
 
@@ -182,7 +182,7 @@ AudioPipeline::FeedResult AudioPipeline::feed(const uint8_t *buf, size_t len, ui
     }
     if (!OpusDecoderWrapper::is_valid_frame_size(header.sample_rate, header.frames_per_packet)) {
         stats.on_packet_invalid();
-        WOMIC_LOGV("非法 Opus 帧长 %u（采样率 %u），丢弃 seq=%u", header.frames_per_packet,
+        MICLINK_LOGV("非法 Opus 帧长 %u（采样率 %u），丢弃 seq=%u", header.frames_per_packet,
                    header.sample_rate, header.seq);
         return FeedResult::kInvalidPacket;
     }
@@ -219,7 +219,7 @@ AudioPipeline::FeedResult AudioPipeline::feed(const uint8_t *buf, size_t len, ui
 
     std::string err;
     if (!ensure_capture_format(header.sample_rate, header.channels, frame_ms, &err)) {
-        WOMIC_LOGW("采集格式切换失败：%s", err.c_str());
+        MICLINK_LOGW("采集格式切换失败：%s", err.c_str());
         stats.on_packet_invalid();
         return FeedResult::kInvalidPacket;
     }
@@ -235,7 +235,7 @@ AudioPipeline::FeedResult AudioPipeline::feed(const uint8_t *buf, size_t len, ui
     }
 
     /*
-     * ---- 带内 FEC（WOMIC_FLAG_FEC）--------------------------------------
+     * ---- 带内 FEC（MICLINK_FLAG_FEC）--------------------------------------
      * 协议约定：带 FEC 标志的包是"它所标注 seq 那一帧"的**冗余副本**。发送端
      * 必须复用被保护帧的 seq、且不占用新序号（见 android/.../MicCaptureService.kt）。
      *
@@ -252,12 +252,12 @@ AudioPipeline::FeedResult AudioPipeline::feed(const uint8_t *buf, size_t len, ui
      * bug），服务端在协议层面无法把它与"真实的新帧"区分开，只能照单全收；
      * 那一部分膨胀只能由发送端修复消除（见 tests/test_pipeline.cpp 场景 F）。
      */
-    if ((header.flags & WOMIC_FLAG_FEC) != 0u) {
+    if ((header.flags & MICLINK_FLAG_FEC) != 0u) {
         if (!jitter_.is_seq_missing(header.seq)) {
-            WOMIC_LOGV("FEC 冗余包 seq=%u 无缺口可补，拒收（不解码、不入队）", header.seq);
+            MICLINK_LOGV("FEC 冗余包 seq=%u 无缺口可补，拒收（不解码、不入队）", header.seq);
             return FeedResult::kNotAccepted;
         }
-        WOMIC_LOGV("FEC 冗余包 seq=%u 用于补洞", header.seq);
+        MICLINK_LOGV("FEC 冗余包 seq=%u 用于补洞", header.seq);
     }
 
     int decoded = 0;
@@ -337,7 +337,7 @@ ProducedFrame AudioPipeline::produce(uint32_t now_ms, Stats &stats)
         stats.on_jitter_missing();
         /* 通知去咔哒：接下来要做淡入，避免从上一帧末尾直接跳变。 */
         if (cfg_.declick) {
-            womic_declck_notify_loss(&declck_);
+            miclink_declck_notify_loss(&declck_);
         }
     }
 
@@ -346,7 +346,7 @@ ProducedFrame AudioPipeline::produce(uint32_t now_ms, Stats &stats)
     int out_frames = resampler_.process(decode_buf_.data(), samples_per_frame, out_buf_.data(),
                                         out_capacity);
     if (out_frames < 0) {
-        WOMIC_LOGW("重采样失败(%d)，本帧丢弃", out_frames);
+        MICLINK_LOGW("重采样失败(%d)，本帧丢弃", out_frames);
         stats.on_ring_drop(1u);
         return result;
     }
@@ -357,7 +357,7 @@ ProducedFrame AudioPipeline::produce(uint32_t now_ms, Stats &stats)
          * 重采样器内部，样本总数严格守恒（见 resampler 的 flush()）。
          * 因此这里既不计数丢帧，也不告警。
          */
-        WOMIC_LOGV("重采样器本轮未产出（内部滤波仍在填充，样本未丢失）");
+        MICLINK_LOGV("重采样器本轮未产出（内部滤波仍在填充，样本未丢失）");
         return result;
     }
     const uint32_t produced = static_cast<uint32_t>(out_frames);
@@ -365,14 +365,14 @@ ProducedFrame AudioPipeline::produce(uint32_t now_ms, Stats &stats)
 
     /* ---- DSP：去咔哒 -> 增益（带饱和）-> 电平测量 ---- */
     if (cfg_.declick) {
-        womic_apply_declck(&declck_, out_buf_.data(), produced_samples);
+        miclink_apply_declck(&declck_, out_buf_.data(), produced_samples);
     }
     if (cfg_.gain_db != 0.0f) {
-        womic_apply_gain(out_buf_.data(), produced_samples, linear_gain_);
+        miclink_apply_gain(out_buf_.data(), produced_samples, linear_gain_);
     }
     float rms = 0.0f;
     float peak = 0.0f;
-    womic_measure_level(out_buf_.data(), produced_samples, &rms, &peak);
+    miclink_measure_level(out_buf_.data(), produced_samples, &rms, &peak);
     stats.set_level(rms, peak);
 
     const uint32_t written = ring_.write(out_buf_.data(), produced);
@@ -416,7 +416,7 @@ void AudioPipeline::flush_resampler(Stats &stats)
         stats.on_ring_drop(produced - written);
     }
     stats.on_frame_produced(written);
-    WOMIC_LOGI("重采样器收尾：挤出 %u 帧写入 %u 帧", produced, written);
+    MICLINK_LOGI("重采样器收尾：挤出 %u 帧写入 %u 帧", produced, written);
 }
 
 uint32_t AudioPipeline::ring_available() const
@@ -429,4 +429,4 @@ uint32_t AudioPipeline::ring_free() const
     return ready_ ? ring_.free_frames() : 0u;
 }
 
-}  // namespace womic
+}  // namespace miclink

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    安装 Womic 虚拟麦克风驱动（测试签名 / 生产签名两种模式）。
+    安装 MicLink 虚拟麦克风驱动（测试签名 / 生产签名两种模式）。
 
 .DESCRIPTION
     TestSign（默认）   : 本机开发自测。会检查并提示开启 bcdedit /set testsigning on
@@ -14,7 +14,7 @@
     TestSign（默认）或 Production。
 
 .PARAMETER InfPath
-    驱动 INF 路径。默认在仓库常见输出目录下搜索 WomicVirtualMic.inf。
+    驱动 INF 路径。默认在仓库常见输出目录下搜索 MicLinkVirtualMic.inf。
 
 .PARAMETER Force
     跳过交互确认，并在需要时直接执行 bcdedit /set testsigning on。
@@ -35,7 +35,7 @@
     powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Mode TestSign -Force
 
 .EXAMPLE
-    powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Mode Production -InfPath C:\build\WomicVirtualMic.inf
+    powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Mode Production -InfPath C:\build\MicLinkVirtualMic.inf
 
 .NOTES
     必须以管理员权限运行。测试签名驱动**仅限本机开发自测**，不得分发给普通用户。
@@ -70,8 +70,8 @@ Set-StrictMode -Version Latest
 # ---------------------------------------------------------------------------
 # 常量与工具函数（脚本作用域，避免嵌套作用域取不到值）
 # ---------------------------------------------------------------------------
-$script:DriverFriendlyName = 'Womic Virtual Microphone'
-$script:DriverServiceName = 'WomicVirtualMic'
+$script:DriverFriendlyName = 'MicLink Virtual Microphone'
+$script:DriverServiceName = 'MicLinkVirtualMic'
 $script:IsInteractive = [Environment]::UserInteractive -and -not ([Console]::IsInputRedirected)
 
 function Write-Banner {
@@ -141,7 +141,7 @@ function Get-TestSigningState {
     return [PSCustomObject]@{ Enabled = $enabled; Raw = $raw }
 }
 
-function Resolve-WomicInf {
+function Resolve-MicLinkInf {
     param([string]$ExplicitPath)
 
     if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
@@ -153,11 +153,11 @@ function Resolve-WomicInf {
 
     $repoRoot = Split-Path -Parent $PSScriptRoot
     $candidates = @(
-        (Join-Path $repoRoot 'driver\x64\Debug\WomicVirtualMic.inf'),
-        (Join-Path $repoRoot 'driver\x64\Release\WomicVirtualMic.inf'),
-        (Join-Path $repoRoot 'driver\Source\Main\x64\Debug\WomicVirtualMic.inf'),
-        (Join-Path $repoRoot 'driver\build\WomicVirtualMic.inf'),
-        (Join-Path $repoRoot 'build\driver\WomicVirtualMic.inf')
+        (Join-Path $repoRoot 'driver\x64\Debug\MicLinkVirtualMic.inf'),
+        (Join-Path $repoRoot 'driver\x64\Release\MicLinkVirtualMic.inf'),
+        (Join-Path $repoRoot 'driver\Source\Main\x64\Debug\MicLinkVirtualMic.inf'),
+        (Join-Path $repoRoot 'driver\build\MicLinkVirtualMic.inf'),
+        (Join-Path $repoRoot 'build\driver\MicLinkVirtualMic.inf')
     )
     foreach ($c in $candidates) {
         if (Test-Path -LiteralPath $c -PathType Leaf) {
@@ -166,16 +166,16 @@ function Resolve-WomicInf {
     }
 
     # 兜底：全仓库搜索
-    $found = Get-ChildItem -Path $repoRoot -Filter 'WomicVirtualMic.inf' -Recurse -File -ErrorAction SilentlyContinue |
+    $found = Get-ChildItem -Path $repoRoot -Filter 'MicLinkVirtualMic.inf' -Recurse -File -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if ($null -ne $found) {
         return $found.FullName
     }
     throw @"
-未找到 WomicVirtualMic.inf。
+未找到 MicLinkVirtualMic.inf。
 请先用 Visual Studio + WDK 编译驱动（见 docs/BUILD.md），再用 -InfPath 显式指定，例如：
 
-  powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Mode TestSign -InfPath C:\path\to\WomicVirtualMic.inf
+  powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Mode TestSign -InfPath C:\path\to\MicLinkVirtualMic.inf
 "@
 }
 
@@ -183,8 +183,8 @@ function Get-DriverBinariesFromInf {
     param([string]$InfFullPath)
 
     $infDir = Split-Path -Parent $InfFullPath
-    $sys = Join-Path $infDir 'womicvirtualmic.sys'
-    $cat = Join-Path $infDir 'WomicVirtualMic.cat'
+    $sys = Join-Path $infDir 'miclinkvirtualmic.sys'
+    $cat = Join-Path $infDir 'MicLinkVirtualMic.cat'
     return [PSCustomObject]@{
         Inf      = $InfFullPath
         Sys      = $sys
@@ -258,7 +258,7 @@ Write-Ok '管理员权限 OK'
 # ---------------------------------------------------------------------------
 Write-Step '定位驱动 INF…'
 try {
-    $inf = Resolve-WomicInf -ExplicitPath $InfPath
+    $inf = Resolve-MicLinkInf -ExplicitPath $InfPath
 } catch {
     Write-Fail $_.Exception.Message
     exit 3
@@ -322,7 +322,7 @@ if ($Mode -eq 'TestSign') {
             Write-Warn2 'cat 未签名或签名无效：测试模式下仍可安装（前提是已开启 testsigning），生产模式会被拒绝。'
         }
     } else {
-        Write-Warn2 '未找到 WomicVirtualMic.cat：测试模式下可安装，生产模式必须提供已签名的 cat。'
+        Write-Warn2 '未找到 MicLinkVirtualMic.cat：测试模式下可安装，生产模式必须提供已签名的 cat。'
         Write-Host '         可用 tools\make-test-cert.ps1 生成测试证书并签名。' -ForegroundColor Gray
     }
 } else {
@@ -335,14 +335,14 @@ if ($Mode -eq 'TestSign') {
     if ($bin.SysFound) {
         $sysSig = Get-SignatureReport -Path $bin.Sys
         Write-Host "       sys 签名：$($sysSig.Status) / 链验证=$($sysSig.ChainOk) / $($sysSig.Signer)" -ForegroundColor Gray
-        if ($sysSig.Status -ne 'Valid') { $problems.Add("womicvirtualmic.sys 签名无效（$($sysSig.Status)）") }
-        if (-not $sysSig.ChainOk) { $problems.Add('womicvirtualmic.sys 签名链无法验证到受信任根（测试证书不被接受）') }
+        if ($sysSig.Status -ne 'Valid') { $problems.Add("miclinkvirtualmic.sys 签名无效（$($sysSig.Status)）") }
+        if (-not $sysSig.ChainOk) { $problems.Add('miclinkvirtualmic.sys 签名链无法验证到受信任根（测试证书不被接受）') }
     }
     if ($bin.CatFound) {
         $catSig = Get-SignatureReport -Path $bin.Cat
         Write-Host "       cat 签名：$($catSig.Status) / 链验证=$($catSig.ChainOk) / $($catSig.Signer)" -ForegroundColor Gray
-        if ($catSig.Status -ne 'Valid') { $problems.Add("WomicVirtualMic.cat 签名无效（$($catSig.Status)）") }
-        if (-not $catSig.ChainOk) { $problems.Add('WomicVirtualMic.cat 签名链无法验证到受信任根（测试证书不被接受）') }
+        if ($catSig.Status -ne 'Valid') { $problems.Add("MicLinkVirtualMic.cat 签名无效（$($catSig.Status)）") }
+        if (-not $catSig.ChainOk) { $problems.Add('MicLinkVirtualMic.cat 签名链无法验证到受信任根（测试证书不被接受）') }
     }
 
     if ($problems.Count -gt 0) {
@@ -408,7 +408,7 @@ if ($NoWait) {
         Start-Sleep -Seconds 2
         $device = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
                 ($_.FriendlyName -like "*$script:DriverFriendlyName*") -or
-                ($_.InstanceId -like '*WomicVirtualMic*')
+                ($_.InstanceId -like '*MicLinkVirtualMic*')
             })
         if ($device.Count -gt 0) { break }
     } while ((Get-Date) -lt $deadline)

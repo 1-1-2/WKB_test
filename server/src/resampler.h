@@ -4,7 +4,7 @@
  * 【红线说明（务必读完再改）】
  * 本项目严禁内核驱动做任何重采样：驱动端点一旦 SET_FORMAT 成功，之后所有
  * WRITE_PCM 必须是该采样率/声道/位深的原始 PCM，驱动绝不转换（见
- * shared/core/include/womic/womic_ioctl.h 中 WOMIC_ERR_FORMAT_MISMATCH 的语义）。
+ * shared/core/include/miclink/miclink_ioctl.h 中 MICLINK_ERR_FORMAT_MISMATCH 的语义）。
  *
  * 因此当"手机侧 Opus 采集率" != "驱动端点采样率"时（典型：手机 16k，端点 48k），
  * 转换责任 100% 落在用户态服务端，且只在本文件里发生：
@@ -21,14 +21,14 @@
  *
  * 采样率相同时直接走 memcpy 旁路，零开销、零音质损失。
  */
-#ifndef WOMIC_SERVER_RESAMPLER_H
-#define WOMIC_SERVER_RESAMPLER_H
+#ifndef MICLINK_SERVER_RESAMPLER_H
+#define MICLINK_SERVER_RESAMPLER_H
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
-namespace womic {
+namespace miclink {
 
 class Resampler {
 public:
@@ -104,6 +104,6 @@ private:
     bool flushed_ = false;
 };
 
-}  // namespace womic
+}  // namespace miclink
 
-#endif  /* WOMIC_SERVER_RESAMPLER_H */
+#endif  /* MICLINK_SERVER_RESAMPLER_H */

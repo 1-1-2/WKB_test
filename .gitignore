@@ -52,6 +52,11 @@ obj/
 *.tmh
 *.tracedata
 
+# ---- NuGet / WDK ----
+# driver/packages.config 是清单文件（入库），driver/packages/ 是还原产物
+# （WDK x64 包单个 ~115MB，CI 每次还原，绝不入库）。
+packages/
+
 # ---- Python / 工具 ----
 __pycache__/
 *.pyc

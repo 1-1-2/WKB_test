@@ -8,8 +8,8 @@
  *   - 停止用 atomic<bool> 令牌 + join()，不用 TerminateThread / pthread_cancel
  *     （后者可能在持有锁或内核句柄时把线程杀掉，驱动句柄会泄漏）。
  */
-#ifndef WOMIC_SERVER_THREADS_H
-#define WOMIC_SERVER_THREADS_H
+#ifndef MICLINK_SERVER_THREADS_H
+#define MICLINK_SERVER_THREADS_H
 
 #include <atomic>
 #include <functional>
@@ -18,7 +18,7 @@
 
 #include "threads_sync.h"
 
-namespace womic {
+namespace miclink {
 
 class Thread {
 public:
@@ -65,6 +65,6 @@ private:
     std::thread th_;
 };
 
-}  // namespace womic
+}  // namespace miclink
 
-#endif  /* WOMIC_SERVER_THREADS_H */
+#endif  /* MICLINK_SERVER_THREADS_H */

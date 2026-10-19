@@ -49,7 +49,7 @@ shutdown /r /t 0
 * ❌ **不能**把测试签名的驱动包分发给普通用户。后果：用户机器上加载失败（设备管理器代码 52），
   或者诱导用户去执行 `bcdedit /set testsigning on` 并关闭 Secure Boot——
   **这等于让用户为装一个麦克风而关闭系统安全保护，在合规与安全上都不可接受。**
-* ❌ **不能**把 `tools\_out\WomicTestSigning.pfx`（及口令）带到其它机器或提交到仓库。
+* ❌ **不能**把 `tools\_out\MicLinkTestSigning.pfx`（及口令）带到其它机器或提交到仓库。
   它让“信任它的机器”信任“任何用它签的东西”。
 * ❌ **不能**在文档、README、安装脚本或任何对用户的表述里暗示“测试签名可以正常分发”。
   本仓库的 `tools/install.ps1` 在 TestSign 模式下会**主动打印**这条警示。
@@ -62,7 +62,7 @@ bcdedit /set testsigning off
 shutdown /r /t 0
 
 # 删除本机上的测试证书（证书管理器 certlm.msc）
-#   受信任的根证书颁发机构 / 受信任的发布者 → 找到 "Womic Open Test Signing" → 删除
+#   受信任的根证书颁发机构 / 受信任的发布者 → 找到 "MicLink Open Test Signing" → 删除
 ```
 
 ---
@@ -90,9 +90,9 @@ shutdown /r /t 0
 2) 注册 Microsoft Partner Center（Hardware 计划）
      └─ 需要 EV 证书 + 组织验证（也是数年费，具体以当时官方报价为准）
 3) 准备驱动提交包（.cab）
-     ├─ WomicVirtualMic.inf
-     ├─ womicvirtualmic.sys
-     ├─ WomicVirtualMic.cat（用 EV 证书先签好）
+     ├─ MicLinkVirtualMic.inf
+     ├─ miclinkvirtualmic.sys
+     ├─ MicLinkVirtualMic.cat（用 EV 证书先签好）
      └─ 符号文件（可选但建议）
 4) 提交到 Partner Center
      ├─ Attestation：勾选 attestation signing，上传，等待微软扫描与签名

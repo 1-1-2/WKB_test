@@ -8,9 +8,9 @@
 
 #include "log.h"
 
-namespace womic {
+namespace miclink {
 
-static constexpr char kWomicLogModule[] = "opus";
+static constexpr char kMicLinkLogModule[] = "opus";
 
 OpusDecoderWrapper::~OpusDecoderWrapper()
 {
@@ -82,7 +82,7 @@ int OpusDecoderWrapper::decode(const uint8_t *payload, int payload_bytes, int16_
 
     int n = opus_decode(dec_, payload, payload_bytes, pcm, frame_size, 0);
     if (n < 0) {
-        WOMIC_LOGW("opus_decode 失败(%d): %s，改用 PLC 补齐", n, error_string(n).c_str());
+        MICLINK_LOGW("opus_decode 失败(%d): %s，改用 PLC 补齐", n, error_string(n).c_str());
         return decode_plc(pcm, frame_size);
     }
     return n;
@@ -103,7 +103,7 @@ int OpusDecoderWrapper::decode_plc(int16_t *pcm, int frame_size)
      */
     int n = opus_decode(dec_, nullptr, 0, pcm, frame_size, 0);
     if (n < 0) {
-        WOMIC_LOGW("opus_decode(PLC) 失败(%d): %s，退化为静音", n, error_string(n).c_str());
+        MICLINK_LOGW("opus_decode(PLC) 失败(%d): %s，退化为静音", n, error_string(n).c_str());
         for (int i = 0; i < frame_size * static_cast<int>(channels_); ++i) {
             pcm[i] = 0;
         }
@@ -184,4 +184,4 @@ std::string OpusDecoderWrapper::error_string(int code)
     return std::string(buf);
 }
 
-}  // namespace womic
+}  // namespace miclink

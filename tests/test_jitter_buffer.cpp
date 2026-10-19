@@ -14,7 +14,7 @@
  *   4) 无长卡顿：产出帧数接近理论值，重新缓冲(stall)次数很少
  *   5) 丢包率与注入的丢包率一致（允许少量启动瞬态与迟到丢弃）
  */
-#include <womic/womic_jitter.h>
+#include <miclink/miclink_jitter.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -56,7 +56,7 @@ SimResult run_sim(uint32_t jitter_ms, uint32_t loss_pct, uint32_t reorder_mode,
     const uint32_t kTotal = kMain + kQuiet;
     const uint32_t spf = sample_rate * frame_ms / 1000u; /* channels = 1 */
 
-    womic_jb_config cfg;
+    miclink_jb_config cfg;
     cfg.target_delay_ms = 50u;
     cfg.min_delay_ms = 50u;
     cfg.max_delay_ms = 100u;
@@ -65,18 +65,18 @@ SimResult run_sim(uint32_t jitter_ms, uint32_t loss_pct, uint32_t reorder_mode,
     cfg.sample_rate = sample_rate;
     cfg.channels = 1u;
 
-    const size_t need = womic_jb_storage_bytes(&cfg);
-    WOMIC_CHECK(need > 0u);
+    const size_t need = miclink_jb_storage_bytes(&cfg);
+    MICLINK_CHECK(need > 0u);
     std::vector<uint8_t> storage(need, 0u);
-    womic_jitter jb;
-    const int rc = womic_jb_init(&jb, &cfg, storage.data(), need);
-    WOMIC_CHECK_EQ(rc, 0);
-    WOMIC_CHECK_EQ(jb.samples_per_frame, spf);
+    miclink_jitter jb;
+    const int rc = miclink_jb_init(&jb, &cfg, storage.data(), need);
+    MICLINK_CHECK_EQ(rc, 0);
+    MICLINK_CHECK_EQ(jb.samples_per_frame, spf);
 
     /* ---- 生成到达计划 ---- */
     std::vector<uint8_t> sent(kTotal, 0u);
     std::vector<uint32_t> arrival(kTotal, 0u);
-    womic_test::Rng rng(seed);
+    miclink_test::Rng rng(seed);
 
     for (uint32_t i = 0u; i < kTotal; ++i) {
         const bool quiet = (i >= kMain);
@@ -149,16 +149,16 @@ SimResult run_sim(uint32_t jitter_ms, uint32_t loss_pct, uint32_t reorder_mode,
             for (uint32_t k = 0u; k < spf; ++k) {
                 src[k] = v; /* 用 seq 填充整帧，便于校验输出连续性 */
             }
-            const int prc = womic_jb_put(&jb, seq, src.data(), spf, now);
-            WOMIC_CHECK(prc == 0 || prc == 1 || prc == 2);
+            const int prc = miclink_jb_put(&jb, seq, src.data(), spf, now);
+            MICLINK_CHECK(prc == 0 || prc == 1 || prc == 2);
             ++ei;
         }
 
         /* 播放时钟：只要到点就取一帧 */
         for (;;) {
             int missing_flag = 0;
-            const int grc = womic_jb_get(&jb, out.data(), spf, &missing_flag, now);
-            WOMIC_CHECK(grc == 0 || grc == 1);
+            const int grc = miclink_jb_get(&jb, out.data(), spf, &missing_flag, now);
+            MICLINK_CHECK(grc == 0 || grc == 1);
             if (grc != 1) {
                 break;
             }
@@ -180,16 +180,16 @@ SimResult run_sim(uint32_t jitter_ms, uint32_t loss_pct, uint32_t reorder_mode,
 
         /* 稳态统计取主阶段后半段 */
         if ((now >= main_end_ms / 2u) && (now < main_end_ms)) {
-            target_sum += static_cast<double>(womic_jb_target_delay_ms(&jb));
-            depth_sum += static_cast<double>(womic_jb_depth_ms(&jb));
+            target_sum += static_cast<double>(miclink_jb_target_delay_ms(&jb));
+            depth_sum += static_cast<double>(miclink_jb_depth_ms(&jb));
             ++sample_n;
         }
     }
 
-    WOMIC_CHECK(sample_n > 0u);
+    MICLINK_CHECK(sample_n > 0u);
     res.steady_target_ms = target_sum / static_cast<double>(sample_n);
     res.steady_depth_ms = depth_sum / static_cast<double>(sample_n);
-    res.final_target_ms = womic_jb_target_delay_ms(&jb);
+    res.final_target_ms = miclink_jb_target_delay_ms(&jb);
     res.stalls = jb.stall_count;
     res.duplicates = static_cast<uint32_t>(jb.frames_duplicate);
     res.late = static_cast<uint32_t>(jb.frames_late);
@@ -238,39 +238,39 @@ void run_matrix()
 
 void assert_all()
 {
-    WOMIC_CHECK_EQ(g_results.size(), 36u); /* >= 12 组 */
+    MICLINK_CHECK_EQ(g_results.size(), 36u); /* >= 12 组 */
 
     for (const SimResult &r : g_results) {
         /* 1) 稳态目标延迟必须在 [50, 100] ms */
-        WOMIC_CHECK(r.steady_target_ms >= 49.5);
-        WOMIC_CHECK(r.steady_target_ms <= 100.5);
+        MICLINK_CHECK(r.steady_target_ms >= 49.5);
+        MICLINK_CHECK(r.steady_target_ms <= 100.5);
 
         /* 2) 抖动消失后必须回落：硬要求 <= 120 ms；
               实际上应当回落到 min(50) 附近（允许 2 帧的残差） */
-        WOMIC_CHECK(r.final_target_ms <= 120u);
-        WOMIC_CHECK(r.final_target_ms <= 50u + 2u * r.frame_ms);
+        MICLINK_CHECK(r.final_target_ms <= 120u);
+        MICLINK_CHECK(r.final_target_ms <= 50u + 2u * r.frame_ms);
 
         /* 3) 输出连续性：不允许出现未发送 / 乱序 / 重复的帧 */
-        WOMIC_CHECK_EQ(r.continuity_errors, 0u);
+        MICLINK_CHECK_EQ(r.continuity_errors, 0u);
 
         /* 4) 无长卡顿：产出帧数应接近理论值（4500 帧减去起播缓冲） */
         const uint32_t theoretical = 3000u + 1500u;
-        WOMIC_CHECK(r.emitted + 30u >= theoretical - (100u / r.frame_ms));
-        WOMIC_CHECK(r.stalls <= 40u);
+        MICLINK_CHECK(r.emitted + 30u >= theoretical - (100u / r.frame_ms));
+        MICLINK_CHECK(r.stalls <= 40u);
 
         /* 5) 占位帧数量应与注入丢包率吻合（允许启动瞬态与迟到丢弃的少量偏差） */
         const double injected = 0.01 * static_cast<double>(r.loss_pct) * 3000.0;
         const double tolerance = injected * 0.5 + 40.0;
-        WOMIC_CHECK(static_cast<double>(r.missing) <= injected + tolerance);
+        MICLINK_CHECK(static_cast<double>(r.missing) <= injected + tolerance);
         if (r.loss_pct == 0u) {
-            WOMIC_CHECK(r.missing <= 40u);
+            MICLINK_CHECK(r.missing <= 40u);
         }
     }
 }
 
 }  // namespace
 
-WOMIC_TEST_MAIN(test_jitter_buffer, ({
+MICLINK_TEST_MAIN(test_jitter_buffer, ({
     std::printf("  自适应抖动缓冲场景矩阵（%d 组）:\n", 36);
     run_matrix();
     assert_all();

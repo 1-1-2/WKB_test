@@ -31,6 +31,10 @@ The following table shows the contents of the various subdirectories of this sam
 
 ## Build the sample
 
+> miclink-open modification: 本仓库的驱动构建采用 NuGet WDK 包模式（无需安装 WDK），
+> 命令与版本对应见 `docs/BUILD.md` 第 1.1 节与 `.github/workflows/build-driver.yml`。
+> 以下为微软上游示例原文，保留供对照。
+
 If you simply want to build this sample driver and don't intend to run or test it, then you do not need a target computer (also called a test computer). If, however, you would like to deploy, run and test this sample driver, then you need a second computer that will serve as your target computer. Instructions are provided in the **Run the sample** section to show you how to set up the target computer - also referred to as *provisioning* a target computer.
 
 Perform the following steps to build this sample driver.

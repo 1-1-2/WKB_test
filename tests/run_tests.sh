@@ -2,7 +2,7 @@
 #
 # run_tests.sh -- 一条命令完成 clean build + ctest。
 #
-#   cd /workspace/womic-open/tests && ./run_tests.sh
+#   cd /workspace/miclink-open/tests && ./run_tests.sh
 #
 # 可选参数：
 #   --jobs N      并行编译线程数（默认 nproc）

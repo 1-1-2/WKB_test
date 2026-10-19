@@ -62,10 +62,10 @@ PCPIN_DESCRIPTOR MicArray1TopoMiniportPins[] =
         KSPIN_DATAFLOW_IN,                            // DataFlow
         KSPIN_COMMUNICATION_NONE,                     // Communication
         //
-        // WOMIC：端点从"2 通道麦克风阵列"改为"16-bit 单声道麦克风"，
+        // MICLINK：端点从"2 通道麦克风阵列"改为"16-bit 单声道麦克风"，
         // 因此 category 从 KSNODETYPE_MICROPHONE_ARRAY 改为 KSNODETYPE_MICROPHONE。
         // 这会让 AudioEndpointBuilder 把它枚举成普通的 "Microphone" 形态因子
-        // （而不是阵列），与产品名 "Womic Virtual Microphone" 一致。
+        // （而不是阵列），与产品名 "MicLink Virtual Microphone" 一致。
         //
         &KSNODETYPE_MICROPHONE,                       // Category
         &MICARRAY1_CUSTOM_NAME,                       // Name

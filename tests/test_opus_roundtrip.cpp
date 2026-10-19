@@ -143,8 +143,8 @@ Case run_case(uint32_t sample_rate, uint32_t frame_ms, uint32_t bitrate_bps)
 
     int err = OPUS_OK;
     OpusEncoder *enc = opus_encoder_create((opus_int32)sample_rate, 1, OPUS_APPLICATION_AUDIO, &err);
-    WOMIC_CHECK_EQ(err, OPUS_OK);
-    WOMIC_CHECK(enc != nullptr);
+    MICLINK_CHECK_EQ(err, OPUS_OK);
+    MICLINK_CHECK(enc != nullptr);
 
     opus_int32 bitrate = (opus_int32)bitrate_bps;
     opus_int32 vbr = 0;      /* CBR：结果可复现 */
@@ -152,20 +152,20 @@ Case run_case(uint32_t sample_rate, uint32_t frame_ms, uint32_t bitrate_bps)
     opus_int32 complexity = 10;
     opus_int32 dtx = 0;
     opus_int32 fec = 0;
-    WOMIC_CHECK_EQ(opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrate)), OPUS_OK);
-    WOMIC_CHECK_EQ(opus_encoder_ctl(enc, OPUS_SET_VBR(vbr)), OPUS_OK);
-    WOMIC_CHECK_EQ(opus_encoder_ctl(enc, OPUS_SET_VBR_CONSTRAINT(cvbr)), OPUS_OK);
-    WOMIC_CHECK_EQ(opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(complexity)), OPUS_OK);
-    WOMIC_CHECK_EQ(opus_encoder_ctl(enc, OPUS_SET_DTX(dtx)), OPUS_OK);
-    WOMIC_CHECK_EQ(opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(fec)), OPUS_OK);
+    MICLINK_CHECK_EQ(opus_encoder_ctl(enc, OPUS_SET_BITRATE(bitrate)), OPUS_OK);
+    MICLINK_CHECK_EQ(opus_encoder_ctl(enc, OPUS_SET_VBR(vbr)), OPUS_OK);
+    MICLINK_CHECK_EQ(opus_encoder_ctl(enc, OPUS_SET_VBR_CONSTRAINT(cvbr)), OPUS_OK);
+    MICLINK_CHECK_EQ(opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(complexity)), OPUS_OK);
+    MICLINK_CHECK_EQ(opus_encoder_ctl(enc, OPUS_SET_DTX(dtx)), OPUS_OK);
+    MICLINK_CHECK_EQ(opus_encoder_ctl(enc, OPUS_SET_INBAND_FEC(fec)), OPUS_OK);
 
     opus_int32 lookahead = 0;
-    WOMIC_CHECK_EQ(opus_encoder_ctl(enc, OPUS_GET_LOOKAHEAD(&lookahead)), OPUS_OK);
-    WOMIC_CHECK(lookahead >= 0);
+    MICLINK_CHECK_EQ(opus_encoder_ctl(enc, OPUS_GET_LOOKAHEAD(&lookahead)), OPUS_OK);
+    MICLINK_CHECK(lookahead >= 0);
 
     OpusDecoder *dec = opus_decoder_create((opus_int32)sample_rate, 1, &err);
-    WOMIC_CHECK_EQ(err, OPUS_OK);
-    WOMIC_CHECK(dec != nullptr);
+    MICLINK_CHECK_EQ(err, OPUS_OK);
+    MICLINK_CHECK(dec != nullptr);
 
     std::vector<unsigned char> payload(kMaxPayloadBytes, 0u);
     std::vector<int16_t> pcm((size_t)frame_size, 0);
@@ -176,12 +176,12 @@ Case run_case(uint32_t sample_rate, uint32_t frame_ms, uint32_t bitrate_bps)
     for (uint32_t f = 0; f < num_frames; ++f) {
         const int nb = opus_encode(enc, &in[(size_t)f * (size_t)frame_size], frame_size,
                                    payload.data(), (opus_int32)payload.size());
-        WOMIC_CHECK(nb > 0);
-        WOMIC_CHECK(nb <= kMaxPayloadBytes);
+        MICLINK_CHECK(nb > 0);
+        MICLINK_CHECK(nb <= kMaxPayloadBytes);
         total_payload_bytes += (uint32_t)nb;
 
         const int ns = opus_decode(dec, payload.data(), nb, pcm.data(), frame_size, 0);
-        WOMIC_CHECK_EQ(ns, frame_size); /* 样本数无错乱 */
+        MICLINK_CHECK_EQ(ns, frame_size); /* 样本数无错乱 */
         for (int i = 0; i < frame_size; ++i) {
             decoded.push_back(pcm[(size_t)i]);
         }
@@ -189,11 +189,11 @@ Case run_case(uint32_t sample_rate, uint32_t frame_ms, uint32_t bitrate_bps)
 
     /* PLC：丢包隐藏也必须产出 frame_size 个样本 */
     const int plc_ns = opus_decode(dec, nullptr, 0, pcm.data(), frame_size, 0);
-    WOMIC_CHECK_EQ(plc_ns, frame_size);
+    MICLINK_CHECK_EQ(plc_ns, frame_size);
 
     /* 样本数一致性 */
     c.decoded_samples = (uint32_t)decoded.size();
-    WOMIC_CHECK_EQ(c.decoded_samples, num_samples);
+    MICLINK_CHECK_EQ(c.decoded_samples, num_samples);
 
     /* 对齐搜索 + SNR */
     const int max_lag = lookahead + 800;
@@ -218,7 +218,7 @@ Case run_case(uint32_t sample_rate, uint32_t frame_ms, uint32_t bitrate_bps)
     /* 实际码率应接近目标（CBR 下误差 < 25%） */
     const double actual_kbps = (double)total_payload_bytes * 8.0 / kDurationSec / 1000.0;
     const double target_kbps = (double)bitrate_bps / 1000.0;
-    WOMIC_CHECK(std::fabs(actual_kbps - target_kbps) <= target_kbps * 0.25 + 2.0);
+    MICLINK_CHECK(std::fabs(actual_kbps - target_kbps) <= target_kbps * 0.25 + 2.0);
 
     opus_encoder_destroy(enc);
     opus_decoder_destroy(dec);
@@ -251,7 +251,7 @@ void run_matrix()
 
 void assert_all()
 {
-    WOMIC_CHECK_EQ(g_cases.size(), 16u);
+    MICLINK_CHECK_EQ(g_cases.size(), 16u);
 
     /* 1) 分级阈值 */
     for (const Case &c : g_cases) {
@@ -261,7 +261,7 @@ void assert_all()
                          "  [SNR 不足] %u Hz / %u ms / %u kbps: %.2f dB < 要求 %.1f dB\n",
                          c.sample_rate, c.frame_ms, c.bitrate_bps / 1000u, c.snr_db, need);
         }
-        WOMIC_CHECK(c.snr_db >= need);
+        MICLINK_CHECK(c.snr_db >= need);
     }
 
     /* 2) 至少有一个配置进入“波形保真区”（>= 25 dB），证明集成链路本身无失真 */
@@ -271,7 +271,7 @@ void assert_all()
             ++hi_fi;
         }
     }
-    WOMIC_CHECK(hi_fi >= 4);
+    MICLINK_CHECK(hi_fi >= 4);
 
     /* 3) 结构性断言：同一 (采样率, 帧长) 下，SNR 随码率单调不减 */
     for (uint32_t rate = 16000u; rate <= 48000u; rate += 32000u) {
@@ -279,7 +279,7 @@ void assert_all()
             double prev = -1e30;
             for (const Case &c : g_cases) {
                 if ((c.sample_rate == rate) && (c.frame_ms == fms)) {
-                    WOMIC_CHECK(c.snr_db >= prev - 0.5);
+                    MICLINK_CHECK(c.snr_db >= prev - 0.5);
                     prev = c.snr_db;
                 }
             }
@@ -299,7 +299,7 @@ void assert_all()
 
 }  // namespace
 
-WOMIC_TEST_MAIN(test_opus_roundtrip, ({
+MICLINK_TEST_MAIN(test_opus_roundtrip, ({
     std::printf("  libopus 版本: %s\n", opus_get_version_string());
     run_matrix();
     assert_all();

@@ -11,8 +11,8 @@
  *     优先级反转的可能（见 THREADS.md 说明）。本文件的锁只用于
  *     UdpReceiver 的端点快照、Discovery 这类低频路径。
  */
-#ifndef WOMIC_SERVER_THREADS_SYNC_H
-#define WOMIC_SERVER_THREADS_SYNC_H
+#ifndef MICLINK_SERVER_THREADS_SYNC_H
+#define MICLINK_SERVER_THREADS_SYNC_H
 
 #include <atomic>
 #include <chrono>
@@ -30,7 +30,7 @@
 
 #include <string>
 
-namespace womic {
+namespace miclink {
 
 /** 线程优先级枚举。映射到 Windows 的 THREAD_PRIORITY_* 或 Linux 的 SCHED_FIFO / nice。 */
 enum class ThreadPriority : int {
@@ -118,7 +118,7 @@ private:
 /**
  * @brief 单调毫秒时钟（jitter buffer 的播放时钟基准）。
  *
- * 单位毫秒、uint32_t 在 49 天后自然回绕，与 womic_jitter 的 uint32_t now_ms
+ * 单位毫秒、uint32_t 在 49 天后自然回绕，与 miclink_jitter 的 uint32_t now_ms
  * 约定一致（其差值运算对回绕安全）。
  */
 uint32_t steady_now_ms();
@@ -146,6 +146,6 @@ void set_current_thread_name(const char *name);
 /** 停止令牌：各线程循环用其 load() 判断是否退出。 */
 using StopFlag = std::atomic<bool>;
 
-}  // namespace womic
+}  // namespace miclink
 
-#endif  /* WOMIC_SERVER_THREADS_SYNC_H */
+#endif  /* MICLINK_SERVER_THREADS_SYNC_H */

@@ -4,14 +4,14 @@
  * 目的：让手机 App 不需要手填 PC 的 IP 与端口。
  * 协议（极简，明文 ASCII，便于跨端调试与抓包排查）：
  *
- *   手机 -> 255.255.255.255:<discovery_port>   "WOMIC-DISCOVER 1"
- *   服务端 -> 单播回复                          "WOMIC-HERE 1 <port> <rate> <channels> <name>"
- *   服务端（可选，--discovery-interval-ms）    周期性向广播地址发 "WOMIC-HERE ..."
+ *   手机 -> 255.255.255.255:<discovery_port>   "MICLINK-DISCOVER 1"
+ *   服务端 -> 单播回复                          "MICLINK-HERE 1 <port> <rate> <channels> <name>"
+ *   服务端（可选，--discovery-interval-ms）    周期性向广播地址发 "MICLINK-HERE ..."
  *
  * 只在同一网段的广播域内工作；不依赖 mDNS/SSDP 等重量级组件。
  */
-#ifndef WOMIC_SERVER_DISCOVERY_H
-#define WOMIC_SERVER_DISCOVERY_H
+#ifndef MICLINK_SERVER_DISCOVERY_H
+#define MICLINK_SERVER_DISCOVERY_H
 
 #include <atomic>
 #include <cstdint>
@@ -21,7 +21,7 @@
 #include "net_socket.h"
 #include "threads.h"
 
-namespace womic {
+namespace miclink {
 
 class DiscoveryService {
 public:
@@ -59,6 +59,6 @@ private:
     std::atomic<bool> running_{false};
 };
 
-}  // namespace womic
+}  // namespace miclink
 
-#endif  /* WOMIC_SERVER_DISCOVERY_H */
+#endif  /* MICLINK_SERVER_DISCOVERY_H */

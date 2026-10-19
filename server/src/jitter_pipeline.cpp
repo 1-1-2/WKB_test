@@ -1,5 +1,5 @@
 /*
- * jitter_pipeline.cpp -- womic_jitter 的服务端封装实现。
+ * jitter_pipeline.cpp -- miclink_jitter 的服务端封装实现。
  */
 #include "jitter_pipeline.h"
 
@@ -7,9 +7,9 @@
 
 #include "log.h"
 
-namespace womic {
+namespace miclink {
 
-static constexpr char kWomicLogModule[] = "jitter";
+static constexpr char kMicLinkLogModule[] = "jitter";
 
 bool JitterPipeline::init(uint32_t sample_rate, uint16_t channels, uint32_t frame_ms,
                           uint32_t min_ms, uint32_t max_ms, uint32_t target_ms,
@@ -23,16 +23,16 @@ bool JitterPipeline::init(uint32_t sample_rate, uint16_t channels, uint32_t fram
         return false;
     }
 
-    womic_jb_config cfg {};
+    miclink_jb_config cfg {};
     cfg.sample_rate = sample_rate;
     cfg.channels = channels;
     cfg.frame_ms = frame_ms;
-    cfg.min_delay_ms = (min_ms == 0u) ? WOMIC_JB_DEFAULT_MIN : min_ms;
-    cfg.max_delay_ms = (max_ms == 0u) ? WOMIC_JB_DEFAULT_MAX : max_ms;
+    cfg.min_delay_ms = (min_ms == 0u) ? MICLINK_JB_DEFAULT_MIN : min_ms;
+    cfg.max_delay_ms = (max_ms == 0u) ? MICLINK_JB_DEFAULT_MAX : max_ms;
     cfg.target_delay_ms = (target_ms == 0u) ? cfg.min_delay_ms : target_ms;
     cfg.capacity_frames = capacity_frames;
 
-    const size_t need = womic_jb_storage_bytes(&cfg);
+    const size_t need = miclink_jb_storage_bytes(&cfg);
     if (need == 0u) {
         if (err != nullptr) {
             *err = "jitter: storage_bytes 计算为 0（配置非法）";
@@ -44,11 +44,11 @@ bool JitterPipeline::init(uint32_t sample_rate, uint16_t channels, uint32_t fram
         storage_.resize(need);
     }
 
-    int rc = womic_jb_init(&jb_, &cfg, storage_.data(), storage_.size());
+    int rc = miclink_jb_init(&jb_, &cfg, storage_.data(), storage_.size());
     if (rc != 0) {
         if (err != nullptr) {
             char buf[160];
-            std::snprintf(buf, sizeof(buf), "womic_jb_init 失败(%d)，需要 %zu 字节 storage", rc, need);
+            std::snprintf(buf, sizeof(buf), "miclink_jb_init 失败(%d)，需要 %zu 字节 storage", rc, need);
             *err = buf;
         }
         ready_ = false;
@@ -72,7 +72,7 @@ JitterPushResult JitterPipeline::push(uint32_t seq, const int16_t *frames, uint3
     if ((frames == nullptr) || (nframes != samples_per_frame_)) {
         return JitterPushResult::kInvalidArg;
     }
-    int rc = womic_jb_put(&jb_, seq, const_cast<int16_t *>(frames), nframes, now_ms);
+    int rc = miclink_jb_put(&jb_, seq, const_cast<int16_t *>(frames), nframes, now_ms);
     switch (rc) {
         case 0:
             return JitterPushResult::kAccepted;
@@ -81,7 +81,7 @@ JitterPushResult JitterPipeline::push(uint32_t seq, const int16_t *frames, uint3
         case 2:
             return JitterPushResult::kLate;
         default:
-            /* womic_jb_put 的负值：目前只有参数错误 / nframes 不符。 */
+            /* miclink_jb_put 的负值：目前只有参数错误 / nframes 不符。 */
             return (rc == -2) ? JitterPushResult::kTooLarge : JitterPushResult::kInvalidArg;
     }
 }
@@ -113,7 +113,7 @@ JitterPullResult JitterPipeline::pull(int16_t *out_frames, uint32_t nframes, int
         *out_missing = 0;
     }
 
-    int rc = womic_jb_get(&jb_, out_frames, nframes, out_missing, now_ms);
+    int rc = miclink_jb_get(&jb_, out_frames, nframes, out_missing, now_ms);
     if (rc != 1) {
         if (rc == -2) {
             return JitterPullResult::kWrongFrameSize;
@@ -125,7 +125,7 @@ JitterPullResult JitterPipeline::pull(int16_t *out_frames, uint32_t nframes, int
     }
 
     /*
-     * 成功产出一帧后，womic_jitter.head_seq 已经 ++，因此"刚播出的那一帧"
+     * 成功产出一帧后，miclink_jitter.head_seq 已经 ++，因此"刚播出的那一帧"
      * 的 seq 就是 head_seq - 1（真实帧与占位帧都会推进 head_seq，见
      * shared/core/src/jitter_buffer.c 的 jb_emit_at_head 与占位分支）。
      * 直接读共享结构体字段（不复制定义），用于统计与测试的 seq 连续性校验。
@@ -141,7 +141,7 @@ uint32_t JitterPipeline::target_delay_ms() const
     if (!ready_) {
         return 0u;
     }
-    return womic_jb_target_delay_ms(&jb_);
+    return miclink_jb_target_delay_ms(&jb_);
 }
 
 uint32_t JitterPipeline::depth_ms() const
@@ -149,7 +149,7 @@ uint32_t JitterPipeline::depth_ms() const
     if (!ready_) {
         return 0u;
     }
-    return womic_jb_depth_ms(&jb_);
+    return miclink_jb_depth_ms(&jb_);
 }
 
 JitterCounters JitterPipeline::counters() const
@@ -173,7 +173,7 @@ void JitterPipeline::reset()
     if (!ready_) {
         return;
     }
-    womic_jb_reset(&jb_);
+    miclink_jb_reset(&jb_);
 }
 
-}  // namespace womic
+}  // namespace miclink

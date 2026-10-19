@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Womic Open 启动图标（矢量图，避免引入 png/mipmap 二进制资源）。
+  MicLink Open 启动图标（矢量图，避免引入 png/mipmap 二进制资源）。
   图案：一枚麦克风外形 + 声波弧线。
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"

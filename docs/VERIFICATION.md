@@ -23,7 +23,7 @@
 命令：
 
 ```bash
-cd /workspace/womic-open/tests && ./run_tests.sh
+cd /workspace/miclink-open/tests && ./run_tests.sh
 ```
 
 实测结果（`--no-clean` 增量复跑，2024 年本次会话内执行）：
@@ -53,16 +53,16 @@ cd /workspace/womic-open/tests && ./run_tests.sh
 命令：
 
 ```bash
-cmake -S /workspace/womic-open/server -B /workspace/womic-open/server/build -DCMAKE_BUILD_TYPE=Release
-cmake --build /workspace/womic-open/server/build
-ctest --test-dir /workspace/womic-open/server/build --output-on-failure
+cmake -S /workspace/miclink-open/server -B /workspace/miclink-open/server/build -DCMAKE_BUILD_TYPE=Release
+cmake --build /workspace/miclink-open/server/build
+ctest --test-dir /workspace/miclink-open/server/build --output-on-failure
 ```
 
 实测结果：
 
 | 项目 | 结果 |
 |---|---|
-| `womicserver` 构建 | 成功（产物 `server/build/womicserver`） |
+| `miclinkserver` 构建 | 成功（产物 `server/build/miclinkserver`） |
 | `test_pipeline` | **Passed**（16.22 s） |
 | 汇总 | `100% tests passed, 0 tests failed out of 1` |
 | 断言数 | **64 项断言，0 项失败** |
@@ -73,7 +73,7 @@ ctest --test-dir /workspace/womic-open/server/build --output-on-failure
 |---|---|---|
 | 5% 丢包下的 PLC | 模拟丢包后用 Opus PLC 隐藏 | 通过 |
 | 16 kHz → 48 kHz 重采样 | 采集率与端点率不同，由服务端重采样 | 通过 |
-| 发现服务往返 | 发 `WOMIC-DISCOVER 1`（16 字节），收到 `WOMIC-HERE 1 <port> 48000 1 Womic_Virtual_Microphone` | 通过 |
+| 发现服务往返 | 发 `MICLINK-DISCOVER 1`（16 字节），收到 `MICLINK-HERE 1 <port> 48000 1 MicLink_Virtual_Microphone` | 通过 |
 | 会话启动 / 注入 / 停止复位 | Fake 设备后端全流程 | 通过 |
 | **E 带内 FEC（合规语义）** | 冗余包**复用**被保护帧的 seq。断言：产出帧数 == 真实帧数（96000 == 96000，容差 0）、`frames_decoded == 100`（冗余包一个都没被当成新帧解码）、逐帧频率校验 97 帧全对 | 通过 |
 | **F 带内 FEC（非合规语义）** | 冗余包**占用新 seq**（修复前 Android 的行为）。实测 106 个 seq 槽 → 抖动缓冲（默认 7 槽）**驱逐 7 帧**、只产出 99 帧。用于锁定"服务端无法弥补发送端膨胀"这一能力边界 | 通过 |
@@ -97,7 +97,7 @@ ctest --test-dir /workspace/womic-open/server/build --output-on-failure
 ```
 
 修复两侧的改动：`android/.../MicCaptureService.kt`（冗余包复用 `frameSeq` 且不再 `seq++`）
-与 `server/src/pipeline.cpp`（解码前读 `WOMIC_FLAG_FEC`，无缺口时直接拒收）。
+与 `server/src/pipeline.cpp`（解码前读 `MICLINK_FLAG_FEC`，无缺口时直接拒收）。
 **服务端的能力边界**：若发送端违反约定给冗余包分配新 seq，服务端在协议层面无法区分
 它与"真实的新帧"，只能照单全收（场景 F 就是这条边界的刻画，修复前后结论相同），
 那 6.25% 的膨胀只能靠发送端修复消除。
@@ -113,9 +113,9 @@ ctest --test-dir /workspace/womic-open/server/build --output-on-failure
 命令：
 
 ```bash
-python3 /workspace/womic-open/driver/verify/check_driver_consistency.py            # 人读报告
-python3 /workspace/womic-open/driver/verify/check_driver_consistency.py --quiet    # 只打汇总
-python3 /workspace/womic-open/driver/verify/check_driver_consistency.py --json
+python3 /workspace/miclink-open/driver/verify/check_driver_consistency.py            # 人读报告
+python3 /workspace/miclink-open/driver/verify/check_driver_consistency.py --quiet    # 只打汇总
+python3 /workspace/miclink-open/driver/verify/check_driver_consistency.py --json
 ```
 
 实测结果：`TOTAL: 127   PASS: 127   FAIL: 0` → `RESULT: ALL GREEN`（退出码 0）。
@@ -128,14 +128,14 @@ python3 /workspace/womic-open/driver/verify/check_driver_consistency.py --json
 命令：
 
 ```bash
-cd /workspace/womic-open/android/verify/protocol_crosscheck && ./run.sh
+cd /workspace/miclink-open/android/verify/protocol_crosscheck && ./run.sh
 ```
 
 实测结果：`PASS`（退出码 0）。
 
 | 项 | 结果 |
 |---|---|
-| C 侧（真实 `shared/core/src/protocol.c` 的 `womic_packet_encode`） | `len=37`，十六进制 `574F4D500001002012345678010203040000BB80000103C00005000100000000DEADBEEF01` |
+| C 侧（真实 `shared/core/src/protocol.c` 的 `miclink_packet_encode`） | `len=37`，十六进制 `574F4D500001002012345678010203040000BB80000103C00005000100000000DEADBEEF01` |
 | Java 侧（`Packetizer.kt` 的逻辑镜像 `PacketizerProbe.java`） | **与 C 侧完全相同** |
 | 逐字节 diff | 一致 |
 | 用权威解码器回读 | `decode=37 seq=305419896 ts=16909060 rate=48000 ch=1 frames=960 payload=5 flags=1`（自洽） |
@@ -150,14 +150,14 @@ cd /workspace/womic-open/android/verify/protocol_crosscheck && ./run.sh
 命令：
 
 ```bash
-cd /workspace/womic-open/android/verify/jni_smoketest && ./run.sh
+cd /workspace/miclink-open/android/verify/jni_smoketest && ./run.sh
 ```
 
 实测结果：`JNI SMOKE TEST OK`（退出码 0）。
 
 | 项 | 结果 |
 |---|---|
-| 生成的 JNI 符号 | `Java_com_womic_open_OpusEncoder_nativeCreate / nativeDestroy / nativeEncode / nativePlc / nativeSetBitrate / nativeSetComplexity / nativeSetInbandFec / nativeVersion`（8 个，与 Kotlin 声明一一对应） |
+| 生成的 JNI 符号 | `Java_com_miclink_open_OpusEncoder_nativeCreate / nativeDestroy / nativeEncode / nativePlc / nativeSetBitrate / nativeSetComplexity / nativeSetInbandFec / nativeVersion`（8 个，与 Kotlin 声明一一对应） |
 | `create(48k,1ch,64kbps,960)` | 成功 |
 | `encode` / `plc` 往返 | 长度一致 |
 | `setBitrate` / `setComplexity` / `setInbandFec` | 返回 0 |
@@ -173,14 +173,14 @@ cd /workspace/womic-open/android/verify/jni_smoketest && ./run.sh
 
 | # | 验证项 | 为什么沙箱做不了 | 在哪里做 | 判据 |
 |---|---|---|---|---|
-| B1 | **WDK 驱动编译**（x64，Debug/Release） | 无 WDK、无 MSVC | VS 2022 + WDK，见 `docs/BUILD.md` | 生成 `womicvirtualmic.sys` / `WomicVirtualMic.inf` / `.cat` |
+| B1 | **WDK 驱动编译**（x64，Debug/Release） | 无 WDK、无 MSVC | VS 2022 + WDK，见 `docs/BUILD.md` | 生成 `miclinkvirtualmic.sys` / `MicLinkVirtualMic.inf` / `.cat` |
 | B2 | **测试签名**（`make-test-cert.ps1` + `signtool`） | 无 Windows、无 signtool | 管理员 PowerShell | `Get-AuthenticodeSignature` = Valid |
 | B3 | **驱动安装**（`install.ps1 -Mode TestSign`） | 无 Windows | 管理员 PowerShell | pnputil 成功，设备枚举出现 |
 | B4 | **测试签名水印 / 重启生效** | 无 Windows | 真机 | `bcdedit` 显示 `testsigning Yes`、桌面出现“测试模式”水印 |
-| B5 | **端点出现在输入设备列表** | 无 Windows 音频栈 | 设置 → 系统 → 声音 → 输入 | 出现 **Womic Virtual Microphone** 并可选为默认 |
+| B5 | **端点出现在输入设备列表** | 无 Windows 音频栈 | 设置 → 系统 → 声音 → 输入 | 出现 **MicLink Virtual Microphone** 并可选为默认 |
 | B6 | **控制面板“录制”选项卡状态** | 同上 | `mmsys.cpl` → 录制 | 状态“准备就绪”，非“已禁用/未插入” |
 | B7 | **设备管理器无感叹号、无代码 52** | 同上 | `devmgmt.msc` | “该设备运转正常”，无代码 52 |
-| B8 | **`CreateFile("\\.\WomicControl")` 打开成功** | 无驱动 | `tools\verify.ps1` | 检查项 PASS |
+| B8 | **`CreateFile("\\.\MicLinkControl")` 打开成功** | 无驱动 | `tools\verify.ps1` | 检查项 PASS |
 | B9 | **IOCTL GET_VERSION 返回版本号** | 无驱动 | `tools\verify.ps1` | 返回 4 个 uint32 |
 | B10 | **Windows 录音机采集到手机声音** | 无 Windows | 手册第 6.1 节 | 回放能听到手机侧说话 |
 | B11 | **OBS 采集到手机声音** | 无 OBS | 手册第 6.2 节 | 混音器电平跳动、录制文件有声 |
@@ -223,21 +223,21 @@ cd /workspace/womic-open/android/verify/jni_smoketest && ./run.sh
 # ---- A 类：Linux 上可复跑 ----
 
 # A1: shared/core（7 个用例）
-cd /workspace/womic-open/tests && ./run_tests.sh
+cd /workspace/miclink-open/tests && ./run_tests.sh
 
 # A2: server（构建 + 端到端 64 项断言）
-cmake -S /workspace/womic-open/server -B /workspace/womic-open/server/build -DCMAKE_BUILD_TYPE=Release
-cmake --build /workspace/womic-open/server/build
-ctest --test-dir /workspace/womic-open/server/build --output-on-failure
+cmake -S /workspace/miclink-open/server -B /workspace/miclink-open/server/build -DCMAKE_BUILD_TYPE=Release
+cmake --build /workspace/miclink-open/server/build
+ctest --test-dir /workspace/miclink-open/server/build --output-on-failure
 
 # A3: driver 静态一致性（127 项）
-python3 /workspace/womic-open/driver/verify/check_driver_consistency.py --quiet
+python3 /workspace/miclink-open/driver/verify/check_driver_consistency.py --quiet
 
 # A4: Android 封包字节布局 vs shared/core 权威实现（逐字节比对）
-cd /workspace/womic-open/android/verify/protocol_crosscheck && ./run.sh
+cd /workspace/miclink-open/android/verify/protocol_crosscheck && ./run.sh
 
 # A5: Android JNI 接线冒烟测试（链接 stub opus）
-cd /workspace/womic-open/android/verify/jni_smoketest && ./run.sh
+cd /workspace/miclink-open/android/verify/jni_smoketest && ./run.sh
 ```
 
 ```powershell
@@ -253,5 +253,5 @@ powershell -ExecutionPolicy Bypass -File tools\uninstall.ps1
 ```bash
 # ---- B13：Android（未执行过） ----
 # 先按 android/README.md 放入 opus 源码到 android/app/src/main/cpp/opus/
-cd /workspace/womic-open/android && ./gradlew :app:assembleDebug
+cd /workspace/miclink-open/android && ./gradlew :app:assembleDebug
 ```

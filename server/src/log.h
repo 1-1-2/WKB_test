@@ -8,16 +8,16 @@
  *   - 日志点全部位于非热路径（状态打印、异常、状态切换）。电平日志
  *     默认关闭，开启后由 Stats 侧按 1s 节流，绝不会每帧调用。
  */
-#ifndef WOMIC_SERVER_LOG_H
-#define WOMIC_SERVER_LOG_H
+#ifndef MICLINK_SERVER_LOG_H
+#define MICLINK_SERVER_LOG_H
 
 #if defined(__GNUC__) || defined(__clang__)
-#define WOMIC_LOG_FMT(a, b) __attribute__((format(printf, a, b)))
+#define MICLINK_LOG_FMT(a, b) __attribute__((format(printf, a, b)))
 #else
-#define WOMIC_LOG_FMT(a, b)
+#define MICLINK_LOG_FMT(a, b)
 #endif
 
-namespace womic {
+namespace miclink {
 
 /** 日志级别。数值越大越啰嗦；运行时按 log_level() 截断。 */
 enum class LogLevel : int {
@@ -46,23 +46,23 @@ const char *log_level_name(LogLevel level);
 bool log_level_parse(const char *text, LogLevel *out);
 
 /**
- * @brief 写一条日志。外部请优先使用 WOMIC_LOG* 宏。
+ * @brief 写一条日志。外部请优先使用 MICLINK_LOG* 宏。
  * @param level  级别
- * @param module 模块名（各 .cpp 内定义 kWomicLogModule）
+ * @param module 模块名（各 .cpp 内定义 kMicLinkLogModule）
  * @param fmt    printf 风格格式串
  */
-void log_write(LogLevel level, const char *module, const char *fmt, ...) WOMIC_LOG_FMT(3, 4);
+void log_write(LogLevel level, const char *module, const char *fmt, ...) MICLINK_LOG_FMT(3, 4);
 
-}  // namespace womic
+}  // namespace miclink
 
-/* --- 便捷宏：每个 .cpp 需先定义 static constexpr char kWomicLogModule[] --- */
-#define WOMIC_LOGE(fmt, ...) \
-    ::womic::log_write(::womic::LogLevel::kError, kWomicLogModule, fmt, ##__VA_ARGS__)
-#define WOMIC_LOGW(fmt, ...) \
-    ::womic::log_write(::womic::LogLevel::kWarn, kWomicLogModule, fmt, ##__VA_ARGS__)
-#define WOMIC_LOGI(fmt, ...) \
-    ::womic::log_write(::womic::LogLevel::kInfo, kWomicLogModule, fmt, ##__VA_ARGS__)
-#define WOMIC_LOGV(fmt, ...) \
-    ::womic::log_write(::womic::LogLevel::kVerbose, kWomicLogModule, fmt, ##__VA_ARGS__)
+/* --- 便捷宏：每个 .cpp 需先定义 static constexpr char kMicLinkLogModule[] --- */
+#define MICLINK_LOGE(fmt, ...) \
+    ::miclink::log_write(::miclink::LogLevel::kError, kMicLinkLogModule, fmt, ##__VA_ARGS__)
+#define MICLINK_LOGW(fmt, ...) \
+    ::miclink::log_write(::miclink::LogLevel::kWarn, kMicLinkLogModule, fmt, ##__VA_ARGS__)
+#define MICLINK_LOGI(fmt, ...) \
+    ::miclink::log_write(::miclink::LogLevel::kInfo, kMicLinkLogModule, fmt, ##__VA_ARGS__)
+#define MICLINK_LOGV(fmt, ...) \
+    ::miclink::log_write(::miclink::LogLevel::kVerbose, kMicLinkLogModule, fmt, ##__VA_ARGS__)
 
-#endif  /* WOMIC_SERVER_LOG_H */
+#endif  /* MICLINK_SERVER_LOG_H */

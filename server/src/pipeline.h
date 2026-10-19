@@ -3,7 +3,7 @@
  *
  * 数据流（全部发生在 UDP 接收线程内，故 Opus 解码器无需加锁）：
  *
- *   UDP 包 -> womic_packet_decode -> opus_decode / PLC -> JitterPipeline
+ *   UDP 包 -> miclink_packet_decode -> opus_decode / PLC -> JitterPipeline
  *          -> (服务端重采样：采集率 -> 端点率) -> 去咔哒 + 增益 + 电平测量
  *          -> PcmRing --(线程边界)--> 注入线程 -> DeviceIoControl(WRITE_PCM)
  *
@@ -15,8 +15,8 @@
  *      （驱动侧绝不做重采样）。
  *   3) PcmRing 是唯一跨越线程边界的数据结构，SPSC 无锁。
  */
-#ifndef WOMIC_SERVER_PIPELINE_H
-#define WOMIC_SERVER_PIPELINE_H
+#ifndef MICLINK_SERVER_PIPELINE_H
+#define MICLINK_SERVER_PIPELINE_H
 
 #include <cstdint>
 #include <string>
@@ -28,9 +28,9 @@
 #include "resampler.h"
 #include "ring_adapter.h"
 #include "stats.h"
-#include "womic/womic_dsp.h"
+#include "miclink/miclink_dsp.h"
 
-namespace womic {
+namespace miclink {
 
 /** produce() 的产出描述。 */
 struct ProducedFrame {
@@ -104,7 +104,7 @@ private:
     uint32_t out_samples_per_frame_ = 1u;
 
     float linear_gain_ = 1.0f;
-    womic_declck declck_ {};
+    miclink_declck declck_ {};
 
     /* 解码暂存（采集率，最大 60ms × 48kHz × 2ch = 5760）与输出暂存（端点率）。 */
     std::vector<int16_t> decode_buf_;
@@ -113,6 +113,6 @@ private:
     uint64_t produced_frames_ = 0u;
 };
 
-}  // namespace womic
+}  // namespace miclink
 
-#endif  /* WOMIC_SERVER_PIPELINE_H */
+#endif  /* MICLINK_SERVER_PIPELINE_H */

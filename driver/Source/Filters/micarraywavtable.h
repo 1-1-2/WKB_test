@@ -18,7 +18,7 @@ Abstract:-
 //
 // Mic range.
 //
-// WOMIC 端点被改造为 16-bit 单声道麦克风：
+// MICLINK 端点被改造为 16-bit 单声道麦克风：
 //   * MICARRAY_RAW_CHANNELS / MICARRAY_DEVICE_MAX_CHANNELS : 2 -> 1
 //   * 位深 32 -> 16（原宏名 MICARRAY_32_BITS_PER_SAMPLE_PCM 会误导，
 //     改名为 MICARRAY_BITS_PER_SAMPLE_PCM；下面的 DataRange 同步改用新名）
@@ -35,7 +35,7 @@ Abstract:-
 #define MICARRAY_MAX_INPUT_STREAMS              1
 
 //
-// 一帧的字节数：16-bit 单声道 = 2。与 womic_ctl.h 的 WOMIC_FRAME_BYTES 必须一致，
+// 一帧的字节数：16-bit 单声道 = 2。与 miclink_ctl.h 的 MICLINK_FRAME_BYTES 必须一致，
 // 否则环形缓冲的帧计数与 DMA 字节位移会对不上。
 //
 #define MICARRAY_FRAME_BYTES                    2

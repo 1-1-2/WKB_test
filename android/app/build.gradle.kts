@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.womic.open"
+    namespace = "com.miclink.open"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.womic.open"
+        applicationId = "com.miclink.open"
         // minSdk 26：AudioRecord.Builder / 前台服务通知渠道 / Opus 均需要较新的 API
         minSdk = 26
         targetSdk = 34

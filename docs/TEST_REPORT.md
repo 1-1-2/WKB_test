@@ -1,4 +1,4 @@
-# Womic-Open 最终全局验证与一致性审查报告
+# MicLink-Open 最终全局验证与一致性审查报告
 
 - **审查人**：QA（严格模式）
 - **审查环境**：Linux Ubuntu 22.04 / gcc 13.3 / cmake 3.28 / ninja / libopus 1.4（**Windows / WDK / Android SDK 均不可用**）
@@ -37,15 +37,15 @@
 ### A1. `shared/core` 单元测试（7 个）
 
 ```bash
-cd /workspace/womic-open/tests && ./run_tests.sh --jobs 16
+cd /workspace/miclink-open/tests && ./run_tests.sh --jobs 16
 ```
 
 真实输出（ctest 段）：
 
 ```
 ==> 运行 ctest
-Internal ctest changing into directory: /workspace/womic-open/tests/build
-Test project /workspace/womic-open/tests/build
+Internal ctest changing into directory: /workspace/miclink-open/tests/build
+Test project /workspace/miclink-open/tests/build
     Start 1: test_ring_buffer
 1/7 Test #1: test_ring_buffer .................   Passed    0.03 sec
     Start 2: test_jitter_buffer
@@ -83,8 +83,8 @@ Total Test time (real) =   3.55 sec
 ### A2. `server` Linux 构建 + `test_pipeline`
 
 ```bash
-cd /workspace/womic-open/server
-rm -rf build && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWOMIC_WITH_FAKE_DEVICE=ON
+cd /workspace/miclink-open/server
+rm -rf build && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMICLINK_WITH_FAKE_DEVICE=ON
 cmake --build build --parallel 16        # BUILD_EXIT=0
 ctest --output-on-failure                # 在 build 下
 ```
@@ -92,7 +92,7 @@ ctest --output-on-failure                # 在 build 下
 真实输出：
 
 ```
-Test project /workspace/womic-open/server/build
+Test project /workspace/miclink-open/server/build
     Start 1: test_pipeline
 1/1 Test #1: test_pipeline ....................   Passed   10.55 sec
 
@@ -111,14 +111,14 @@ Total Test time (real) =  10.55 sec
   [ ok ] 峰值电平 0.524 落在 (0.05, 1.0]
   [ ok ] 削波样本占比 0.000% < 1%（无溢出）
 ==== 场景 E 发现服务往返 ====
-  [ ok ] 收到发现应答：WOMIC-HERE 1 42546 48000 1 Womic_Virtual_Microphone
+  [ ok ] 收到发现应答：MICLINK-HERE 1 42546 48000 1 MicLink_Virtual_Microphone
 ==== 汇总：40 项断言，0 项失败 ====
 测试通过
 ```
 
 | 项目 | 结果 |
 |---|---|
-| `womicserver` 构建 | **成功**（`server/build/womicserver` 产出） |
+| `miclinkserver` 构建 | **成功**（`server/build/miclinkserver` 产出） |
 | `test_pipeline` | **Passed**（10.55 s，40 项断言 / 0 失败） |
 
 **边界**：Linux 走的是 **Fake 设备后端**（`server/src/fake_device.h`），**不等于** Windows 上的 `DeviceIoControl` 路径；IOCTL 那一半在 Linux 上**无法验证**。
@@ -126,7 +126,7 @@ Total Test time (real) =  10.55 sec
 ### A3. `driver` 静态一致性自校验
 
 ```bash
-cd /workspace/womic-open/driver/verify && python3 check_driver_consistency.py
+cd /workspace/miclink-open/driver/verify && python3 check_driver_consistency.py
 ```
 
 真实输出（尾部）：
@@ -136,9 +136,9 @@ cd /workspace/womic-open/driver/verify && python3 check_driver_consistency.py
 [PASS] DriverUnload 中销毁控制设备（且在 PortCls unload 之后）
 [PASS] 创建设备后清 DO_DEVICE_INITIALIZING
 [PASS] 符号链接使用 \DosDevices\Global\（跨 session 可见）
-[PASS] womic_shared_ring.c 直接 include shared/core/src/ring_buffer.c（无副本）
-[PASS] womic_shared_dsp.c 直接 include shared/core/src/dsp.c（无副本）
-[PASS] 内核侧不调用浮点 DSP（womic_apply_gain / womic_measure_level）
+[PASS] miclink_shared_ring.c 直接 include shared/core/src/ring_buffer.c（无副本）
+[PASS] miclink_shared_dsp.c 直接 include shared/core/src/dsp.c（无副本）
+[PASS] 内核侧不调用浮点 DSP（miclink_apply_gain / miclink_measure_level）
 ------------------------------------------------------------------------------
  TOTAL: 122   PASS: 122   FAIL: 0
 ==============================================================================
@@ -150,7 +150,7 @@ cd /workspace/womic-open/driver/verify && python3 check_driver_consistency.py
 ### A4. Android 封包字节布局交叉校验（本作者复跑）
 
 ```bash
-cd /workspace/womic-open/android/verify/protocol_crosscheck && ./run.sh
+cd /workspace/miclink-open/android/verify/protocol_crosscheck && ./run.sh
 ```
 
 ```
@@ -168,7 +168,7 @@ PASS：Android 端封包与 shared/core 权威实现逐字节一致
 ### A5. Android JNI 接线冒烟测试（本作者复跑）
 
 ```bash
-cd /workspace/womic-open/android/verify/jni_smoketest && ./run.sh
+cd /workspace/miclink-open/android/verify/jni_smoketest && ./run.sh
 ```
 
 ```
@@ -180,7 +180,7 @@ libopus(stub) = stub-opus（非真实 Opus）
 JNI SMOKE TEST OK
 ```
 
-8 个 `Java_com_womic_open_OpusEncoder_native*` 符号全部导出。
+8 个 `Java_com_miclink_open_OpusEncoder_native*` 符号全部导出。
 
 | A 类汇总 | |
 |---|---|
@@ -195,14 +195,14 @@ JNI SMOKE TEST OK
 
 | # | 验证项 | 判据 | 状态 |
 |---|---|---|---|
-| B1 | WDK 驱动编译（x64 Debug/Release） | 产出 `womicvirtualmic.sys` / `.inf` / `.cat` | **从未执行** |
+| B1 | WDK 驱动编译（x64 Debug/Release） | 产出 `miclinkvirtualmic.sys` / `.inf` / `.cat` | **从未执行** |
 | B2 | 测试签名（make-test-cert + signtool） | `Get-AuthenticodeSignature` = Valid | **从未执行** |
 | B3 | 驱动安装（install.ps1 -Mode TestSign） | pnputil 成功、设备枚举出现 | **从未执行** |
 | B4 | 测试签名水印 / 重启生效 | `bcdedit` 显示 `testsigning Yes` | **从未执行** |
-| B5 | 端点出现在 Windows 输入设备列表 | 出现 "Womic Virtual Microphone" | **从未执行** |
+| B5 | 端点出现在 Windows 输入设备列表 | 出现 "MicLink Virtual Microphone" | **从未执行** |
 | B6 | `mmsys.cpl` → 录制 状态"准备就绪" | 非"已禁用/未插入" | **从未执行** |
 | B7 | 设备管理器无感叹号 / 无代码 52 | "该设备运转正常" | **从未执行** |
-| B8 | `CreateFile("\\.\WomicControl")` 成功 | `tools\verify.ps1` PASS | **从未执行** |
+| B8 | `CreateFile("\\.\MicLinkControl")` 成功 | `tools\verify.ps1` PASS | **从未执行** |
 | B9 | IOCTL GET_VERSION 返回版本号 | 返回 4 个 uint32 | **从未执行** |
 | B10 | Windows 录音机采集到手机声音 | 回放能听到 | **从未执行** |
 | B11 | OBS 采集到手机声音 | 混音器电平跳动 | **从未执行** |
@@ -222,17 +222,17 @@ JNI SMOKE TEST OK
 
 | # | 审查项 | 结论 | 证据 |
 |---|---|---|---|
-| B-1 | **协议一致性**（Android ↔ `womic_protocol.h`） | **PASS** | 见下方逐字段表 |
-| B-2 | **IOCTL 一致性**（server/driver 共用同一份，无重复定义） | **PASS** | `shared/core/include/womic/womic_ioctl.h:37-45`；`server/src/injector.h:29` `#include "womic/womic_ioctl.h"`；`driver/Source/Inc/womic/womic_ctl.h:58` 同文件 include；`driver/Source/Main/womicctl.cpp:40` include `womic/womic_ctl.h`。全仓库 grep `WOMIC_CTL_CODE` 仅 `womic_ioctl.h:29` 一处定义（另见 `docs/ARCHITECTURE.md:768` 为文档引用）。驱动 9 个 case 全覆盖：`womicctl.cpp:680,702,728,743,793,928,966,1002,1069` |
-| B-3 | **默认端口 / 采样率三方一致** | **PASS** | 音频端口 5004：`android/.../Prefs.kt:47` = `android/app/build.gradle.kts:22` = `server/src/config.h:33`；发现端口 5005：`Discovery.kt:46` = `build.gradle.kts:23` = `server/src/config.h:77`；采样率 48000：`Prefs.kt:51` = `build.gradle.kts:24` = `config.h`。发现报文格式：服务端 `server/src/discovery.cpp:44` 产出 `WOMIC-HERE 1 %u %u %u %s`，Android `Discovery.kt:147-166` 按 `parts[0..5]` 解析，字段顺序完全对应；请求 `WOMIC-DISCOVER 1` 与 `discovery.cpp:110` 的前 14 字节校验一致 |
-| B-4 | **驱动侧无重采样** | **PASS** | `grep -rni "resample\|resampl\|SRC_\|SampleRateConvert\|soxr\|speex_resamp" driver/ --include=*.{c,cpp,h,inx}` → **0 命中**。反证：`womicctl.cpp:834` 帧字节不等即 `STATUS_INVALID_DEVICE_REQUEST`；`womicctl.cpp:837-843` 注入格式必须与流格式完全一致 |
-| B-5 | **驱动侧无正弦残留** | **PASS** | `GenerateSine` 仅出现在注释中：`minwavertstream.cpp:330`（注释）、`minwavertstream.cpp:1392`（位于 `/*++ ... --*/` 的 Routine Description 注释块内，1384–1401）；`check_driver_consistency.py:420-421` 用去注释后的代码判定。实际代码路径 `minwavertstream.cpp:1482` 为 `womic_ring_read_fill_silence(ring, dst, frames)`。附带发现见缺陷 D-04（ToneGenerator.cpp 仍被编译但无引用） |
+| B-1 | **协议一致性**（Android ↔ `miclink_protocol.h`） | **PASS** | 见下方逐字段表 |
+| B-2 | **IOCTL 一致性**（server/driver 共用同一份，无重复定义） | **PASS** | `shared/core/include/miclink/miclink_ioctl.h:37-45`；`server/src/injector.h:29` `#include "miclink/miclink_ioctl.h"`；`driver/Source/Inc/miclink/miclink_ctl.h:58` 同文件 include；`driver/Source/Main/miclinkctl.cpp:40` include `miclink/miclink_ctl.h`。全仓库 grep `MICLINK_CTL_CODE` 仅 `miclink_ioctl.h:29` 一处定义（另见 `docs/ARCHITECTURE.md:768` 为文档引用）。驱动 9 个 case 全覆盖：`miclinkctl.cpp:680,702,728,743,793,928,966,1002,1069` |
+| B-3 | **默认端口 / 采样率三方一致** | **PASS** | 音频端口 5004：`android/.../Prefs.kt:47` = `android/app/build.gradle.kts:22` = `server/src/config.h:33`；发现端口 5005：`Discovery.kt:46` = `build.gradle.kts:23` = `server/src/config.h:77`；采样率 48000：`Prefs.kt:51` = `build.gradle.kts:24` = `config.h`。发现报文格式：服务端 `server/src/discovery.cpp:44` 产出 `MICLINK-HERE 1 %u %u %u %s`，Android `Discovery.kt:147-166` 按 `parts[0..5]` 解析，字段顺序完全对应；请求 `MICLINK-DISCOVER 1` 与 `discovery.cpp:110` 的前 14 字节校验一致 |
+| B-4 | **驱动侧无重采样** | **PASS** | `grep -rni "resample\|resampl\|SRC_\|SampleRateConvert\|soxr\|speex_resamp" driver/ --include=*.{c,cpp,h,inx}` → **0 命中**。反证：`miclinkctl.cpp:834` 帧字节不等即 `STATUS_INVALID_DEVICE_REQUEST`；`miclinkctl.cpp:837-843` 注入格式必须与流格式完全一致 |
+| B-5 | **驱动侧无正弦残留** | **PASS** | `GenerateSine` 仅出现在注释中：`minwavertstream.cpp:330`（注释）、`minwavertstream.cpp:1392`（位于 `/*++ ... --*/` 的 Routine Description 注释块内，1384–1401）；`check_driver_consistency.py:420-421` 用去注释后的代码判定。实际代码路径 `minwavertstream.cpp:1482` 为 `miclink_ring_read_fill_silence(ring, dst, frames)`。附带发现见缺陷 D-04（ToneGenerator.cpp 仍被编译但无引用） |
 | B-6 | **删除的 speaker 文件无残留引用** | **PASS** | `grep -rni "speakertopo\|speakerwavtable\|speakertoptable" driver/ --include=*.{cpp,h,vcxproj,inx,rc,sln}` → 仅 `driver/Source/Filters/minipairs.h:19-20`（注释，说明"四个文件已删除"）；`find driver -iname "*speaker*"` → **无文件** |
-| B-7 | **vcxproj 收录完整性** | **PASS** | 新增：`Main.vcxproj` 含 `womicctl.cpp`；`Utilities.vcxproj` 含 `womic_shared_ring.c`、`womic_shared_dsp.c`。已删除的 speaker 文件未出现在任何 vcxproj（Filters.vcxproj 仅 `micarraytopo.cpp`） |
+| B-7 | **vcxproj 收录完整性** | **PASS** | 新增：`Main.vcxproj` 含 `miclinkctl.cpp`；`Utilities.vcxproj` 含 `miclink_shared_ring.c`、`miclink_shared_dsp.c`。已删除的 speaker 文件未出现在任何 vcxproj（Filters.vcxproj 仅 `micarraytopo.cpp`） |
 
 #### B-1 逐字段比对表
 
-| 偏移 | 长度 | 字段 | `womic_protocol.h` | `Packetizer.kt` | `PacketizerProbe.java` | 一致 |
+| 偏移 | 长度 | 字段 | `miclink_protocol.h` | `Packetizer.kt` | `PacketizerProbe.java` | 一致 |
 |---|---|---|---|---|---|---|
 | 0 | 4 | `magic` | `:40 uint32`，值 `0x574F4D50` (`:21`) | `:32 MAGIC=0x574F_4D50`，`:84-87` 大端写 | `:18` + `:55-58` | ✅ |
 | 4 | 2 | `version` | `:41 uint16` = 1 | `:35 VERSION=1`，`:89 putBe16(4)` | `:59` | ✅ |
@@ -245,9 +245,9 @@ JNI SMOKE TEST OK
 | 24 | 2 | `payload_bytes` | `:48 uint16` | `:96` | `:66` | ✅ |
 | 26 | 2 | `flags` | `:49 uint16`（bit0 FEC `:36` / bit1 DTX `:37`） | `:97`；`:44 FLAG_FEC=0x0001`、`:47 FLAG_DTX=0x0002` | `:67` | ✅（但服务端**不读**此字段，见 D-01） |
 | 28 | 4 | `reserved` | `:50 uint32` | `:98 putBe32(28, 0)` | `:68` | ✅ |
-| — | — | **头部总长** | `:24 WOMIC_PACKET_HEADER_SIZE = 32` | `:38 HEADER_SIZE = 32` | `:20` | ✅ |
-| — | — | **payload 上限** | `:25 WOMIC_PROTO_MAX_PAYLOAD = 4096` | `:41 MAX_PAYLOAD = 4096`；`opus_jni.h:20 WOMIC_OPUS_MAX_PAYLOAD 4096` | — | ✅ |
-| — | — | **字节序** | 全字段 `womic_hton*` 大端（`protocol.c`） | `putBe16/putBe32` 大端（`:170-181`） | 大端 | ✅ |
+| — | — | **头部总长** | `:24 MICLINK_PACKET_HEADER_SIZE = 32` | `:38 HEADER_SIZE = 32` | `:20` | ✅ |
+| — | — | **payload 上限** | `:25 MICLINK_PROTO_MAX_PAYLOAD = 4096` | `:41 MAX_PAYLOAD = 4096`；`opus_jni.h:20 MICLINK_OPUS_MAX_PAYLOAD 4096` | — | ✅ |
+| — | — | **字节序** | 全字段 `miclink_hton*` 大端（`protocol.c`） | `putBe16/putBe32` 大端（`:170-181`） | 大端 | ✅ |
 | — | — | **长度自洽** | `decode` 要求 `buf_len == header_size + payload_bytes` | `:103` 返回 `32+payloadLen`，无尾随 0；`:153` 自校验同一规则 | `:70` | ✅ |
 
 `opus_jni.cpp` **没有任何包结构重复定义**（只读 `opus_jni.h` 的常量，封包完全由 `Packetizer.kt` 负责）→ 无第二处事实来源。
@@ -256,10 +256,10 @@ JNI SMOKE TEST OK
 
 | # | 审查项 | 结论 | 证据 |
 |---|---|---|---|
-| C-1 | `PnpHandler` 在 `IoGetCurrentIrpStackLocation` **之前**短路控制设备 | **PASS** | `driver/Source/Main/adapter.cpp:890` `if (WomicIsControlDevice(_DeviceObject)) { ... IoCompleteRequest ... return }` ；`adapter.cpp:903` 才是 `stack = IoGetCurrentIrpStackLocation(_Irp);`。两段式判定实现于 `womicctl.cpp:251`（指针快拒，不读陌生设备 extension）→ `:259-266`（magic 终裁），正确 |
-| C-2 | `DataRangeIntersection` 已改为遍历匹配 | **PASS** | `driver/Source/Main/minwavert.cpp:381-398`：`for (formatIndex = 0; ...)` 逐个调用 `WomicFormatMatchesDataRange(...)`（`:383`），命中即 `*resultantFormat = ...[formatIndex]`；遍历完无命中返回 `STATUS_NO_MATCH`（`:400`）而非硬编码第 0 项。匹配函数 `minwavert.cpp:196-269` 校验 3 个 GUID + 通道/位深上界 + 采样率闭区间 |
-| C-3 | `WriteBytes` DPC 安全消费 ring | **PASS** | `minwavertstream.cpp:1443` 只用 `WomicGetControlExt()`（读全局指针 + 验签，无锁无 IO）；`:1482 womic_ring_read_fill_silence`（无阻塞/无分配/无锁/纯整数）；`:1510 womic_apply_declck`（纯整数）；统计只用 `InterlockedExchangeAdd64 / InterlockedExchange / InterlockedIncrement`。**无** `ExAllocatePool`、**无** 任何锁获取、**无** 浮点、**无** `PAGED_CODE()`。生产者侧对应不挂起：`womicctl.cpp:855-861` 缓冲满即 `STATUS_BUFFER_TOO_SMALL`，绝不等待 |
-| C-4 | dispatch 覆盖在 `PcInitializeAdapterDriver` **之后**；非控制设备一律 `PcDispatchIrp` 回投 | **PASS** | `adapter.cpp:347 PcInitializeAdapterDriver` → `:358 MajorFunction[IRP_MJ_PNP]` → `:375 WomicInitializeControlDevice`（后者内部 `womicctl.cpp:536-539` 保存 PortCls 原 4 个入口、`:548-551` 覆盖 CREATE/CLOSE/CLEANUP/DEVICE_CONTROL）。回投：`womicctl.cpp:584 / 607 / 635 / 664` 四处 `return PcDispatchIrp(DeviceObject, Irp);` |
+| C-1 | `PnpHandler` 在 `IoGetCurrentIrpStackLocation` **之前**短路控制设备 | **PASS** | `driver/Source/Main/adapter.cpp:890` `if (MicLinkIsControlDevice(_DeviceObject)) { ... IoCompleteRequest ... return }` ；`adapter.cpp:903` 才是 `stack = IoGetCurrentIrpStackLocation(_Irp);`。两段式判定实现于 `miclinkctl.cpp:251`（指针快拒，不读陌生设备 extension）→ `:259-266`（magic 终裁），正确 |
+| C-2 | `DataRangeIntersection` 已改为遍历匹配 | **PASS** | `driver/Source/Main/minwavert.cpp:381-398`：`for (formatIndex = 0; ...)` 逐个调用 `MicLinkFormatMatchesDataRange(...)`（`:383`），命中即 `*resultantFormat = ...[formatIndex]`；遍历完无命中返回 `STATUS_NO_MATCH`（`:400`）而非硬编码第 0 项。匹配函数 `minwavert.cpp:196-269` 校验 3 个 GUID + 通道/位深上界 + 采样率闭区间 |
+| C-3 | `WriteBytes` DPC 安全消费 ring | **PASS** | `minwavertstream.cpp:1443` 只用 `MicLinkGetControlExt()`（读全局指针 + 验签，无锁无 IO）；`:1482 miclink_ring_read_fill_silence`（无阻塞/无分配/无锁/纯整数）；`:1510 miclink_apply_declck`（纯整数）；统计只用 `InterlockedExchangeAdd64 / InterlockedExchange / InterlockedIncrement`。**无** `ExAllocatePool`、**无** 任何锁获取、**无** 浮点、**无** `PAGED_CODE()`。生产者侧对应不挂起：`miclinkctl.cpp:855-861` 缓冲满即 `STATUS_BUFFER_TOO_SMALL`，绝不等待 |
+| C-4 | dispatch 覆盖在 `PcInitializeAdapterDriver` **之后**；非控制设备一律 `PcDispatchIrp` 回投 | **PASS** | `adapter.cpp:347 PcInitializeAdapterDriver` → `:358 MajorFunction[IRP_MJ_PNP]` → `:375 MicLinkInitializeControlDevice`（后者内部 `miclinkctl.cpp:536-539` 保存 PortCls 原 4 个入口、`:548-551` 覆盖 CREATE/CLOSE/CLEANUP/DEVICE_CONTROL）。回投：`miclinkctl.cpp:584 / 607 / 635 / 664` 四处 `return PcDispatchIrp(DeviceObject, Irp);` |
 
 **C 节 4/4 PASS，B 节 7/7 PASS —— 合计 11/11 PASS。**
 
@@ -290,7 +290,7 @@ JNI SMOKE TEST OK
 #### D-01 — FEC 冗余包被服务端当作**正常音频帧**注入，导致重复帧 / 播放加速 / 缓冲溢出
 
 - **文件:行号**
-  - `android/app/src/main/java/com/womic/open/MicCaptureService.kt:509-527`
+  - `android/app/src/main/java/com/miclink/open/MicCaptureService.kt:509-527`
   - `server/src/pipeline.cpp:258`（`jitter_.push(header.seq, ...)`）
   - 缺失侧：`server/src/pipeline.cpp:171-260` 全程**从未读取** `header.flags`
 - **问题描述**
@@ -298,23 +298,23 @@ JNI SMOKE TEST OK
   服务端 `pipeline.cpp` 从头到尾不读 `header.flags`（grep `FLAG_FEC` 在 `server/src/*.cpp` 中 **0 命中**），于是这个包被 `OpusDecoderWrapper::decode` 正常解码，并以它自己的 seq 通过 `jitter_.push()` 进入抖动缓冲 —— 成为一个**额外的、内容重复的 20 ms 帧**。
 - **影响**
   - 每 16 个真实帧多注入 1 个重复帧 ⇒ 每 320 ms 多 20 ms 音频，产出速率比实时快约 **6.25 %**；
-  - 驱动消费是实时速率，环形缓冲（`WOMIC_RING_CAPACITY_FRAMES = 32768`，约 0.68 s）会**持续累积**，最终 overrun 丢帧；
+  - 驱动消费是实时速率，环形缓冲（`MICLINK_RING_CAPACITY_FRAMES = 32768`，约 0.68 s）会**持续累积**，最终 overrun 丢帧；
   - 主观听感：周期性"叠音/回音" + 音高/语速偏高；
   - **默认开启**：`Prefs.kt:34 fecEnabled: Boolean = true`，`MicCaptureService.kt:200` 默认值也是 `true`。即**默认配置下必然触发**。
   - Linux `test_pipeline` **测不出**该缺陷（测试不发 FEC 包）。
 - **建议修复（二选一，推荐 A）**
   - **A（改 Android，1 行）**：冗余包复用**上一帧的 seq** 且不再递增，即 `Packetizer.pack(..., seq = seq - 1, ...)` 并删除 `:526` 的 `seq++`。这样抖动缓冲判定为 `kDuplicate`：原包若已到达则丢弃（`pipeline.cpp:263` 已有处理），原包若真丢了则由它补洞 —— 这才是"带内 FEC"的正确语义。
-  - **B（改服务端）**：在 `pipeline.cpp` 解码前判断 `header.flags & WOMIC_FLAG_FEC`，仅当对应 `seq-1` 确实缺失时才解码注入，否则直接 `return FeedResult::kNotAccepted`。
+  - **B（改服务端）**：在 `pipeline.cpp` 解码前判断 `header.flags & MICLINK_FLAG_FEC`，仅当对应 `seq-1` 确实缺失时才解码注入，否则直接 `return FeedResult::kNotAccepted`。
   - 无论选哪个，**都必须新增一个 Linux 侧回归用例**（发带 FEC 的包，断言产出帧数 == 真实帧数）。
 
 ### 🟠 中等（Medium）
 
 #### D-02 — README 声明的最低 Windows 版本与 INF 实际目标 OS 矛盾
 
-- **文件:行号**：`README.md:117` vs `driver/Source/Main/WomicVirtualMic.inx`（UTF-16，转换后第 31–33 行）
-- **问题描述**：README 写"Windows 10 2004（build 19041）或 11"，同一行又写"驱动最低支持 `NT$ARCH$.10.0...22000`"。INF 的 `[Manufacturer]` 为 `%MfgName% = WOMIC, NT$ARCH$.10.0...22000`，即**只对 build ≥ 22000（Windows 11）声明模型**。Windows 10 19041 上 pnputil 会报"找不到匹配的模型"，驱动装不上。
+- **文件:行号**：`README.md:117` vs `driver/Source/Main/MicLinkVirtualMic.inx`（UTF-16，转换后第 31–33 行）
+- **问题描述**：README 写"Windows 10 2004（build 19041）或 11"，同一行又写"驱动最低支持 `NT$ARCH$.10.0...22000`"。INF 的 `[Manufacturer]` 为 `%MfgName% = MICLINK, NT$ARCH$.10.0...22000`，即**只对 build ≥ 22000（Windows 11）声明模型**。Windows 10 19041 上 pnputil 会报"找不到匹配的模型"，驱动装不上。
 - **影响**：Windows 10 用户按 README 准备环境，装到一半失败，且排查方向完全错误。
-- **建议修复**：二选一并保持一致 —— 要么把 README 改成"Windows 11 21H2（build 22000）或更高"，要么把 INF 的 TargetOS 放宽为 `NT$ARCH$.10.0...19041`（并同步 `WOMIC.NT$ARCH$.10.0...22000` 段名）。**同时**在 `docs/BUILD.md` 与 `docs/Windows-Manual-Verification.md` 中同步。
+- **建议修复**：二选一并保持一致 —— 要么把 README 改成"Windows 11 21H2（build 22000）或更高"，要么把 INF 的 TargetOS 放宽为 `NT$ARCH$.10.0...19041`（并同步 `MICLINK.NT$ARCH$.10.0...22000` 段名）。**同时**在 `docs/BUILD.md` 与 `docs/Windows-Manual-Verification.md` 中同步。
 
 #### D-03 — `framesPerPacket` 在采集线程被写、在主线程被读，且未加 `@Volatile`
 
@@ -332,20 +332,20 @@ JNI SMOKE TEST OK
 | D-04 | `driver/Source/Utilities/Utilities.vcxproj`（含 `tonegenerator.cpp`）；`driver/Source/Main/adapter.cpp:59,219,259` | 正弦发生器 `ToneGenerator.cpp:147 GenerateSine` 仍被编译进 Utilities 库，注册表开关 `g_DisableToneGenerator` 仍在读，但**已无任何调用点** | 死代码 + 误导性开关；WDK 编译仍要过 `/W4` | 从 `Utilities.vcxproj` 移除 `tonegenerator.cpp` 并删除文件/注册表项（属 driver 改动，请转交工程师） |
 | D-05 | `docs/VERIFICATION.md:48`、`README.md:32` 写"10 万轮 fuzz"；`tests/CMakeLists.txt:9` 与实测输出为 **150000 轮** | 文档数字低于实际（保守方向），但与代码不一致 | 同步为 15 万轮 |
 | D-06 | `driver/Source/Main/adapter.cpp:365` 注释写"PcInitializeAdapterDriver（上面 330 行）"，实际在 **347 行** | 注释漂移，后续维护者按注释找会找错 | 改为 347 行 |
-| D-07 | `docs/ARCHITECTURE.md:735` 表格写 `IOCTL_WOMIC_WRITE_PCM` 的「输出 = 同」，但驱动 `womicctl.cpp:793-908` **不写任何输出缓冲**（只设 `Information = written`） | 契约文档与实现不一致（当前服务端 `injector.cpp:212` 传了 `WOMIC_STATUS` 输出缓冲但从不读取，所以暂不致命） | 把「输出」改为「无（`Information` = 已写帧数）」 |
+| D-07 | `docs/ARCHITECTURE.md:735` 表格写 `IOCTL_MICLINK_WRITE_PCM` 的「输出 = 同」，但驱动 `miclinkctl.cpp:793-908` **不写任何输出缓冲**（只设 `Information = written`） | 契约文档与实现不一致（当前服务端 `injector.cpp:212` 传了 `MICLINK_STATUS` 输出缓冲但从不读取，所以暂不致命） | 把「输出」改为「无（`Information` = 已写帧数）」 |
 | D-08 | `tools/install.ps1:435-436` | 设备枚举超时（`:415-418` 只打 WARN）后仍 `exit 0` | CI / 批处理无法据此判定安装失败 | 枚举失败时 `exit` 非 0（或新增 `-AllowNoDevice` 开关） |
-| D-09 | `driver/Source/Main/WomicVirtualMic.inx` `DriverVer = 02/22/2016, 1.0.0.1` | 沿用 SYSVAD 示例日期，与本项目版本无关 | 驱动版本排序/替换行为可能异常 | 改为真实构建日期 |
+| D-09 | `driver/Source/Main/MicLinkVirtualMic.inx` `DriverVer = 02/22/2016, 1.0.0.1` | 沿用 SYSVAD 示例日期，与本项目版本无关 | 驱动版本排序/替换行为可能异常 | 改为真实构建日期 |
 | D-10 | `android/app/src/main/AndroidManifest.xml` 未声明组播/未获取 `WifiManager.MulticastLock`；`server/src/discovery.cpp:127-138` 会周期性向 `255.255.255.255` 广播公告 | Android 侧靠"发广播 + 收单播应答"工作（`Discovery.kt:94` + `:110`），不受影响；但**被动接收服务端周期公告**在部分 ROM 上收不到 | 被动发现不可靠（主动扫描不受影响） | 若需被动发现，加 `MulticastLock`；否则在文档中说明"仅主动发现" |
 | D-11 | `android/app/build.gradle.kts:22-26` 与 `Prefs.kt:47-57` 与 `Discovery.kt:46` | 5004/5005/48000/20/64000 五处重复定义（BuildConfig 与 Kotlin 常量） | 当前**全部一致**，但无自动化校验，改一处易漏 | 让 Kotlin 侧读 `BuildConfig.DEFAULT_*`，或加一个断言两者相等的自检 |
-| D-12 | `android/app/src/main/java/com/womic/open/MicCaptureService.kt:509` | FEC 触发条件 `(seq and 0x0F) == 0` 写在 `seq++` **之后**，实际周期是"每 17 个 seq 值 / 16 个真实帧"，与 `strings.xml` 的"每 16 帧"表述略有出入 | 仅文案/可读性 | 随 D-01 一并理清 |
+| D-12 | `android/app/src/main/java/com/miclink/open/MicCaptureService.kt:509` | FEC 触发条件 `(seq and 0x0F) == 0` 写在 `seq++` **之后**，实际周期是"每 17 个 seq 值 / 16 个真实帧"，与 `strings.xml` 的"每 16 帧"表述略有出入 | 仅文案/可读性 | 随 D-01 一并理清 |
 
 ---
 
 ## 7. 诚实声明（**以下内容从未被任何人验证过**）
 
 1. **从未编译过 WDK 驱动**。整个 `driver/` 目录在本次及此前所有会话中**只做过静态文本检查**（`check_driver_consistency.py` 122 项）+ 人工 code review。**没有一次 `msbuild`。**
-2. **从未安装或运行过 Windows 驱动**。没有 `pnputil`、没有 `CreateFile("\\.\WomicControl")`、没有一次真正的 `DeviceIoControl`。服务端 IOCTL 那一半（`server/src/injector.cpp` 的 `#ifdef _WIN32` 分支）**一行都没执行过**。
-3. **从未在 Windows 上见过 "Womic Virtual Microphone" 端点**。B5 / B6 / B7 全部未验证。
+2. **从未安装或运行过 Windows 驱动**。没有 `pnputil`、没有 `CreateFile("\\.\MicLinkControl")`、没有一次真正的 `DeviceIoControl`。服务端 IOCTL 那一半（`server/src/injector.cpp` 的 `#ifdef _WIN32` 分支）**一行都没执行过**。
+3. **从未在 Windows 上见过 "MicLink Virtual Microphone" 端点**。B5 / B6 / B7 全部未验证。
 4. **从未跑过 Zoom / OBS / Windows 录音机**。B10 / B11 / B12 全部未验证。**不得对外声称"可被 Zoom 采集到"。**
 5. **四个 PowerShell 脚本从未在 PowerShell 中执行过**（`install.ps1` / `uninstall.ps1` / `verify.ps1` / `make-test-cert.ps1`）。本报告对它们的结论**仅为静态 code review**，不涉及 pnputil / bcdedit / signtool / `Get-AuthenticodeSignature` 的真实行为。
 6. **Android 端从未编译过**。无 Android SDK / NDK / Kotlin 编译器。所有 Kotlin 结论**仅为人工 code review**。A4 校验的是 **Java 逻辑镜像**（`PacketizerProbe.java`），**不是** `Packetizer.kt` 源码本身 —— 若两者被改动不同步，A4 会给出失真绿灯。A5 链接的是**假 libopus**（`opus_stub_impl.cpp`），只证明 JNI 接线正确，**不证明** opus 编码质量、CMake 能编过、真机 ABI 兼容。
@@ -360,18 +360,18 @@ JNI SMOKE TEST OK
 
 ```bash
 # A1 shared/core（7 个用例）
-cd /workspace/womic-open/tests && ./run_tests.sh --jobs 16
+cd /workspace/miclink-open/tests && ./run_tests.sh --jobs 16
 # A2 server（Linux + fake 后端）
-cmake -S /workspace/womic-open/server -B /workspace/womic-open/server/build -G Ninja \
-      -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWOMIC_WITH_FAKE_DEVICE=ON
-cmake --build /workspace/womic-open/server/build --parallel 16
-ctest --test-dir /workspace/womic-open/server/build --output-on-failure
+cmake -S /workspace/miclink-open/server -B /workspace/miclink-open/server/build -G Ninja \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMICLINK_WITH_FAKE_DEVICE=ON
+cmake --build /workspace/miclink-open/server/build --parallel 16
+ctest --test-dir /workspace/miclink-open/server/build --output-on-failure
 # A3 driver 静态一致性（122 项）
-python3 /workspace/womic-open/driver/verify/check_driver_consistency.py
+python3 /workspace/miclink-open/driver/verify/check_driver_consistency.py
 # A4 Android 封包字节布局 vs shared/core（逐字节）
-cd /workspace/womic-open/android/verify/protocol_crosscheck && ./run.sh
+cd /workspace/miclink-open/android/verify/protocol_crosscheck && ./run.sh
 # A5 Android JNI 接线冒烟（假 opus）
-cd /workspace/womic-open/android/verify/jni_smoketest && ./run.sh
+cd /workspace/miclink-open/android/verify/jni_smoketest && ./run.sh
 ```
 
 ```powershell
@@ -428,13 +428,13 @@ powershell -ExecutionPolicy Bypass -File tools\uninstall.ps1
 
 | ID | 严重度 | 复核结论 | 证据（`文件:行号` 或真实命令输出） |
 |---|---|---|---|
-| **D-01** | 🔴 严重 | **PASS** | ① Android：`MicCaptureService.kt:501` `val frameSeq = seq` → `:504` 主包用 `seq = frameSeq` → `:513 seq++`（**只推进一次**）→ `:539` `encoder?.plc(redundant)` → `:542` 冗余包 `seq = frameSeq`（**复用，无 `seq++`**）。② 服务端：`pipeline.cpp:255` `if ((header.flags & WOMIC_FLAG_FEC) != 0u)` → `:256` `if (!jitter_.is_seq_missing(header.seq))` → `:258 return FeedResult::kNotAccepted`（**解码前**拦截）。③ `is_seq_missing` 实现 `jitter_pipeline.cpp:89-101`，与 `womic_jb_put` 的判定（`jitter_buffer.c:483` 迟到 / `:488-489` 重复）**逐条镜像**，语义="这一帧现在 push 进去会不会有用"。④ 反向验证见 R4 |
+| **D-01** | 🔴 严重 | **PASS** | ① Android：`MicCaptureService.kt:501` `val frameSeq = seq` → `:504` 主包用 `seq = frameSeq` → `:513 seq++`（**只推进一次**）→ `:539` `encoder?.plc(redundant)` → `:542` 冗余包 `seq = frameSeq`（**复用，无 `seq++`**）。② 服务端：`pipeline.cpp:255` `if ((header.flags & MICLINK_FLAG_FEC) != 0u)` → `:256` `if (!jitter_.is_seq_missing(header.seq))` → `:258 return FeedResult::kNotAccepted`（**解码前**拦截）。③ `is_seq_missing` 实现 `jitter_pipeline.cpp:89-101`，与 `miclink_jb_put` 的判定（`jitter_buffer.c:483` 迟到 / `:488-489` 重复）**逐条镜像**，语义="这一帧现在 push 进去会不会有用"。④ 反向验证见 R4 |
 | **D-02** | 🟠 中等 | **PASS** | `README.md:117` "**Win11 21H2（build 22000）或更高**（INF 声明值）；源码层面下限为 Win10 2004（build 19041）"；`README.md:133-134` 分列"INF 声明的目标 OS"与"源码实际需要的 OS"；`README.md:139-145` 给出放宽 INF 的具体改法（段名与 TargetOS 必须一起改）；`docs/BUILD.md:13,24-41` 与 `docs/Windows-Manual-Verification.md:16` 三处同步。**两端都写着，没有删掉任何一端** |
 | **D-03** | 🟠 中等 | **PASS** | `MicCaptureService.kt:175-191`：运行期参数 7 个全部 `@Volatile` —— `host:179`、`port:181`、`requestedSampleRate:183`、`frameMs:185`、`bitrateBps:187`、`fecEnabled:189`、**`framesPerPacket:191`**（D-03 原始缺陷字段）。另有 `:102,106,110,141,144,147,152,154` 共 8 个伴生字段也已加。未遗漏同类（`wakeLock:157` / `audioManager:158` 均在 `startCapture`/`stopCapture`/`onCreate` 主线程内读写，无需 volatile） |
 | **D-04** | 🟡 轻微 | **PASS** | 文件已删（`find driver -iname "*Tone*"` 无结果）。残留引用 grep **仅命中注释**：`Utilities.vcxproj:195-197`（说明注释）、`adapter.cpp:218`（注释）、`minwavertstream.h:27-29`（注释）、`minwavertstream.cpp:328,330`（注释）。`minwavertstream.cpp:1392` 的 `ToneGenerator::GenerateSine(...)` 位于 `/*++ ... --*/` 注释块 **1382–1402** 内（已逐行确认），**不是代码**。`grep -rn '#include.*ToneGenerator' driver/` → 仅命中检查脚本自身；`grep -rn m_ToneGenerator driver/` → **0 命码**。`Utilities.vcxproj` 的 `ClCompile` 实际列表 `:192,193,194,205,210` 已无 `tonegenerator.cpp`。新增 4 条 D-04 专属断言：`check_driver_consistency.py:428`（不读 DisableToneGenerator）、`:430`（不定义 g_DisableToneGenerator）、`:434`（不 include ToneGenerator.h）、`:602`（vcxproj 不编译 tonegenerator.cpp）+ `:137-138`（文件删除断言扩展） |
 | **D-05** | 🟡 轻微 | **PASS** | `README.md:32` "**15 万轮** ASan/UBSan 协议 fuzz"；代码真值 `tests/fuzz_protocol.cpp:25` `constexpr int kRounds = 150000`。**文档与代码一致** |
 | **D-06** | 🟡 轻微 | **PASS**（但同注释块另有一处漂移，见 R5-01） | `adapter.cpp:365` "PcInitializeAdapterDriver（上面 **347** 行）"；实际 `grep -n "PcInitializeAdapterDriver(DriverObject" adapter.cpp` → **347** ✅ |
-| **D-07** | 🟡 轻微 | **PASS** | `docs/ARCHITECTURE.md:735` 已改为「无（驱动不写输出缓冲，仅设 `Information` = 已写帧数；见 `womicctl.cpp:793-908`）」，与驱动实际行为一致 |
+| **D-07** | 🟡 轻微 | **PASS** | `docs/ARCHITECTURE.md:735` 已改为「无（驱动不写输出缓冲，仅设 `Information` = 已写帧数；见 `miclinkctl.cpp:793-908`）」，与驱动实际行为一致 |
 | **D-08** | 🟡 轻微 | **PASS** | `tools/install.ps1:29-31` 参数文档、`:64` `[switch]$AllowNoDevice`、`:448-450` 退出码契约注释、`:456-458` 带开关时 `Write-Warn2` + `exit 0`、`:460-461` 未枚举到时 `Write-Fail` + **`exit 7`**、`:463` 正常 `exit 0`。另新增 `:452` `exit 8`（有问题码） |
 | **D-09** | 🟡 轻微 | **PASS** | INF `DriverVer = 10/19/2026, 1.0.0.1`（原 SYSVAD 的 `02/22/2016` 已改）。**编码检查**：`file` → `Windows setup INFormation`；`hexdump -C` 首字节 `ff fe` = **UTF-16LE + BOM** ✅（stampinf 不会失败） |
 | **D-10** | 🟡 轻微 | **工程师未修 → QA 代修** | 复核时 `AndroidManifest.xml` **仍无** `MulticastLock`，README/docs **仍无任何**"仅主动发现"说明（grep `MulticastLock\|仅主动发现` 在 README.md / docs 中 0 命中，只在第 1 轮报告里）。**QA 已在 `README.md` FAQ 补一行**说明"发现走主动扫描，Android 未申请 MulticastLock，被动接收周期公告在部分 ROM 上收不到"。见 R5-02 |
@@ -448,13 +448,13 @@ powershell -ExecutionPolicy Bypass -File tools\uninstall.ps1
 ### A1. `shared/core` 单元测试（7 个）
 
 ```bash
-cd /workspace/womic-open/tests && ./run_tests.sh --jobs 16
+cd /workspace/miclink-open/tests && ./run_tests.sh --jobs 16
 ```
 
 ```
 ==> 运行 ctest
-Internal ctest changing into directory: /workspace/womic-open/tests/build
-Test project /workspace/womic-open/tests/build
+Internal ctest changing into directory: /workspace/miclink-open/tests/build
+Test project /workspace/miclink-open/tests/build
     Start 1: test_ring_buffer
 1/7 Test #1: test_ring_buffer .................   Passed    0.04 sec
     Start 2: test_jitter_buffer
@@ -478,15 +478,15 @@ Total Test time (real) =   3.60 sec
 ### A2. `server` 端到端 ctest（含新增场景 E/F）
 
 ```bash
-cd /workspace/womic-open/server
-rm -rf build && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DWOMIC_WITH_FAKE_DEVICE=ON
+cd /workspace/miclink-open/server
+rm -rf build && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMICLINK_WITH_FAKE_DEVICE=ON
 cmake --build build --parallel 16     # BUILD_EXIT=0
 ctest --test-dir build --output-on-failure
 ```
 
 ```
-Internal ctest changing into directory: /workspace/womic-open/server/build
-Test project /workspace/womic-open/server/build
+Internal ctest changing into directory: /workspace/miclink-open/server/build
+Test project /workspace/miclink-open/server/build
     Start 1: test_pipeline
 1/1 Test #1: test_pipeline ....................   Passed   16.23 sec
 
@@ -526,7 +526,7 @@ Total Test time (real) =  16.23 sec
 ### A3. `driver` 静态一致性自校验
 
 ```bash
-python3 /workspace/womic-open/driver/verify/check_driver_consistency.py
+python3 /workspace/miclink-open/driver/verify/check_driver_consistency.py
 ```
 
 ```
@@ -588,7 +588,7 @@ SABOTAGED_TEST_EXIT=1
 
 ```bash
 g++ -std=c++17 -O1 -o /tmp/fec_probe /tmp/fec_probe.cpp -I shared/core/include -I server/src \
-    server/build/libwomic_server_core.a server/build/libwomic_core.a -lopus -lspeexdsp -lsoxr -lpthread
+    server/build/libmiclink_server_core.a server/build/libmiclink_core.a -lopus -lspeexdsp -lsoxr -lpthread
 /tmp/fec_probe
 ```
 
@@ -658,8 +658,8 @@ PROBE_EXIT=0
 ## R7. 第 2 轮诚实声明（**以下依旧从未被任何人验证过**）
 
 1. **WDK 驱动仍未编译过一次**。整个 `driver/` 目录至今**只做过静态文本检查**（127 项）+ 人工 code review，**没有一次 `msbuild`**。驱动 `.sys` 在它的目标平台上从未成功构建。
-2. **Windows 驱动从未安装/运行过**。无 `pnputil`、无 `CreateFile("\\.\WomicControl")`、无一次真实 `DeviceIoControl`。服务端 `injector.cpp` 的 `#ifdef _WIN32` 分支**一行都没执行过**。
-3. **从未见过 "Womic Virtual Microphone" 端点**；**从未跑过录音机 / OBS / Zoom**。B5–B7、B10–B12 全部未验证。
+2. **Windows 驱动从未安装/运行过**。无 `pnputil`、无 `CreateFile("\\.\MicLinkControl")`、无一次真实 `DeviceIoControl`。服务端 `injector.cpp` 的 `#ifdef _WIN32` 分支**一行都没执行过**。
+3. **从未见过 "MicLink Virtual Microphone" 端点**；**从未跑过录音机 / OBS / Zoom**。B5–B7、B10–B12 全部未验证。
 4. **四个 PowerShell 脚本从未在 PowerShell 中执行过**。D-08 的 `exit 7` 结论**仅为静态 code review**（已核对 `install.ps1:460-461` 源码），**未**验证 pnputil / 枚举超时的真实行为。
 5. **Android 端从未编译过**。D-01 的 Android 侧修复（复用 `frameSeq`）**仅为人工 code review + 逻辑推演**；场景 E 验证的是 `test_pipeline.cpp` 里的**镜像发送端**，**不是** `MicCaptureService.kt` 本身。
 6. **Android 与 Windows 服务端从未联调过**，端到端全链路**从未跑通**。
@@ -673,14 +673,14 @@ PROBE_EXIT=0
 
 | # | 验证项 | 判据 | 状态 |
 |---|---|---|---|
-| B1 | WDK 驱动编译（x64 Debug/Release） | 产出 `womicvirtualmic.sys` / `.inf` / `.cat` | **从未执行**（**最高优先级**：项目从未在目标平台构建成功） |
+| B1 | WDK 驱动编译（x64 Debug/Release） | 产出 `miclinkvirtualmic.sys` / `.inf` / `.cat` | **从未执行**（**最高优先级**：项目从未在目标平台构建成功） |
 | B2 | 测试签名（make-test-cert + signtool） | `Get-AuthenticodeSignature` = Valid | **从未执行** |
 | B3 | 驱动安装（`install.ps1 -Mode TestSign`） | pnputil 成功、设备枚举出现 | **从未执行** |
 | B4 | 测试签名水印 / 重启生效 | `bcdedit` 显示 `testsigning Yes` | **从未执行** |
-| B5 | 端点出现在 Windows 输入设备列表 | 出现 "Womic Virtual Microphone" | **从未执行** |
+| B5 | 端点出现在 Windows 输入设备列表 | 出现 "MicLink Virtual Microphone" | **从未执行** |
 | B6 | `mmsys.cpl` → 录制 状态"准备就绪" | 非"已禁用/未插入" | **从未执行** |
 | B7 | 设备管理器无感叹号 / 无代码 52 | "该设备运转正常" | **从未执行** |
-| B8 | `CreateFile("\\.\WomicControl")` 成功 | `tools\verify.ps1` PASS | **从未执行** |
+| B8 | `CreateFile("\\.\MicLinkControl")` 成功 | `tools\verify.ps1` PASS | **从未执行** |
 | B9 | IOCTL GET_VERSION 返回版本号 | 返回 4 个 uint32 | **从未执行** |
 | B10 | Windows 录音机采集到手机声音 | 回放能听到 | **从未执行** |
 | B11 | OBS 采集到手机声音 | 混音器电平跳动 | **从未执行** |

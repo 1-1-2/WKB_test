@@ -10,7 +10,7 @@
  *   6) 并发 SPSC 压力：2 线程、1000 万帧，断言
  *        丢样本 = 0、输出严格按序、无撕裂
  */
-#include <womic/womic_ring.h>
+#include <miclink/miclink_ring.h>
 
 #include <atomic>
 #include <cstdint>
@@ -28,34 +28,34 @@ constexpr uint32_t kSamplesPerFrame = kFrameBytes / 2u;
 void test_init_and_basic()
 {
     std::vector<int16_t> storage(kCapacity * kSamplesPerFrame, 0);
-    womic_ring r;
+    miclink_ring r;
 
-    int rc = womic_ring_init(&r, storage.data(), kCapacity, kFrameBytes);
-    WOMIC_CHECK_EQ(rc, WOMIC_RING_OK);
-    WOMIC_CHECK_EQ(r.capacity, kCapacity);
-    WOMIC_CHECK_EQ(r.mask, kCapacity - 1u);
-    WOMIC_CHECK_EQ(womic_ring_frame_samples(&r), kSamplesPerFrame);
-    WOMIC_CHECK_EQ(womic_ring_available(&r), 0u);
-    WOMIC_CHECK_EQ(womic_ring_free(&r), kCapacity);
+    int rc = miclink_ring_init(&r, storage.data(), kCapacity, kFrameBytes);
+    MICLINK_CHECK_EQ(rc, MICLINK_RING_OK);
+    MICLINK_CHECK_EQ(r.capacity, kCapacity);
+    MICLINK_CHECK_EQ(r.mask, kCapacity - 1u);
+    MICLINK_CHECK_EQ(miclink_ring_frame_samples(&r), kSamplesPerFrame);
+    MICLINK_CHECK_EQ(miclink_ring_available(&r), 0u);
+    MICLINK_CHECK_EQ(miclink_ring_free(&r), kCapacity);
 
     /* 非 2 的幂 -> 向下取整 */
-    womic_ring r2;
-    rc = womic_ring_init(&r2, storage.data(), 1000u, kFrameBytes);
-    WOMIC_CHECK_EQ(rc, WOMIC_RING_OK);
-    WOMIC_CHECK_EQ(r2.capacity, 512u);
+    miclink_ring r2;
+    rc = miclink_ring_init(&r2, storage.data(), 1000u, kFrameBytes);
+    MICLINK_CHECK_EQ(rc, MICLINK_RING_OK);
+    MICLINK_CHECK_EQ(r2.capacity, 512u);
 
     /* 非法帧字节数 */
-    womic_ring r3;
-    WOMIC_CHECK_EQ(womic_ring_init(&r3, storage.data(), 16u, 0u), WOMIC_RING_ERR_BAD_FRAME);
-    WOMIC_CHECK_EQ(womic_ring_init(&r3, storage.data(), 16u, 3u), WOMIC_RING_ERR_BAD_FRAME);
-    WOMIC_CHECK_EQ(womic_ring_init(nullptr, storage.data(), 16u, 2u), WOMIC_RING_ERR_NULL);
+    miclink_ring r3;
+    MICLINK_CHECK_EQ(miclink_ring_init(&r3, storage.data(), 16u, 0u), MICLINK_RING_ERR_BAD_FRAME);
+    MICLINK_CHECK_EQ(miclink_ring_init(&r3, storage.data(), 16u, 3u), MICLINK_RING_ERR_BAD_FRAME);
+    MICLINK_CHECK_EQ(miclink_ring_init(nullptr, storage.data(), 16u, 2u), MICLINK_RING_ERR_NULL);
 }
 
 void test_write_read_roundtrip()
 {
     std::vector<int16_t> storage(kCapacity * kSamplesPerFrame, 0);
-    womic_ring r;
-    WOMIC_CHECK_EQ(womic_ring_init(&r, storage.data(), kCapacity, kFrameBytes), WOMIC_RING_OK);
+    miclink_ring r;
+    MICLINK_CHECK_EQ(miclink_ring_init(&r, storage.data(), kCapacity, kFrameBytes), MICLINK_RING_OK);
 
     std::vector<int16_t> in(8u * kSamplesPerFrame);
     std::vector<int16_t> out(8u * kSamplesPerFrame, -1);
@@ -64,44 +64,44 @@ void test_write_read_roundtrip()
         in[i * kSamplesPerFrame + 1u] = static_cast<int16_t>(-(1000 + static_cast<int>(i)));
     }
 
-    WOMIC_CHECK_EQ(womic_ring_write(&r, in.data(), 8u), 8u);
-    WOMIC_CHECK_EQ(womic_ring_available(&r), 8u);
-    WOMIC_CHECK_EQ(womic_ring_free(&r), kCapacity - 8u);
-    WOMIC_CHECK_EQ(womic_ring_read(&r, out.data(), 8u), 8u);
+    MICLINK_CHECK_EQ(miclink_ring_write(&r, in.data(), 8u), 8u);
+    MICLINK_CHECK_EQ(miclink_ring_available(&r), 8u);
+    MICLINK_CHECK_EQ(miclink_ring_free(&r), kCapacity - 8u);
+    MICLINK_CHECK_EQ(miclink_ring_read(&r, out.data(), 8u), 8u);
     for (uint32_t i = 0; i < 8u * kSamplesPerFrame; ++i) {
-        WOMIC_CHECK_EQ(out[i], in[i]);
+        MICLINK_CHECK_EQ(out[i], in[i]);
     }
-    WOMIC_CHECK_EQ(womic_ring_available(&r), 0u);
-    WOMIC_CHECK_EQ(r.written_frames, 8u);
-    WOMIC_CHECK_EQ(r.read_frames, 8u);
-    WOMIC_CHECK_EQ(r.dropped_frames, 0u);
+    MICLINK_CHECK_EQ(miclink_ring_available(&r), 0u);
+    MICLINK_CHECK_EQ(r.written_frames, 8u);
+    MICLINK_CHECK_EQ(r.read_frames, 8u);
+    MICLINK_CHECK_EQ(r.dropped_frames, 0u);
 }
 
 void test_empty_and_full()
 {
     std::vector<int16_t> storage(8u * kSamplesPerFrame, 0);
-    womic_ring r;
-    WOMIC_CHECK_EQ(womic_ring_init(&r, storage.data(), 8u, kFrameBytes), WOMIC_RING_OK);
+    miclink_ring r;
+    MICLINK_CHECK_EQ(miclink_ring_init(&r, storage.data(), 8u, kFrameBytes), MICLINK_RING_OK);
 
     /* 空读 */
     std::vector<int16_t> out(4u * kSamplesPerFrame, -1);
-    WOMIC_CHECK_EQ(womic_ring_read(&r, out.data(), 4u), 0u);
+    MICLINK_CHECK_EQ(miclink_ring_read(&r, out.data(), 4u), 0u);
 
     /* 满写：容量 8，请求 16 -> 只能写 8 */
     std::vector<int16_t> in(16u * kSamplesPerFrame, 7);
-    WOMIC_CHECK_EQ(womic_ring_write(&r, in.data(), 16u), 8u);
-    WOMIC_CHECK_EQ(womic_ring_free(&r), 0u);
-    WOMIC_CHECK_EQ(womic_ring_write(&r, in.data(), 1u), 0u); /* 已满，写不进 */
+    MICLINK_CHECK_EQ(miclink_ring_write(&r, in.data(), 16u), 8u);
+    MICLINK_CHECK_EQ(miclink_ring_free(&r), 0u);
+    MICLINK_CHECK_EQ(miclink_ring_write(&r, in.data(), 1u), 0u); /* 已满，写不进 */
 
     /* 读 3 帧后可再写 3 帧 */
-    WOMIC_CHECK_EQ(womic_ring_read(&r, out.data(), 3u), 3u);
-    WOMIC_CHECK_EQ(womic_ring_free(&r), 3u);
-    WOMIC_CHECK_EQ(womic_ring_write(&r, in.data(), 5u), 3u);
-    WOMIC_CHECK_EQ(womic_ring_available(&r), 8u);
+    MICLINK_CHECK_EQ(miclink_ring_read(&r, out.data(), 3u), 3u);
+    MICLINK_CHECK_EQ(miclink_ring_free(&r), 3u);
+    MICLINK_CHECK_EQ(miclink_ring_write(&r, in.data(), 5u), 3u);
+    MICLINK_CHECK_EQ(miclink_ring_available(&r), 8u);
 
     /* 记账：写端显式记录丢帧 */
-    womic_ring_add_dropped(&r, 2u);
-    WOMIC_CHECK_EQ(r.dropped_frames, 2u);
+    miclink_ring_add_dropped(&r, 2u);
+    MICLINK_CHECK_EQ(r.dropped_frames, 2u);
 }
 
 void test_wrap_around_and_frame_alignment()
@@ -109,8 +109,8 @@ void test_wrap_around_and_frame_alignment()
     /* 小容量（4 帧）反复读写，强制每次都跨越缓冲区末尾 */
     constexpr uint32_t cap = 4u;
     std::vector<int16_t> storage(cap * kSamplesPerFrame, 0);
-    womic_ring r;
-    WOMIC_CHECK_EQ(womic_ring_init(&r, storage.data(), cap, kFrameBytes), WOMIC_RING_OK);
+    miclink_ring r;
+    MICLINK_CHECK_EQ(miclink_ring_init(&r, storage.data(), cap, kFrameBytes), MICLINK_RING_OK);
 
     std::vector<int16_t> in(3u * kSamplesPerFrame, 0);
     std::vector<int16_t> out(3u * kSamplesPerFrame, 0);
@@ -121,10 +121,10 @@ void test_wrap_around_and_frame_alignment()
             in[i * kSamplesPerFrame + 0u] = v;
             in[i * kSamplesPerFrame + 1u] = static_cast<int16_t>(-v);
         }
-        WOMIC_CHECK_EQ(womic_ring_write(&r, in.data(), 3u), 3u);
-        WOMIC_CHECK_EQ(womic_ring_read(&r, out.data(), 3u), 3u);
+        MICLINK_CHECK_EQ(miclink_ring_write(&r, in.data(), 3u), 3u);
+        MICLINK_CHECK_EQ(miclink_ring_read(&r, out.data(), 3u), 3u);
         for (uint32_t i = 0u; i < 3u * kSamplesPerFrame; ++i) {
-            WOMIC_CHECK_EQ(out[i], in[i]); /* 帧对齐：高低两半必须成对出现 */
+            MICLINK_CHECK_EQ(out[i], in[i]); /* 帧对齐：高低两半必须成对出现 */
         }
     }
 }
@@ -132,40 +132,40 @@ void test_wrap_around_and_frame_alignment()
 void test_read_fill_silence()
 {
     std::vector<int16_t> storage(kCapacity * kSamplesPerFrame, 0);
-    womic_ring r;
-    WOMIC_CHECK_EQ(womic_ring_init(&r, storage.data(), kCapacity, kFrameBytes), WOMIC_RING_OK);
+    miclink_ring r;
+    MICLINK_CHECK_EQ(miclink_ring_init(&r, storage.data(), kCapacity, kFrameBytes), MICLINK_RING_OK);
 
     std::vector<int16_t> in(3u * kSamplesPerFrame, 1234);
-    WOMIC_CHECK_EQ(womic_ring_write(&r, in.data(), 3u), 3u);
+    MICLINK_CHECK_EQ(miclink_ring_write(&r, in.data(), 3u), 3u);
 
     std::vector<int16_t> out(8u * kSamplesPerFrame, -1);
-    uint32_t real = womic_ring_read_fill_silence(&r, out.data(), 8u);
-    WOMIC_CHECK_EQ(real, 3u); /* 只有 3 帧是真实的 */
+    uint32_t real = miclink_ring_read_fill_silence(&r, out.data(), 8u);
+    MICLINK_CHECK_EQ(real, 3u); /* 只有 3 帧是真实的 */
     for (uint32_t i = 0u; i < 3u * kSamplesPerFrame; ++i) {
-        WOMIC_CHECK_EQ(out[i], 1234);
+        MICLINK_CHECK_EQ(out[i], 1234);
     }
     for (uint32_t i = 3u * kSamplesPerFrame; i < 8u * kSamplesPerFrame; ++i) {
-        WOMIC_CHECK_EQ(out[i], 0); /* 不足部分补零 */
+        MICLINK_CHECK_EQ(out[i], 0); /* 不足部分补零 */
     }
-    WOMIC_CHECK_EQ(womic_ring_available(&r), 0u);
+    MICLINK_CHECK_EQ(miclink_ring_available(&r), 0u);
 }
 
 void test_reset()
 {
     std::vector<int16_t> storage(kCapacity * kSamplesPerFrame, 0);
-    womic_ring r;
-    WOMIC_CHECK_EQ(womic_ring_init(&r, storage.data(), kCapacity, kFrameBytes), WOMIC_RING_OK);
+    miclink_ring r;
+    MICLINK_CHECK_EQ(miclink_ring_init(&r, storage.data(), kCapacity, kFrameBytes), MICLINK_RING_OK);
 
     std::vector<int16_t> in(5u * kSamplesPerFrame, 999);
-    WOMIC_CHECK_EQ(womic_ring_write(&r, in.data(), 5u), 5u);
-    womic_ring_add_dropped(&r, 4u);
+    MICLINK_CHECK_EQ(miclink_ring_write(&r, in.data(), 5u), 5u);
+    miclink_ring_add_dropped(&r, 4u);
 
-    womic_ring_reset(&r);
-    WOMIC_CHECK_EQ(womic_ring_available(&r), 0u);
-    WOMIC_CHECK_EQ(womic_ring_free(&r), kCapacity);
-    WOMIC_CHECK_EQ(r.written_frames, 0u);
-    WOMIC_CHECK_EQ(r.read_frames, 0u);
-    WOMIC_CHECK_EQ(r.dropped_frames, 0u);
+    miclink_ring_reset(&r);
+    MICLINK_CHECK_EQ(miclink_ring_available(&r), 0u);
+    MICLINK_CHECK_EQ(miclink_ring_free(&r), kCapacity);
+    MICLINK_CHECK_EQ(r.written_frames, 0u);
+    MICLINK_CHECK_EQ(r.read_frames, 0u);
+    MICLINK_CHECK_EQ(r.dropped_frames, 0u);
 }
 
 /*
@@ -181,8 +181,8 @@ void test_concurrent_stress()
     constexpr uint32_t kChunk = 64u;
 
     std::vector<int16_t> storage(kCapacity * kSamplesPerFrame, 0);
-    womic_ring ring;
-    WOMIC_CHECK_EQ(womic_ring_init(&ring, storage.data(), kCapacity, kFrameBytes), WOMIC_RING_OK);
+    miclink_ring ring;
+    MICLINK_CHECK_EQ(miclink_ring_init(&ring, storage.data(), kCapacity, kFrameBytes), MICLINK_RING_OK);
 
     std::atomic<uint32_t> producer_errors{0u};
     std::atomic<uint32_t> consumer_errors{0u};
@@ -207,7 +207,7 @@ void test_concurrent_stress()
             for (uint32_t i = 0u; i < want; ++i) {
                 encode(static_cast<uint32_t>(next + i), &buf[i * kSamplesPerFrame]);
             }
-            uint32_t wrote = womic_ring_write(&ring, buf.data(), want);
+            uint32_t wrote = miclink_ring_write(&ring, buf.data(), want);
             if (wrote == 0u) {
                 std::this_thread::yield();
                 continue;
@@ -224,7 +224,7 @@ void test_concurrent_stress()
         std::vector<int16_t> buf(kChunk * kSamplesPerFrame, 0);
         uint64_t expect = 0ull;
         while (expect < kTotalFrames) {
-            uint32_t got = womic_ring_read(&ring, buf.data(), kChunk);
+            uint32_t got = miclink_ring_read(&ring, buf.data(), kChunk);
             if (got == 0u) {
                 std::this_thread::yield();
                 continue;
@@ -248,13 +248,13 @@ void test_concurrent_stress()
     producer.join();
     consumer.join();
 
-    WOMIC_CHECK_EQ(producer_errors.load(), 0u);
-    WOMIC_CHECK_EQ(consumer_errors.load(), 0u); /* 丢样本 = 0、严格按序、无撕裂 */
-    WOMIC_CHECK_EQ(consumed.load(), kTotalFrames);
-    WOMIC_CHECK_EQ(ring.written_frames, kTotalFrames);
-    WOMIC_CHECK_EQ(ring.read_frames, kTotalFrames);
-    WOMIC_CHECK_EQ(ring.dropped_frames, 0u);
-    WOMIC_CHECK_EQ(womic_ring_available(&ring), 0u);
+    MICLINK_CHECK_EQ(producer_errors.load(), 0u);
+    MICLINK_CHECK_EQ(consumer_errors.load(), 0u); /* 丢样本 = 0、严格按序、无撕裂 */
+    MICLINK_CHECK_EQ(consumed.load(), kTotalFrames);
+    MICLINK_CHECK_EQ(ring.written_frames, kTotalFrames);
+    MICLINK_CHECK_EQ(ring.read_frames, kTotalFrames);
+    MICLINK_CHECK_EQ(ring.dropped_frames, 0u);
+    MICLINK_CHECK_EQ(miclink_ring_available(&ring), 0u);
 
     std::printf("      并发 SPSC：%llu 帧，无丢失 / 无乱序 / 无撕裂\n",
                 static_cast<unsigned long long>(kTotalFrames));
@@ -262,7 +262,7 @@ void test_concurrent_stress()
 
 }  // namespace
 
-WOMIC_TEST_MAIN(test_ring_buffer, ({
+MICLINK_TEST_MAIN(test_ring_buffer, ({
     test_init_and_basic();
     test_write_read_roundtrip();
     test_empty_and_full();

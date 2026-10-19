@@ -8,8 +8,8 @@
  * 真正的 Opus 由使用者按 android/README.md 下载到 app/src/main/cpp/opus/。
  * 本文件绝不参与 Android 构建（它不在 app/src/main/cpp 下）。
  */
-#ifndef WOMIC_STUB_OPUS_H
-#define WOMIC_STUB_OPUS_H
+#ifndef MICLINK_STUB_OPUS_H
+#define MICLINK_STUB_OPUS_H
 
 #include <stdint.h>
 
@@ -47,4 +47,4 @@ const char *opus_get_version_string(void);
 }
 #endif
 
-#endif /* WOMIC_STUB_OPUS_H */
+#endif /* MICLINK_STUB_OPUS_H */

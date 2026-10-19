@@ -1,12 +1,12 @@
 <#
 .SYNOPSIS
-    卸载 Womic 虚拟麦克风设备与驱动包，并检查残留。
+    卸载 MicLink 虚拟麦克风设备与驱动包，并检查残留。
 
 .DESCRIPTION
     1) 移除设备实例（pnputil /remove-device）
     2) 删除驱动包（pnputil /delete-driver，必要时 /force）
     3) 残留检查：PnP 设备、驱动服务、注册表服务项、DriverStore 目录、
-       声音设备列表、控制设备 \\.\WomicControl 是否还能打开
+       声音设备列表、控制设备 \\.\MicLinkControl 是否还能打开
 
     输出 PASS / FAIL 清单。
 
@@ -36,9 +36,9 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$script:DriverFriendlyName = 'Womic Virtual Microphone'
-$script:DriverServiceName = 'WomicVirtualMic'
-$script:ControlDevicePath = '\\.\WomicControl'
+$script:DriverFriendlyName = 'MicLink Virtual Microphone'
+$script:DriverServiceName = 'MicLinkVirtualMic'
+$script:ControlDevicePath = '\\.\MicLinkControl'
 
 function Write-Banner {
     param([string]$Text, [string]$Color = 'Yellow')
@@ -61,16 +61,16 @@ function Test-IsAdministrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Get-WomicPnpDevices {
+function Get-MicLinkPnpDevices {
     $all = @(Get-PnpDevice -ErrorAction SilentlyContinue)
     if ($null -eq $all) { return @() }
     return @($all | Where-Object {
             ($_.FriendlyName -like "*$script:DriverFriendlyName*") -or
-            ($_.InstanceId -like '*WomicVirtualMic*')
+            ($_.InstanceId -like '*MicLinkVirtualMic*')
         })
 }
 
-function Get-WomicDriverPackages {
+function Get-MicLinkDriverPackages {
     <#
     .OUTPUTS
     PSCustomObject 数组：PublishedName / OriginalName / Provider / Class
@@ -102,10 +102,10 @@ function Get-WomicDriverPackages {
     if ($null -ne $current) { $packages.Add($current) }
 
     return @($packages | Where-Object {
-            ($_.OriginalName -like '*WomicVirtualMic*') -or
-            ($_.PublishedName -like '*womicvirtualmic*') -or
-            ($_.ProviderName -like '*Womic*') -or
-            ($_.OriginalName -like '*Womic*')
+            ($_.OriginalName -like '*MicLinkVirtualMic*') -or
+            ($_.PublishedName -like '*miclinkvirtualmic*') -or
+            ($_.ProviderName -like '*MicLink*') -or
+            ($_.OriginalName -like '*MicLink*')
         })
 }
 
@@ -113,7 +113,7 @@ function Test-ControlDeviceOpen {
     $source = @'
 using System;
 using System.Runtime.InteropServices;
-public class WomicCtlProbe {
+public class MicLinkCtlProbe {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode,
         IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
@@ -131,17 +131,17 @@ public class WomicCtlProbe {
 }
 '@
     try {
-        if (-not ([System.Management.Automation.PSTypeName]'WomicCtlProbe').Type) {
+        if (-not ([System.Management.Automation.PSTypeName]'MicLinkCtlProbe').Type) {
             Add-Type -TypeDefinition $source -Language CSharp -ErrorAction Stop | Out-Null
         }
-        return [WomicCtlProbe]::TryOpen($script:ControlDevicePath)
+        return [MicLinkCtlProbe]::TryOpen($script:ControlDevicePath)
     } catch {
         return $false
     }
 }
 
 # ---------------------------------------------------------------------------
-Write-Banner '卸载 Womic 虚拟麦克风' 'Yellow'
+Write-Banner '卸载 MicLink 虚拟麦克风' 'Yellow'
 
 Write-Step '检查管理员权限…'
 if (-not (Test-IsAdministrator)) {
@@ -154,9 +154,9 @@ Write-Ok '管理员权限 OK'
 # 1. 移除设备实例
 # ---------------------------------------------------------------------------
 Write-Step '查找设备实例…'
-$devices = Get-WomicPnpDevices
+$devices = Get-MicLinkPnpDevices
 if ($devices.Count -eq 0) {
-    Write-Warn2 '未找到名为 "Womic Virtual Microphone" 的设备实例（可能已被移除或未安装）。'
+    Write-Warn2 '未找到名为 "MicLink Virtual Microphone" 的设备实例（可能已被移除或未安装）。'
 } else {
     foreach ($d in $devices) {
         Write-Host "       移除设备：$($d.InstanceId)" -ForegroundColor Gray
@@ -183,9 +183,9 @@ if ($KeepDriverPackage) {
     Write-Warn2 '-KeepDriverPackage 已指定，保留驱动包在 Driver Store。'
 } else {
     Write-Step '查找驱动包…'
-    $packages = Get-WomicDriverPackages
+    $packages = Get-MicLinkDriverPackages
     if ($packages.Count -eq 0) {
-        Write-Warn2 '未在 Driver Store 中找到 WomicVirtualMic 驱动包。'
+        Write-Warn2 '未在 Driver Store 中找到 MicLinkVirtualMic 驱动包。'
     } else {
         foreach ($p in $packages) {
             Write-Host "       删除驱动包：$($p.PublishedName)（$($p.OriginalName)）" -ForegroundColor Gray
@@ -217,15 +217,15 @@ function Add-Result {
     $results.Add([PSCustomObject]@{ Item = $Name; Result = if ($Passed) { 'PASS' } else { 'FAIL' }; Detail = $Detail })
 }
 
-$leftDevices = Get-WomicPnpDevices
+$leftDevices = Get-MicLinkPnpDevices
 Add-Result 'PnP 设备已移除' ($leftDevices.Count -eq 0) "剩余 $($leftDevices.Count) 个"
 
-$leftPackages = Get-WomicDriverPackages
+$leftPackages = Get-MicLinkDriverPackages
 Add-Result 'Driver Store 驱动包已删除' ($leftPackages.Count -eq 0) "剩余 $($leftPackages.Count) 个"
 
 $service = Get-Service -Name $script:DriverServiceName -ErrorAction SilentlyContinue
 Add-Result '驱动服务已不存在' ($null -eq $service) `
-    $(if ($null -eq $service) { '未找到 WomicVirtualMic 服务' } else { "仍存在：状态=$($service.Status)" })
+    $(if ($null -eq $service) { '未找到 MicLinkVirtualMic 服务' } else { "仍存在：状态=$($service.Status)" })
 
 $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$script:DriverServiceName"
 $regExists = Test-Path -Path $regPath
@@ -233,15 +233,15 @@ Add-Result '注册表服务项已清理' (-not $regExists) `
     $(if ($regExists) { "仍存在：$regPath（通常重启后由系统清理）" } else { '不存在' })
 
 $storeDirs = @(Get-ChildItem -Path "$env:SystemRoot\System32\DriverStore\FileRepository" `
-        -Directory -Filter 'womicvirtualmic*' -ErrorAction SilentlyContinue)
+        -Directory -Filter 'miclinkvirtualmic*' -ErrorAction SilentlyContinue)
 Add-Result 'DriverStore 文件目录已清理' ($storeDirs.Count -eq 0) "剩余 $($storeDirs.Count) 个"
 
 $soundDevices = @(Get-CimInstance -ClassName Win32_SoundDevice -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -like '*Womic*' })
+    Where-Object { $_.Name -like '*MicLink*' })
 Add-Result '声音设备列表无残留' ($soundDevices.Count -eq 0) "剩余 $($soundDevices.Count) 个"
 
 $ctlOpen = Test-ControlDeviceOpen
-Add-Result '控制设备 \\.\WomicControl 已不可打开' (-not $ctlOpen) `
+Add-Result '控制设备 \\.\MicLinkControl 已不可打开' (-not $ctlOpen) `
     $(if ($ctlOpen) { '仍可打开（驱动仍在运行，可能需要重启）' } else { '无法打开（符合预期）' })
 
 Write-Host ''

@@ -5,15 +5,15 @@
  * （同时承载播放时钟）访问，解码与 PLC 都在那一个线程内串行发生，
  * 因此不需要加锁 —— 这是刻意的线程模型设计，不是遗漏。
  */
-#ifndef WOMIC_SERVER_OPUS_DECODER_H
-#define WOMIC_SERVER_OPUS_DECODER_H
+#ifndef MICLINK_SERVER_OPUS_DECODER_H
+#define MICLINK_SERVER_OPUS_DECODER_H
 
 #include <cstdint>
 #include <string>
 
 #include <opus.h>
 
-namespace womic {
+namespace miclink {
 
 class OpusDecoderWrapper {
 public:
@@ -81,6 +81,6 @@ private:
     uint32_t channels_ = 0u;
 };
 
-}  // namespace womic
+}  // namespace miclink
 
-#endif  /* WOMIC_SERVER_OPUS_DECODER_H */
+#endif  /* MICLINK_SERVER_OPUS_DECODER_H */

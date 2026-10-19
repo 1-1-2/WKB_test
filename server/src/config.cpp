@@ -1,7 +1,7 @@
 /*
  * config.cpp -- 配置解析：命令行 + INI/JSON 文件 + 语义校验。
  *
- * 平台中立。校验阶段复用 shared/core 的 womic_check_sample_rate_chain()，
+ * 平台中立。校验阶段复用 shared/core 的 miclink_check_sample_rate_chain()，
  * 保证"驱动绝不做重采样"这条红线在服务端启动前就被拦住。
  */
 #include "config.h"
@@ -15,10 +15,10 @@
 #include <fstream>
 #include <sstream>
 
-#include "womic/womic_jitter.h"
-#include "womic/womic_sample_rate.h"
+#include "miclink/miclink_jitter.h"
+#include "miclink/miclink_sample_rate.h"
 
-namespace womic {
+namespace miclink {
 namespace {
 
 constexpr uint32_t kMinPort = 1u;
@@ -467,7 +467,7 @@ bool apply_flat_json(const std::string &text, ServerConfig *cfg, std::string *er
 
 const char *config_version_string()
 {
-    return "womicserver 1.0.0 (protocol v1, ioctl v1)";
+    return "miclinkserver 1.0.0 (protocol v1, ioctl v1)";
 }
 
 bool config_load_file(const std::string &path, ServerConfig *out, std::string *err)
@@ -652,8 +652,8 @@ bool config_validate(const ServerConfig &cfg, std::string *err)
         (cfg.jitter_min_ms > cfg.jitter_max_ms)) {
         return fail("jitter_min_ms 必须 <= jitter_max_ms 且均大于 0");
     }
-    if (cfg.jitter_max_ms > WOMIC_JB_HARD_MAX_DELAY) {
-        return fail("jitter_max_ms 超过硬上限 " + std::to_string(WOMIC_JB_HARD_MAX_DELAY) + "ms");
+    if (cfg.jitter_max_ms > MICLINK_JB_HARD_MAX_DELAY) {
+        return fail("jitter_max_ms 超过硬上限 " + std::to_string(MICLINK_JB_HARD_MAX_DELAY) + "ms");
     }
     if ((cfg.frame_ms != 10u) && (cfg.frame_ms != 20u) && (cfg.frame_ms != 5u) &&
         (cfg.frame_ms != 40u)) {
@@ -668,13 +668,13 @@ bool config_validate(const ServerConfig &cfg, std::string *err)
 
     /* 采样率链路：端点率必须等于解码率（驱动绝不做重采样）；采集率允许不同。 */
     const char *message = nullptr;
-    womic_sr_result r = womic_check_sample_rate_chain(
+    miclink_sr_result r = miclink_check_sample_rate_chain(
         cfg.expected_opus_rate, cfg.endpoint_sample_rate, cfg.endpoint_sample_rate,
         static_cast<uint16_t>(cfg.expected_channels), &message);
-    if (womic_sr_is_fatal(r)) {
+    if (miclink_sr_is_fatal(r)) {
         return fail(std::string("采样率链路校验失败：") + ((message != nullptr) ? message : "未知原因"));
     }
-    if (r == WOMIC_SR_CAPTURE_MISMATCH) {
+    if (r == MICLINK_SR_CAPTURE_MISMATCH) {
         /* 非致命：服务端会重采样，仅提示。 */
         (void)message;
     }
@@ -757,7 +757,7 @@ std::string config_to_string(const ServerConfig &cfg)
 
 void config_print_usage(const char *program)
 {
-    const char *prog = (program != nullptr) ? program : "womicserver";
+    const char *prog = (program != nullptr) ? program : "miclinkserver";
     std::fprintf(
         stderr,
         "%s\n"
@@ -784,7 +784,7 @@ void config_print_usage(const char *program)
         "\n"
         "设备:\n"
         "  --backend <auto|ioctl|fake> 设备后端（默认 auto：Windows 走 IOCTL，否则 Fake）\n"
-        "  --device-path <path>        控制设备路径（默认 \\\\.\\WomicControl）\n"
+        "  --device-path <path>        控制设备路径（默认 \\\\.\\MicLinkControl）\n"
         "  --ring-capacity-frames <n>  用户态环形缓冲容量（默认 8192）\n"
         "  --max-write-frames <n>      单次 WRITE_PCM 最大帧数（默认 1024）\n"
         "\n"
@@ -812,4 +812,4 @@ void config_print_usage(const char *program)
         config_version_string(), prog);
 }
 
-}  // namespace womic
+}  // namespace miclink

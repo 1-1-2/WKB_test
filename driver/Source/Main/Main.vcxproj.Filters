@@ -27,7 +27,7 @@
         </ClCompile>
     </ItemGroup>
     <ItemGroup>
-        <ResourceCompile Include="WomicVirtualMic.rc">
+        <ResourceCompile Include="MicLinkVirtualMic.rc">
             <Filter>Resource Files</Filter>
         </ResourceCompile>
     </ItemGroup>

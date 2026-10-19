@@ -14,13 +14,13 @@
  */
 public class PacketizerProbe {
 
-    // ---- 必须 Packetizer.kt 与 womic_protocol.h 三方一致 ----
-    static final int MAGIC = 0x574F4D50;       // WOMIC_PROTOCOL_MAGIC 'WOMP'
-    static final int VERSION = 1;              // WOMIC_PROTOCOL_VERSION
-    static final int HEADER_SIZE = 32;         // WOMIC_PACKET_HEADER_SIZE
-    static final int MAX_PAYLOAD = 4096;       // WOMIC_PROTO_MAX_PAYLOAD
-    static final int FLAG_FEC = 0x0001;        // WOMIC_FLAG_FEC
-    static final int FLAG_DTX = 0x0002;        // WOMIC_FLAG_DTX
+    // ---- 必须 Packetizer.kt 与 miclink_protocol.h 三方一致 ----
+    static final int MAGIC = 0x574F4D50;       // MICLINK_PROTOCOL_MAGIC 'WOMP'
+    static final int VERSION = 1;              // MICLINK_PROTOCOL_VERSION
+    static final int HEADER_SIZE = 32;         // MICLINK_PACKET_HEADER_SIZE
+    static final int MAX_PAYLOAD = 4096;       // MICLINK_PROTO_MAX_PAYLOAD
+    static final int FLAG_FEC = 0x0001;        // MICLINK_FLAG_FEC
+    static final int FLAG_DTX = 0x0002;        // MICLINK_FLAG_DTX
 
     static void putBe16(byte[] dst, int off, int v) {
         dst[off] = (byte) (v >>> 8);

@@ -1,10 +1,10 @@
-package com.womic.open;
+package com.miclink.open;
 
 /**
  * OpusEncoder -- OpusEncoder.kt 的 Java 镜像，用于本机 JNI 冒烟测试。
  *
  * 包名 / 类名 / native 方法签名必须与 Kotlin 侧完全一致，
- * 否则 JVM 加载 libwomic_opus.so 时会抛 UnsatisfiedLinkError —— 这正是本测试要抓的问题。
+ * 否则 JVM 加载 libmiclink_opus.so 时会抛 UnsatisfiedLinkError —— 这正是本测试要抓的问题。
  *
  * 注意：链接的是 **假的 libopus**（opus_stub_impl.cpp），
  * 因此本测试验证的是"JNI 接线是否正确"，**不是** Opus 编码质量。
@@ -12,7 +12,7 @@ package com.womic.open;
 public class OpusEncoder {
 
     static {
-        System.loadLibrary("womic_opus");
+        System.loadLibrary("miclink_opus");
     }
 
     private native long nativeCreate(int sampleRate, int channels, int bitrate, int frameSize,
@@ -74,8 +74,8 @@ public class OpusEncoder {
 
         // 3) 非法参数必须有明确错误码，而不是崩溃
         check(enc.nativeEncode(enc.handle, pcm, 960, new byte[4]) == -3,
-                "输出缓冲过小 -> -3 (WOMIC_OPUS_ERR_BUF_SMALL)");
-        check(enc.nativeSetBitrate(enc.handle, 1) == -2, "非法码率 -> -2 (WOMIC_OPUS_ERR_BAD_ARG)");
+                "输出缓冲过小 -> -3 (MICLINK_OPUS_ERR_BUF_SMALL)");
+        check(enc.nativeSetBitrate(enc.handle, 1) == -2, "非法码率 -> -2 (MICLINK_OPUS_ERR_BAD_ARG)");
         check(enc.nativeSetComplexity(enc.handle, 99) == -2, "非法复杂度 -> -2");
         enc.destroy();
 
@@ -88,7 +88,7 @@ public class OpusEncoder {
         OpusEncoder fresh = new OpusEncoder();
         check(fresh.create(48000, 1, 64000, 960, 5, false), "create(48k,960,fec=false) 成功");
         check(fresh.nativePlc(fresh.handle, out) == -5,
-                "无历史帧时 plc -> -5 (WOMIC_OPUS_ERR_NO_REDUNDANT)");
+                "无历史帧时 plc -> -5 (MICLINK_OPUS_ERR_NO_REDUNDANT)");
         fresh.destroy();
 
         // 6) 16 kHz 场景（服务端可重采样消化）

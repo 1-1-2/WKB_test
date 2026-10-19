@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Womic 采集端</string>
+    <string name="app_name">MicLink 采集端</string>
 
     <!-- 通知 -->
-    <string name="notification_title">Womic 麦克风采集进行中</string>
+    <string name="notification_title">MicLink 麦克风采集进行中</string>
     <string name="notification_action_stop">停止</string>
 
     <!-- 状态区 -->

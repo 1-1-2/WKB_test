@@ -9,16 +9,16 @@
 
 #include "log.h"
 
-#if defined(WOMIC_HAVE_SOXR)
+#if defined(MICLINK_HAVE_SOXR)
 #include <soxr.h>
 #endif
-#if defined(WOMIC_HAVE_SPEEXDSP)
+#if defined(MICLINK_HAVE_SPEEXDSP)
 #include <speex/speex_resampler.h>
 #endif
 
-namespace womic {
+namespace miclink {
 
-static constexpr char kWomicLogModule[] = "resamp";
+static constexpr char kMicLinkLogModule[] = "resamp";
 
 Resampler::~Resampler()
 {
@@ -27,7 +27,7 @@ Resampler::~Resampler()
 
 bool Resampler::soxr_available()
 {
-#if defined(WOMIC_HAVE_SOXR)
+#if defined(MICLINK_HAVE_SOXR)
     return true;
 #else
     return false;
@@ -36,7 +36,7 @@ bool Resampler::soxr_available()
 
 bool Resampler::speex_available()
 {
-#if defined(WOMIC_HAVE_SPEEXDSP)
+#if defined(MICLINK_HAVE_SPEEXDSP)
     return true;
 #else
     return false;
@@ -62,14 +62,14 @@ const char *Resampler::backend_name() const
 
 void Resampler::destroy()
 {
-#if defined(WOMIC_HAVE_SOXR)
+#if defined(MICLINK_HAVE_SOXR)
     if (handle_ != nullptr) {
         if (backend_ == Backend::kSoxr) {
             soxr_delete(static_cast<soxr_t>(handle_));
         }
     }
 #endif
-#if defined(WOMIC_HAVE_SPEEXDSP)
+#if defined(MICLINK_HAVE_SPEEXDSP)
     if ((handle_ != nullptr) && (backend_ == Backend::kSpeex)) {
         speex_resampler_destroy(static_cast<SpeexResamplerState *>(handle_));
     }
@@ -130,7 +130,7 @@ bool Resampler::init(Backend preferred, uint32_t in_rate, uint32_t out_rate, uin
             }
             return true;
         }
-        WOMIC_LOGW("soxr 初始化失败，降级到 speex：%s", soxr_err.c_str());
+        MICLINK_LOGW("soxr 初始化失败，降级到 speex：%s", soxr_err.c_str());
     }
     if (try_speex && speex_available()) {
         if (init_speex(quality, &speex_err)) {
@@ -140,7 +140,7 @@ bool Resampler::init(Backend preferred, uint32_t in_rate, uint32_t out_rate, uin
             }
             return true;
         }
-        WOMIC_LOGW("speex 初始化失败：%s", speex_err.c_str());
+        MICLINK_LOGW("speex 初始化失败：%s", speex_err.c_str());
     }
 
     if (err != nullptr) {
@@ -151,7 +151,7 @@ bool Resampler::init(Backend preferred, uint32_t in_rate, uint32_t out_rate, uin
     return false;
 }
 
-#if defined(WOMIC_HAVE_SOXR)
+#if defined(MICLINK_HAVE_SOXR)
 bool Resampler::init_soxr(uint32_t quality, std::string *err)
 {
     /*
@@ -216,7 +216,7 @@ bool Resampler::init_soxr(uint32_t quality, std::string *err)
 }
 #endif
 
-#if defined(WOMIC_HAVE_SPEEXDSP)
+#if defined(MICLINK_HAVE_SPEEXDSP)
 bool Resampler::init_speex(uint32_t quality, std::string *err)
 {
     int err_code = 0;
@@ -291,7 +291,7 @@ int Resampler::process(const int16_t *in, uint32_t in_frames, int16_t *out, uint
         return -2;
     }
 
-#if defined(WOMIC_HAVE_SOXR)
+#if defined(MICLINK_HAVE_SOXR)
     if (backend_ == Backend::kSoxr) {
         size_t idone = 0u;
         size_t odone = 0u;
@@ -300,11 +300,11 @@ int Resampler::process(const int16_t *in, uint32_t in_frames, int16_t *out, uint
                          static_cast<size_t>(in_frames), &idone, static_cast<void *>(out),
                          static_cast<size_t>(out_capacity), &odone);
         if (error != nullptr) {
-            WOMIC_LOGW("soxr_process 失败: %s", soxr_strerror(error));
+            MICLINK_LOGW("soxr_process 失败: %s", soxr_strerror(error));
             return -3;
         }
         if (idone < static_cast<size_t>(in_frames)) {
-            WOMIC_LOGV("soxr 只消费了 %u/%u 输入帧（输出容量 %u）",
+            MICLINK_LOGV("soxr 只消费了 %u/%u 输入帧（输出容量 %u）",
                        static_cast<unsigned>(idone), static_cast<unsigned>(in_frames),
                        static_cast<unsigned>(out_capacity));
         }
@@ -312,7 +312,7 @@ int Resampler::process(const int16_t *in, uint32_t in_frames, int16_t *out, uint
     }
 #endif
 
-#if defined(WOMIC_HAVE_SPEEXDSP)
+#if defined(MICLINK_HAVE_SPEEXDSP)
     if (backend_ == Backend::kSpeex) {
         SpeexResamplerState *st = static_cast<SpeexResamplerState *>(handle_);
         const uint32_t ch = (channels_ == 0u) ? 1u : channels_;
@@ -337,7 +337,7 @@ int Resampler::process(const int16_t *in, uint32_t in_frames, int16_t *out, uint
             int rc = speex_resampler_process_int(st, static_cast<spx_uint32_t>(c), deinterleaved,
                                                  &in_len, resampled, &out_len);
             if (rc != RESAMPLER_ERR_SUCCESS) {
-                WOMIC_LOGW("speex_resampler_process_int 失败(%d)", rc);
+                MICLINK_LOGW("speex_resampler_process_int 失败(%d)", rc);
                 return -3;
             }
             for (uint32_t i = 0u; i < out_len; ++i) {
@@ -363,7 +363,7 @@ int Resampler::flush(int16_t *out, uint32_t out_capacity)
         return -1;
     }
 
-#if defined(WOMIC_HAVE_SOXR)
+#if defined(MICLINK_HAVE_SOXR)
     if (backend_ == Backend::kSoxr) {
         size_t idone = 0u;
         size_t odone = 0u;
@@ -373,14 +373,14 @@ int Resampler::flush(int16_t *out, uint32_t out_capacity)
                                           static_cast<size_t>(out_capacity), &odone);
         flushed_ = true;
         if (error != nullptr) {
-            WOMIC_LOGW("soxr flush 失败: %s", soxr_strerror(error));
+            MICLINK_LOGW("soxr flush 失败: %s", soxr_strerror(error));
             return -3;
         }
         return static_cast<int>(odone);
     }
 #endif
 
-#if defined(WOMIC_HAVE_SPEEXDSP)
+#if defined(MICLINK_HAVE_SPEEXDSP)
     if (backend_ == Backend::kSpeex) {
         /* speex 的输出延迟是有界的（ratio * 滤波阶数），且在整数比下
            输入/输出严格成比例，无需显式 flush；这里返回 0 表示无残留。 */
@@ -394,4 +394,4 @@ int Resampler::flush(int16_t *out, uint32_t out_capacity)
     return 0;
 }
 
-}  // namespace womic
+}  // namespace miclink

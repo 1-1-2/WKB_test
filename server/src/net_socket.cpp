@@ -26,7 +26,7 @@
 #include <unistd.h>
 #endif
 
-namespace womic {
+namespace miclink {
 
 namespace {
 
@@ -444,4 +444,4 @@ std::string net_last_error_string(int err)
 #endif
 }
 
-}  // namespace womic
+}  // namespace miclink

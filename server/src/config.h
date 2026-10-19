@@ -3,14 +3,14 @@
  *
  * 平台中立（不含任何 #ifdef）。默认值即"开箱可用"值。
  */
-#ifndef WOMIC_SERVER_CONFIG_H
-#define WOMIC_SERVER_CONFIG_H
+#ifndef MICLINK_SERVER_CONFIG_H
+#define MICLINK_SERVER_CONFIG_H
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
-namespace womic {
+namespace miclink {
 
 /** 日志级别值，避免 config.h 依赖 log.h 的枚举（两者一一对应）。 */
 enum class LogLevelValue : int {
@@ -55,7 +55,7 @@ struct ServerConfig {
 
     /* ---- 设备 ---- */
     std::string device_backend = "auto";        /* auto | ioctl | fake */
-    std::string device_path = "\\\\.\\WomicControl";  /* 控制设备符号链接 */
+    std::string device_path = "\\\\.\\MicLinkControl";  /* 控制设备符号链接 */
     uint32_t fake_capacity_frames = 32768;      /* Fake 后端环形容量（仅测试用） */
 
     /* ---- DSP ---- */
@@ -75,7 +75,7 @@ struct ServerConfig {
     /* ---- 发现服务（可选 P1） ---- */
     bool discovery_enabled = false;
     uint16_t discovery_port = 5005;
-    std::string discovery_name = "Womic Virtual Microphone";
+    std::string discovery_name = "MicLink Virtual Microphone";
     uint32_t discovery_interval_ms = 0;         /* 0 = 只应答不主动广播 */
 
     /* ---- 运行模式 ---- */
@@ -102,7 +102,7 @@ bool config_load_file(const std::string &path, ServerConfig *out, std::string *e
 
 /**
  * @brief 校验配置语义（端口、采样率链路、抖动区间等）。
- * 内部会调用 shared/core 的 womic_check_sample_rate_chain()，
+ * 内部会调用 shared/core 的 miclink_check_sample_rate_chain()，
  * 端点率 != 解码率时直接拒绝（驱动绝不做重采样）。
  */
 bool config_validate(const ServerConfig &cfg, std::string *err);
@@ -116,6 +116,6 @@ void config_print_usage(const char *program);
 /** 版本号字符串。 */
 const char *config_version_string();
 
-}  // namespace womic
+}  // namespace miclink
 
-#endif  /* WOMIC_SERVER_CONFIG_H */
+#endif  /* MICLINK_SERVER_CONFIG_H */

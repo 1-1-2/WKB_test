@@ -15,7 +15,7 @@ Abstract:
 #define _SIMPLEAUDIOSAMPLE_MINIPAIRS_H_
 
 //
-// WOMIC 只做虚拟麦克风，扬声器端点已被整体移除：
+// MICLINK 只做虚拟麦克风，扬声器端点已被整体移除：
 //   speakertopo.h / speakertoptable.h / speakerwavtable.h / speakertopo.cpp
 // 四个文件已删除，下面的 include 与 SpeakerMiniports 一并删除。
 // （删除前已 grep 全树确认无其它交叉引用。）
@@ -52,7 +52,7 @@ CreateMiniportTopologySimpleAudioSample
 //
 // Capture miniports.
 //
-// （Render miniports 段已整体移除 —— WOMIC 只提供虚拟麦克风。）
+// （Render miniports 段已整体移除 —— MICLINK 只提供虚拟麦克风。）
 //
 
 /*********************************************************************
@@ -103,7 +103,7 @@ ENDPOINT_MINIPAIR MicArray1Miniports =
 //
 // Render miniport pairs.
 //
-// WOMIC 不提供任何渲染端点，因此这里没有数组。
+// MICLINK 不提供任何渲染端点，因此这里没有数组。
 // 注意不能直接写 `static PENDPOINT_MINIPAIR g_RenderEndpoints[] = {};`
 // —— ISO C++ 禁止零长数组，MSVC 会报 C2466（无法分配常量大小为 0 的数组）。
 // 因此直接把计数定义为 0；adapter.cpp 里所有依赖它的代码都用

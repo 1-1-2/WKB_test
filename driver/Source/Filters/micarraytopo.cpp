@@ -372,7 +372,7 @@ Return Value:
             else
             {
                 //
-                // WOMIC：单声道麦克风，阵列元素数 2 -> 1。
+                // MICLINK：单声道麦克风，阵列元素数 2 -> 1。
                 //
                 ULONG cElements = 1;
                 ULONG cbNeeded = FIELD_OFFSET(KSAUDIO_MIC_ARRAY_GEOMETRY, KsMicCoord) +
@@ -594,7 +594,7 @@ Return Value:
                         pMI->Count = 1;
 
                         //
-                        // WOMIC：单声道。原来是 0（阵列麦克风不指定通道掩码），
+                        // MICLINK：单声道。原来是 0（阵列麦克风不指定通道掩码），
                         // 现在明确给出 mono 掩码，便于上层正确识别通道布局。
                         //
                         pDesc->ChannelMapping = KSAUDIO_SPEAKER_MONO;

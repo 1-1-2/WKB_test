@@ -8,9 +8,9 @@
 #include "log.h"
 #include "threads_sync.h"
 
-namespace womic {
+namespace miclink {
 
-static constexpr char kWomicLogModule[] = "discov";
+static constexpr char kMicLinkLogModule[] = "discov";
 
 namespace {
 constexpr uint32_t kBroadcastIpv4 = 0xFFFFFFFFu; /* 255.255.255.255 */
@@ -41,7 +41,7 @@ std::string DiscoveryService::build_reply(uint16_t audio_port, uint32_t rate, ui
             c = '_';
         }
     }
-    std::snprintf(buf, sizeof(buf), "WOMIC-HERE 1 %u %u %u %s", static_cast<unsigned>(audio_port),
+    std::snprintf(buf, sizeof(buf), "MICLINK-HERE 1 %u %u %u %s", static_cast<unsigned>(audio_port),
                   rate, channels, safe_name.c_str());
     return std::string(buf);
 }
@@ -76,7 +76,7 @@ bool DiscoveryService::start(const ServerConfig &cfg, std::string *err)
         }
         return false;
     }
-    WOMIC_LOGI("发现服务已启动：UDP :%u（音频端口 %u，名称 %s）",
+    MICLINK_LOGI("发现服务已启动：UDP :%u（音频端口 %u，名称 %s）",
                static_cast<unsigned>(bound), static_cast<unsigned>(cfg.listen_port),
                cfg.discovery_name.c_str());
     return true;
@@ -107,7 +107,7 @@ void DiscoveryService::run(const std::atomic<bool> &stop)
             int n = udp_recvfrom(sock_, query, sizeof(query), &from, &err);
             if (n > 0) {
                 std::string text(reinterpret_cast<const char *>(query), static_cast<size_t>(n));
-                if (text.compare(0, 14, "WOMIC-DISCOVER") == 0) {
+                if (text.rfind("MICLINK-DISCOVER", 0) == 0) {
                     const std::string reply = build_reply(
                         cfg_.listen_port, cfg_.endpoint_sample_rate, cfg_.endpoint_channels,
                         cfg_.discovery_name);
@@ -115,9 +115,9 @@ void DiscoveryService::run(const std::atomic<bool> &stop)
                     int sent = udp_sendto(sock_, reinterpret_cast<const uint8_t *>(reply.data()),
                                           reply.size(), from, &send_err);
                     if (sent < 0) {
-                        WOMIC_LOGW("发现应答发送失败：%s", send_err.c_str());
+                        MICLINK_LOGW("发现应答发送失败：%s", send_err.c_str());
                     } else {
-                        WOMIC_LOGV("应答发现请求：%s -> %s", from.to_string().c_str(),
+                        MICLINK_LOGV("应答发现请求：%s -> %s", from.to_string().c_str(),
                                    reply.c_str());
                     }
                 }
@@ -140,4 +140,4 @@ void DiscoveryService::run(const std::atomic<bool> &stop)
     }
 }
 
-}  // namespace womic
+}  // namespace miclink

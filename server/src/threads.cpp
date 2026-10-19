@@ -10,7 +10,7 @@
  *   [discovery]（可选）广播应答，THREAD_PRIORITY_BELOW_NORMAL
  *
  * 为什么 rx 最高而不是 inject 最高：
- *   rx 线程承载**播放时钟**（womic_jb_get 以它被调用的时刻推进播放时间轴），
+ *   rx 线程承载**播放时钟**（miclink_jb_get 以它被调用的时刻推进播放时间轴），
  *   它的唤醒抖动会 1:1 变成输出抖动；且它的单次工作量小（收包 + 一帧解码），
  *   给它最高优先级不会饿死别人。inject 线程背后有驱动侧环形缓冲
  *   （GET_CAPS.ringCapacityFrames，通常数百毫秒）做吸震，晚一点点不会断流。
@@ -23,9 +23,9 @@
 
 #include "log.h"
 
-namespace womic {
+namespace miclink {
 
-static constexpr char kWomicLogModule[] = "thread";
+static constexpr char kMicLinkLogModule[] = "thread";
 
 Thread::Thread(std::string name, ThreadPriority prio)
     : name_(std::move(name)), prio_(prio), stop_(false), running_(false)
@@ -49,14 +49,14 @@ bool Thread::start(Body body)
     th_ = std::thread([this, body]() {
         std::string err;
         if (!set_current_thread_priority(prio_, &err) && !err.empty()) {
-            WOMIC_LOGW("线程 %s 设置优先级失败（降级继续）：%s", name_.c_str(), err.c_str());
+            MICLINK_LOGW("线程 %s 设置优先级失败（降级继续）：%s", name_.c_str(), err.c_str());
         }
         set_current_thread_name(name_.c_str());
-        WOMIC_LOGV("线程 %s 启动", name_.c_str());
+        MICLINK_LOGV("线程 %s 启动", name_.c_str());
 
         body(stop_);
 
-        WOMIC_LOGV("线程 %s 退出", name_.c_str());
+        MICLINK_LOGV("线程 %s 退出", name_.c_str());
         running_.store(false, std::memory_order_release);
     });
     return true;
@@ -103,10 +103,10 @@ void Thread::join(uint32_t timeout_ms)
         waited += 5u;
     }
     if (running_.load(std::memory_order_acquire)) {
-        WOMIC_LOGW("线程 %s 在 %ums 内未退出，转入阻塞等待", name_.c_str(),
+        MICLINK_LOGW("线程 %s 在 %ums 内未退出，转入阻塞等待", name_.c_str(),
                    static_cast<unsigned>(timeout_ms));
     }
     th_.join();
 }
 
-}  // namespace womic
+}  // namespace miclink

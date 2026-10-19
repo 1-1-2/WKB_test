@@ -163,7 +163,7 @@ Return Value:
 #pragma code_seg("PAGE")
 static
 BOOLEAN
-WomicFormatMatchesDataRange
+MicLinkFormatMatchesDataRange
 (
     _In_ const KSDATAFORMAT_WAVEFORMATEXTENSIBLE * CandidateFormat,
     _In_ PKSDATARANGE                             ClientDataRange
@@ -303,7 +303,7 @@ Arguments:
                         range. For the mic endpoint we pick from the endpoint's
                         supported-formats table instead of intersecting two
                         ranges literally, because we only support a small fixed
-                        set of formats (see WomicFindMicArrayFormat below).
+                        set of formats (see MicLinkFindMicArrayFormat below).
 
   OutputBufferLength -  Size of the buffer pointed to by the resultant format 
                         parameter. 
@@ -380,13 +380,13 @@ Arguments:
 
         for (formatIndex = 0; formatIndex < formatCount; ++formatIndex)
         {
-            if (WomicFormatMatchesDataRange(&MicArrayPinSupportedDeviceFormats[formatIndex],
+            if (MicLinkFormatMatchesDataRange(&MicArrayPinSupportedDeviceFormats[formatIndex],
                                             ClientDataRange))
             {
                 *resultantFormat       = MicArrayPinSupportedDeviceFormats[formatIndex];
                 *ResultantFormatLength = requiredSize;
 
-                DPF(D_VERBOSE, ("[Womic] DataRangeIntersection -> fmt[%u] %u Hz / %u ch / %u bit",
+                DPF(D_VERBOSE, ("[MicLink] DataRangeIntersection -> fmt[%u] %u Hz / %u ch / %u bit",
                                 formatIndex,
                                 MicArrayPinSupportedDeviceFormats[formatIndex].WaveFormatExt.Format.nSamplesPerSec,
                                 MicArrayPinSupportedDeviceFormats[formatIndex].WaveFormatExt.Format.nChannels,
@@ -396,7 +396,7 @@ Arguments:
             }
         }
 
-        DPF(D_VERBOSE, ("[Womic] DataRangeIntersection: no match"));
+        DPF(D_VERBOSE, ("[MicLink] DataRangeIntersection: no match"));
         return STATUS_NO_MATCH;
     }
     else

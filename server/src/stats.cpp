@@ -5,21 +5,21 @@
 
 #include <cstdio>
 
-#include "womic/womic_ioctl.h"
+#include "miclink/miclink_ioctl.h"
 
-namespace womic {
+namespace miclink {
 namespace {
 
 const char *device_state_name(uint32_t state)
 {
     switch (state) {
-        case WOMIC_STATE_STOPPED:
+        case MICLINK_STATE_STOPPED:
             return "STOPPED";
-        case WOMIC_STATE_STARTED:
+        case MICLINK_STATE_STARTED:
             return "STARTED";
-        case WOMIC_STATE_RUNNING:
+        case MICLINK_STATE_RUNNING:
             return "RUNNING";
-        case WOMIC_STATE_ERROR:
+        case MICLINK_STATE_ERROR:
             return "ERROR";
         default:
             return "UNKNOWN";
@@ -144,4 +144,4 @@ std::string Stats::format_summary() const
     return std::string(buf);
 }
 
-}  // namespace womic
+}  // namespace miclink

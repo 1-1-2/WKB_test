@@ -5,22 +5,22 @@
  * （DeviceIoControl WRITE_PCM）解耦。产出侧受网络抖动影响是突发式的，
  * 注入侧受内核端点时钟影响是匀速的，中间必须有一个 SPSC 缓冲吸收两者差异。
  *
- * 底层直接用 shared/core 的 womic_ring（与内核驱动同一份实现、同一份语义），
+ * 底层直接用 shared/core 的 miclink_ring（与内核驱动同一份实现、同一份语义），
  * 因此用户态与内核态的"帧"定义完全一致，且天然满足：
  *   - 单生产者 / 单消费者 -> 无锁（只有 acquire/release 屏障），
  *     注入线程永远不会因为产出线程持锁而阻塞（无优先级反转）；
  *   - 容量必须是 2 的幂，用 mask 取模，无除法。
  */
-#ifndef WOMIC_SERVER_RING_ADAPTER_H
-#define WOMIC_SERVER_RING_ADAPTER_H
+#ifndef MICLINK_SERVER_RING_ADAPTER_H
+#define MICLINK_SERVER_RING_ADAPTER_H
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
-#include "womic/womic_ring.h"
+#include "miclink/miclink_ring.h"
 
-namespace womic {
+namespace miclink {
 
 class PcmRing {
 public:
@@ -61,11 +61,11 @@ public:
     void reset();
 
 private:
-    womic_ring ring_ {};
+    miclink_ring ring_ {};
     std::vector<int16_t> storage_;
     bool ready_ = false;
 };
 
-}  // namespace womic
+}  // namespace miclink
 
-#endif  /* WOMIC_SERVER_RING_ADAPTER_H */
+#endif  /* MICLINK_SERVER_RING_ADAPTER_H */
