@@ -74,6 +74,37 @@ jobs:
           Write-Host "MSBuild: $msb"
           "path=$msb" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
+
+      - name: Bridge WDK km headers into registered SDK dir
+        shell: pwsh
+        run: |
+          $kits = "C:\Program Files (x86)\Windows Kits\10"
+          $reg  = "10.0.26100.0"
+          Write-Host "已注册 SDK 版本 (可选目标):"
+          Get-ChildItem "$kits\Include" -Directory -EA SilentlyContinue | Select-Object -ExpandProperty Name
+          # 找出 WDK 实际安装的那个版本目录（含 km 子目录）
+          $wdkVer = $null
+          foreach ($d in Get-ChildItem "$kits\Include" -Directory -EA SilentlyContinue) {
+            if (Test-Path (Join-Path $d.FullName "km")) { $wdkVer = $d.Name; break }
+          }
+          Write-Host "检测到 WDK 版本目录: $wdkVer"
+          if (-not $wdkVer) { Write-Host "!! 未发现含 km 的 Include 版本目录"; exit 1 }
+          $srcInc = Join-Path "$kits\Include" "$wdkVer\km"
+          $dstInc = Join-Path "$kits\Include" "$reg\km"
+          if ($srcInc -ne $dstInc) {
+            Write-Host "桥接头文件: $srcInc -> $dstInc"
+            Copy-Item $srcInc $dstInc -Recurse -Force -EA SilentlyContinue
+          }
+          $srcLib = Join-Path "$kits\Lib" "$wdkVer\km"
+          $dstLib = Join-Path "$kits\Lib" "$reg\km"
+          if ((Test-Path $srcLib) -and ($srcLib -ne $dstLib)) {
+            Write-Host "桥接库文件: $srcLib -> $dstLib"
+            Copy-Item $srcLib $dstLib -Recurse -Force -EA SilentlyContinue
+          }
+          Write-Host "--- 桥接后验证 portcls.h 是否可在目标 SDK 下找到 ---"
+          if (Test-Path "$dstInc\portcls.h") { Write-Host "OK: $dstInc\portcls.h" }
+          else { Write-Host "!! 仍未找到 portcls.h" }
+
       - name: Sanity check - list driver tree
         shell: pwsh
         run: |
@@ -98,7 +129,7 @@ jobs:
           Write-Host "编译: $sln"
           & $msb $sln `
               "/p:Configuration=$cfg" "/p:Platform=x64" `
-              "/p:WindowsTargetPlatformVersion=10.0.28000.0" `
+              "/p:WindowsTargetPlatformVersion=10.0.26100.0" `
               "/m" "/nologo" "/v:minimal" `
               "/flp:logfile=build.log;verbosity=detailed"
           $code = $LASTEXITCODE
