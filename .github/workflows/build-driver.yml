@@ -58,9 +58,21 @@ jobs:
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $msb = & $vswhere -latest -requires Microsoft.Component.MSBuild `
-                   -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
-          if (-not $msb) { Write-Host "!! MSBuild 未找到"; exit 1 }
+          $all = & $vswhere -latest -requires Microsoft.Component.MSBuild `
+                   -find MSBuild\**\Bin\MSBuild.exe
+          # WDK 28000 的 NuGet 包没有 x86 版 InfVerif.dll（包内
+          # c\build\<ver>\bin\ 只有 x64/ 与 arm64/）。32 位 MSBuild 下
+          # DPVerifierTask 选 x86 导入名，必然以
+          # "Unable to load DLL 'x86\InfVerif.dll'" 失败（CI run 39335899536 实证）。
+          # vswhere 返回的第一个结果（MSBuild\Current\Bin\MSBuild.exe）就是 32 位，
+          # 必须显式选 amd64 下的 64 位 MSBuild。
+          $msb = $all | Where-Object { $_ -like "*\amd64\MSBuild.exe" } | Select-Object -First 1
+          if (-not $msb) {
+            Write-Host "!! 未找到 64 位 MSBuild（MSBuild\Current\Bin\amd64\MSBuild.exe）"
+            Write-Host "!! WDK 28000 NuGet 构建要求 64 位 MSBuild，拒绝回退 32 位"
+            $all | ForEach-Object { Write-Host "  candidate: $_" }
+            exit 1
+          }
           Write-Host "MSBuild: $msb"
           "path=$msb" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
@@ -81,6 +93,19 @@ jobs:
             exit 99
           }
           Write-Host "编译: $sln ($cfg|x64)"
+          # DPVerifierTask（InfVerif）以相对路径 "x64\InfVerif.dll" P/Invoke，
+          # LoadLibrary 会搜索 PATH；把 WDK 包内 build\bin 目录注入进程 PATH，
+          # 使包自带 x64\infverif.dll 可被找到（纯 NuGet 环境无机器 WDK 兜底）。
+          # 注意：只动进程环境变量 PATH，不设 MSBuild 的 ExecutablePath 属性
+          # （那个属性提前赋值会堵掉 VC 工具目录填充，导致 CL.exe TRK0005）。
+          $wdkBin = Join-Path $env:GITHUB_WORKSPACE "driver\packages\Microsoft.Windows.WDK.x64.10.0.28000.2526\c\build\10.0.28000.0\bin"
+          if (Test-Path $wdkBin) {
+            $env:PATH = "$wdkBin;$env:PATH"
+            Write-Host "PATH 已注入 WDK 工具目录: $wdkBin"
+          } else {
+            Write-Host "::error::WDK 包 bin 目录缺失: $wdkBin"
+            exit 1
+          }
           & $msb $sln `
             -t:rebuild `
             -nologo -v:minimal -m `

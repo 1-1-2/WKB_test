@@ -56,4 +56,37 @@
     <Inf2CatToolPath Condition="'$(Inf2CatToolPath)' == ''">@(_MicLinkWdkInf2Cat->'%(RootDir)%(Directory)')</Inf2CatToolPath>
     <DrvCatToolPath Condition="'$(DrvCatToolPath)' == ''">@(_MicLinkWdkDrvCat->'%(RootDir)%(Directory)')</DrvCatToolPath>
   </PropertyGroup>
+
+  <!--
+    MSVC 14.4x+ 与 WDK km CRT 的已知头文件冲突（微软已知缺陷，
+    https://developercommunity.visualstudio.com/t/Freestanding-C-facilities-broken-in-KM/10877920 ，
+    自 VS2022 14.43 起未修复；CI run 39335899536 实证于 MSVC 14.51 + WDK 28000）：
+
+    1. 跨平台共享头（shared/core/include/miclink/*.h）使用 <stdint.h>；
+       WDK km/crt 无 stdint.h/vcruntime.h，必解析到 MSVC 版；
+    2. _VCRUNTIME_DISABLED_WARNINGS 只由 MSVC vadefs.h 定义，但 WDK
+       km\crt\vadefs.h（内核版）按 include 顺序将其遮蔽 →
+       vcruntime.h(61)/stdint.h(16) 的 pragma 报 C4083；
+    3. MSVC vcruntime.h 与 WDK km\crt\crtdefs.h 重复定义
+       _CRT_STRINGIZE/_CRT_WIDE/__CRTDECL → C4005。
+
+    Main.vcxproj 为 /W4 /WX，上述 warning 被升级为 C2220 error。
+    处置：屏蔽 C4083/C4005（社区标准做法；Utilities 带同样 warning 已成功
+    产出 .lib，实证无害）。
+
+    实现要点（本地 dotnet msbuild 实测）：必须用 ItemDefinitionGroup 而非
+    PropertyGroup——WDK 的 WindowsDriver.Common.props 同样以
+    ItemDefinitionGroup 设置 <DisableSpecificWarnings>4603;4627;4986;4987;
+    %(DisableSpecificWarnings)</DisableSpecificWarnings>，项元数据按导入顺序
+    组合；Directory.Build.props 求值早于 WDK props，此处定义的值会成为基底，
+    被 WDK 默认值与 vcxproj 的单文件元数据（如 miclinkctl.cpp 的
+    "4100;...;4996;%(DisableSpecificWarnings)"）依次追加，实测最终
+    adapter.cpp = "4603;4627;4986;4987;4083;4005"、
+    miclinkctl.cpp = "4100;...;4996;4603;4627;4986;4987;4083;4005"，组合正确。
+  -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <DisableSpecificWarnings>4083;4005</DisableSpecificWarnings>
+    </ClCompile>
+  </ItemDefinitionGroup>
 </Project>

@@ -136,9 +136,21 @@ def check_files(report: Report) -> None:
         # 缺陷 D-04：正弦发生器已无任何调用点，文件一并删除
         os.path.join(UTIL, "ToneGenerator.cpp"),
         os.path.join(UTIL, "ToneGenerator.h"),
+        # WOMIC -> MICLINK 重命名残留（CI run 39335899536：双 INF 盖章）
+        os.path.join(MAIN, "WomicVirtualMic.inx"),
+        os.path.join(MAIN, "WomicVirtualMic.rc"),
+        os.path.join(MAIN, "womicctl.cpp"),
+        os.path.join(INC, "womic", "womic_ctl.h"),
+        os.path.join(UTIL, "womic_shared_ring.c"),
+        os.path.join(UTIL, "womic_shared_dsp.c"),
+        os.path.join(DRIVER_DIR, "WomicVirtualMic.sln"),
+        os.path.join(SHARED_INC, "womic", "womic_ioctl.h"),
+        os.path.join(SHARED_INC, "womic", "womic_ring.h"),
+        os.path.join(REPO_DIR, "server", "womicserver.ini.example"),
+        os.path.join(REPO_DIR, "android", "app", "src", "main", "java", "com", "womic", "open", "MainActivity.kt"),
     ]
     leftover = [p for p in gone if exists(p)]
-    report.check("speaker 文件、旧 INF/RC/SLN 与 ToneGenerator 已删除",
+    report.check("speaker 文件、旧 INF/RC/SLN、ToneGenerator 与 Womic 残留已删除",
                  not leftover, "残留: %s" % leftover)
 
 
