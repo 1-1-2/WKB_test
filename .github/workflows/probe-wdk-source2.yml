@@ -1,0 +1,44 @@
+name: probe-wdk-source2
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: Find installable WDK (non-interactive)
+    runs-on: windows-latest
+    steps:
+      - name: Search WDK packages without prompts
+        shell: pwsh
+        run: |
+          Write-Host "===== [1] winget (source=winget, non-interactive) ====="
+          winget search --id Microsoft.WindowsDriverKit --source winget --disable-interactivity --accept-source-agreements 2>&1 | Out-String
+          Write-Host "----- keyword: WDK -----"
+          winget search WDK --source winget --disable-interactivity --accept-source-agreements 2>&1 | Select-Object -First 25 | Out-String
+
+          Write-Host ""
+          Write-Host "===== [2] choco ====="
+          choco search wdk --limit-output 2>&1 | Out-String
+          choco search driverkit --limit-output 2>&1 | Out-String
+
+          Write-Host ""
+          Write-Host "===== [3] 检查 VS installer 是否支持 WDK 组件 ====="
+          $vsdir = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Write-Host "VS: $vsdir"
+
+          Write-Host ""
+          Write-Host "===== [4] 已知 WDK/EWDK 下载可达性 (HEAD 请求) ====="
+          $urls = @(
+            "https://go.microsoft.com/fwlink/?linkid=2243391",
+            "https://learn.microsoft.com/en-us/windows-hardware/drivers/other-wdk-downloads"
+          )
+          foreach ($u in $urls) {
+            try {
+              $r = Invoke-WebRequest -Uri $u -Method Head -MaximumRedirection 5 -TimeoutSec 30 -UseBasicParsing
+              Write-Host "OK  $u -> status=$($r.StatusCode) final=$($r.BaseResponse.ResponseUri)"
+            } catch { Write-Host "ERR $u -> $($_.Exception.Message)" }
+          }
+
+          Write-Host ""
+          Write-Host "===== [5] 磁盘余量 ====="
+          Get-PSDrive C | Select-Object @{n='FreeGB';e={[Math]::Round($_.Free/1GB,1)}} | Format-List
