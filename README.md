@@ -56,8 +56,14 @@ Zoom / 腾讯会议 / OBS / 系统录音机都能直接选中它，**不需要�
 * `server` 的 Linux 构建 + `test_pipeline` 端到端 64 项断言（含 FEC 回归场景 E/F）；
 * `driver` 的 127 项**静态一致性**自校验（不是编译，不是运行）；
 * Android 端协议实现的**字节级一致性**（`android/core` 纯 JVM 模块 23 个单元测试：帧编解码 / UDP 三种头格式 / 会话状态机 / 5s 心跳看门狗）；
-* Android 端 Kotlin 编译（AGP 9.1.0 + Gradle 9.3.1 + JDK 21，`:app:compileDebugKotlin` 通过）；
-* Android 端 JNI 接线冒烟测试（**链接假 Opus**，只验符号名/签名/错误码：`android/verify/jni_smoketest`）。
+* Android 端**完整构建**（AGP 9.1.0 + Gradle 9.3.1 + NDK 28.2.13676358 + CMake 3.22.1，真实 libopus 经 CMake/NDK 编译并打进 APK，产物含 `lib/x86_64/libmiclink_opus.so`）；
+* Android 端 JNI 接线冒烟测试（**链接假 Opus**，只验符号名/签名/错误码：`android/verify/jni_smoketest`）；
+* 联调脚本 `android/verify/integration/pc_client.py` 的自测 9 项 + 对 mock 服务端的 15 项闭环干跑（含 5s 看门狗断链与重连）。
+
+协议闭环的**设备侧**验证由 CI 的 `integration-test` 作业承担（ubuntu + KVM 模拟器 +
+真 APK，调试音模式免麦克风），断言清单见
+[`android/verify/integration/README.md`](android/verify/integration/README.md)；该作业的
+结果以 GitHub Actions 运行记录为准，不在上表"沙箱内已跑过"之列。
 
 下面这些**从未在本仓库里跑过**，需要你在 Windows 真机上完成：
 
@@ -219,6 +225,7 @@ Android 采集端现实现 WO Mic 协议，规格见
 | [`docs/devops/windows-interactive-debug.md`](docs/devops/windows-interactive-debug.md) | Windows 交互式联调 CI（WarpBuilds/action-debugger，tmate 的 Windows 可用分支） |
 | [`server/build_windows.md`](server/build_windows.md) | 服务端 Windows 构建 |
 | [`android/README.md`](android/README.md) | Android 采集端构建、opus 源码准备、WO Mic 协议实现要点 |
+| [`android/verify/integration/README.md`](android/verify/integration/README.md) | 协议闭环联调脚本 `pc_client.py`（C01–C15 断言、两种 UDP 回收拓扑、CI 作业） |
 | [`tools/README.md`](tools/README.md) | 安装/卸载/签名/验证脚本用法与自审清单 |
 
 ## 许可证

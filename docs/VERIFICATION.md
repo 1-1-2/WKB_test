@@ -149,20 +149,72 @@ JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 /opt/gradle-9.3.1/bin/gradle :core:
 **边界（诚实声明）**：证明 `:core` 模块的字节级行为与官方反编译证据一一对应；
 **不证明** Android 装配层（AudioRecord / 前台服务 / Compose UI）与真机表现，属 B 类。
 
-### A4b. Android 端 Kotlin 编译验证（AGP 9.1.0 + Gradle 9.3.1 + JDK 21）
+### A4b. Android 端完整构建（AGP 9.1.0 + Gradle 9.3.1 + NDK 28.2.13676358 + CMake 3.22.1）
 
-命令：
+命令（沙箱内已装 Android SDK `/opt/android-sdk`、CMake 3.22.1、NDK 28.2.13676358，
+并按 `android/README.md` 放入 opus 1.5.2 源码）：
 
 ```bash
 cd /workspace/miclink-open/android
-JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 /opt/gradle-9.3.1/bin/gradle :app:compileDebugKotlin --no-daemon
+JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 /opt/gradle-9.3.1/bin/gradle \
+    :app:assembleDebug -PwomicAbis=x86_64 --no-daemon
 ```
 
-实测结果：`BUILD SUCCESSFUL`（2026-10-20，零警告）。
+实测结果（2026-10-20）：`BUILD SUCCESSFUL in 2m`，产物
+`app/build/outputs/apk/debug/app-debug.apk`（19,188,916 B）内含：
 
-**边界（诚实声明）**：只验证 Kotlin 源码可编译（Compose UI / 服务装配 /
-Activity Result API 权限迁移均通过）；**未**执行 `assembleDebug`
-（需本机 Android SDK + NDK + opus 源码），属 B 类。
+```
+lib/x86_64/libmiclink_opus.so      656,440 B   ← 静态链接的 libopus + JNI 层
+lib/x86_64/libandroidx.graphics.path.so
+```
+
+`-PwomicAbis=x86_64` 生效：APK 内只有 `lib/x86_64/`，没有 arm64/armeabi。
+
+CMake 配置期有一条无害告警（`Could not get package version`，opus 的
+`OpusPackageVersion.cmake` 在无 `.git` 的源码快照里取不到 git describe），不影响产物。
+
+**边界（诚实声明）**：证明 Kotlin + Compose + 服务装配 + **真实 libopus 经 CMake/NDK
+编译并打包**这条链路在 Linux 上成立；**不证明** app 在 Android 运行时能加载该 .so、
+不证明 `AudioRecord`/前台服务/协议会话在设备上的实际行为 —— 那是 A4c 与
+`integration-test` 作业（模拟器闭环）负责的部分。
+
+### A4c. 联调脚本本地实证（`android/verify/integration/pc_client.py`）
+
+`pc_client.py` 扮演官方 Windows 客户端 6.3 的 PC 角色（TCP client + UDP receiver），
+CI 中由 `integration-test` 作业在模拟器上跑真实 app；沙箱内可先做两层离线验证：
+
+**(1) 自测**（合成字节流，不连设备）：
+
+```bash
+cd android/verify/integration && python3 pc_client.py --self-test
+```
+
+实测：**9/9 通过**（2026-10-20）。覆盖格式 C 单包解析、粘联/逐字节喂入的流式重分帧、
+seq 跳号与 ts 回退检测、u16 seq 回绕、magic 错位重同步、官方 hello 与 config 帧字节。
+
+**(2) 对 mock server 干跑**（本机 Python 模拟 app 侧 `WomicSession` 行为，
+含 5s 看门狗与格式 C 发包）：
+
+```bash
+python3 pc_client.py --skip-adb-setup --udp-tap host \
+    --control-host 127.0.0.1 --control-port 18125 --media-port 5004 --hold-seconds 6
+```
+
+实测：**15/15 通过**（2026-10-20），含 C01 连接、C02 hello 应答 `65 00000002 00 04`、
+C03/C04 config+start 应答、C05 首包格式 C、C06 seq 连续（301 包 0 跳号）、C07 ts 单调、
+C08 音量=5、C09 结构全合法、C10 速率 50.2 包/秒、C11 心跳跨 5s 看门狗、
+C12 stop 应答为 type 102 怪癖、C13 停止后静默、**C14 末次心跳后 5.7s 看门狗断链**、
+C15 断链后重连完整会话全绿。
+
+**边界（诚实声明）**：证明脚本自身逻辑与断言正确、时序（心跳/看门狗/静默）行为符合
+规格 v1；**不证明**真实 app 的行为 —— 后者由 CI 的 `integration-test` 作业
+（ubuntu + KVM 模拟器 + 真 app）覆盖，脚本里的 `C01`~`C15` 编号与该作业日志一一对应。
+
+> 两个坑值得记下（本地实测踩到）：
+> 1. mock 的看门狗循环不能用"推流已停止"事件做循环条件 —— 真实 app 的看门狗是
+>    **连接级**的，STOP 之后仍继续计时（否则 C14 永远等不到断链）。
+> 2. `pkill -f <pattern>` 在 shell 里会匹配到自己的命令行：写脚本时这条模式串
+>    不能与启动命令出现在同一行，否则会把自己杀掉。
 
 ### A5. Android 端 JNI 接线冒烟测试（**链接假 libopus**）
 
@@ -259,6 +311,12 @@ cd /workspace/miclink-open/android && JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd
 
 # A5: Android JNI 接线冒烟测试（链接 stub opus）
 cd /workspace/miclink-open/android/verify/jni_smoketest && ./run.sh
+
+# A4b: Android 完整构建（含真实 libopus 原生编译，单 ABI 约 2 分钟）
+cd /workspace/miclink-open/android && JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 /opt/gradle-9.3.1/bin/gradle :app:assembleDebug -PwomicAbis=x86_64 --no-daemon
+
+# A4c: 联调脚本自测 + 对 mock server 干跑（不需要设备）
+cd /workspace/miclink-open/android/verify/integration && python3 pc_client.py --self-test
 ```
 
 ```powershell

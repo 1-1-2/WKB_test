@@ -170,6 +170,21 @@ cd android
 **调试音模式**：无麦克风权限 / 无麦克风设备时，打开设置里的"调试音"开关，
 app 发送 440Hz 正弦波而不采集麦克风，用于验证链路连通性。
 
+### 4.5 自动化联调（无需真机 / 无需 PC 客户端）
+
+仓库自带一个**协议对端脚本**，扮演官方 Windows 客户端 6.3 的 PC 角色，把整条链路
+（TCP 控制 + UDP 媒体）跑成 15 条断言：
+
+```bash
+python3 android/verify/integration/pc_client.py --self-test   # 不连设备，先自检脚本本身
+python3 android/verify/integration/pc_client.py --hold-seconds 12
+```
+
+CI 上由 `.github/workflows/android.yml` 的 `integration-test` 作业自动执行：
+ubuntu-latest + KVM 模拟器（android-34 x86_64）→ 装 APK → `am start-service` 以
+**调试音模式**启动服务 → 跑脚本 → 失败时上传 logcat / dumpsys / emulator 日志。
+断言清单与拓扑说明见 [`verify/integration/README.md`](verify/integration/README.md)。
+
 ---
 
 ## 5. 关键实现点
@@ -211,7 +226,7 @@ RMS+Peak 双电平条）→ 主操作按钮 → 设置区（控制端口 / 推�
 
 ## 7. 可脱离 Android 环境运行的验证
 
-沙箱没有 Android SDK/NDK 时，下面两项仍可运行，**均已在 Linux 沙箱真实通过**：
+沙箱没有 Android SDK/NDK 时，下面几项仍可运行，**均已在 Linux 沙箱真实通过**：
 
 ```bash
 # 1) 协议字节级一致性：帧编解码 / UDP 三格式 / 会话状态机 / 看门狗（23 个用例）
@@ -219,19 +234,30 @@ cd android && ./gradlew :core:test --configure-on-demand
 
 # 2) JNI 接线：JNI 符号名/签名/错误码是否与 Kotlin 声明一致（g++ + JDK，链接假 opus）
 cd android/verify/jni_smoketest && ./run.sh
+
+# 3) 联调脚本自测：格式 C 解析 / 流式重分帧 / seq·ts·音量断言（9 项，不需要设备）
+cd android/verify/integration && python3 pc_client.py --self-test
 ```
 
 | 校验 | 能证明 | **不能**证明 |
 |---|---|---|
 | `:core:test` | 帧字节序、长度自洽、消息分派、看门狗语义与官方证据一致 | Kotlin 源码能编译；真机 ABI 兼容 |
 | `jni_smoketest` | JNI 函数名/签名与 Kotlin 匹配、错误码契约成立 | Opus 编码质量（链接的是**假 Opus**）；CMake 能编过 |
+| `pc_client.py --self-test` | 脚本自身的解析/断言/时序逻辑正确 | 真实 app 的行为（需 `integration-test` 作业或真机） |
 
-细节与维护约定见 `android/verify/README.md`。
+细节与维护约定见 `android/verify/README.md`；联调脚本见
+`android/verify/integration/README.md`。
 
 ## 8. 验证状态（务必先看 `docs/VERIFICATION.md`）
 
 Kotlin 与 JNI 代码经过 `:core:test` 字节级验证 + 人工自审（import、生命周期、权限、
-前台服务通知渠道、协议偏移），**APK 组装与真机联调属于"待验证"项**：
-本仓库 Linux 沙箱可完成 Kotlin 编译验证（AGP 9.1.0 + Gradle 9.3.1 + JDK 21），
-但 `assembleDebug` 需要本机 Android SDK/NDK 与 opus 源码，真机表现需按
-[`docs/Windows-Manual-Verification.md`](../docs/Windows-Manual-Verification.md) 逐条确认。
+前台服务通知渠道、协议偏移）。**APK 组装已在 Linux 沙箱真实跑通**
+（AGP 9.1.0 + Gradle 9.3.1 + NDK 28.2.13676358 + CMake 3.22.1 + opus 1.5.2，
+产物含 `lib/x86_64/libmiclink_opus.so`），协议闭环由 CI 的 `integration-test`
+作业在模拟器上验证。
+
+**仍未验证**：真实手机（arm64）上的 `AudioRecord` 采集质量、前台服务在 ROM 上的
+保活表现、以及与本项目 `pc_client.py` 之外的真实官方客户端（WOMicClient.exe 6.3）
+对接 —— 后者需按
+[`docs/Windows-Manual-Verification.md`](../docs/Windows-Manual-Verification.md) 在
+Windows 真机确认。
