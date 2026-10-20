@@ -174,6 +174,8 @@ cd /workspace/miclink-open/android/verify/jni_smoketest && ./run.sh
 | # | 验证项 | 为什么沙箱做不了 | 在哪里做 | 判据 |
 |---|---|---|---|---|
 | B1 | **WDK 驱动编译**（x64，Debug/Release） | 无 WDK、无 MSVC | VS 2022 + WDK，见 `docs/BUILD.md` | 生成 `miclinkvirtualmic.sys` / `MicLinkVirtualMic.inf` / `.cat` |
+
+> **状态更新（2026-10-20）**：B1 的 **x64 Release** 已由 GitHub Actions CI 闭环（run 39345304679 全绿，InfVerif/Inf2Cat/测试签名全链路，artifact `miclink-driver-x64`）。判据中的 Debug 配置尚未覆盖。详见 `docs/TEST_REPORT.md` R4 章。**B2–B17 维持从未执行。**
 | B2 | **测试签名**（`make-test-cert.ps1` + `signtool`） | 无 Windows、无 signtool | 管理员 PowerShell | `Get-AuthenticodeSignature` = Valid |
 | B3 | **驱动安装**（`install.ps1 -Mode TestSign`） | 无 Windows | 管理员 PowerShell | pnputil 成功，设备枚举出现 |
 | B4 | **测试签名水印 / 重启生效** | 无 Windows | 真机 | `bcdedit` 显示 `testsigning Yes`、桌面出现“测试模式”水印 |

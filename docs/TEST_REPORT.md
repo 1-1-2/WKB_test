@@ -692,3 +692,52 @@ PROBE_EXIT=0
 | B17 | 24 小时稳定性 | 端点始终存在、无爆音 | **从未执行** |
 | **B18** | **FEC 关闭/开启两种模式下长时间音频音高、时延正常** | 无周期性叠音、无 6.25% 加速 | **从未执行**（D-01 已修，但真机效果未验） |
 | **B19**（本轮新增） | **`Prefs.verifyDefaults()` 在真机启动时不抛异常**（D-11 的 `require()` 是运行时断言） | App 冷启动不崩溃 | **从未执行** |
+
+---
+
+# R4. CI 构建绿记录（2026-10-20）
+
+> 本章为**增量记录**：不改写上文任何历史结论。上文第 1 节判定与第 7 节诚实声明中
+> "从未编译过 WDK 驱动" 的表述，以本章记录的时点为界——此前为真，此后 B1 已闭环。
+
+## R4.1 事实
+
+GitHub Actions **run 39345304679**（commit `bd7851a`，workflow `build-driver`，
+runner `windows-2025-vs2026` = Windows Server 2025 + Visual Studio 18 Enterprise）
+**8 个步骤全部 success，run 结论 success**。这是本项目历史上
+**第一次真实、完整、通过验证的 WDK 驱动编译**。
+
+## R4.2 全链路证据（均取自该 run 的 job 日志与 artifact）
+
+| 环节 | 证据 |
+|---|---|
+| MSBuild 位宽 | 选中 `...\VS\18\Enterprise\MSBuild\Current\Bin\amd64\MSBuild.exe`，PE 机器类型 **0x8664（x64）**；`Bin\MSBuild.exe`（32 位）被 PE 验证显式排除 |
+| StampInf 盖章 | `Stamping x64\Release\MicLinkVirtualMic.inf`，`DriverVer=10/20/2026,0.6.4.569`，**全日志仅此一次**（双 INF 盖章缺陷已根治） |
+| C++ 编译 | 全日志 `error XXXX` 计数 **0**；Main.vcxproj `/W4 /WX` 全过（C4083/C4005 经 ItemDefinitionGroup 屏蔽，WDK 默认警告值与单文件豁免经本地 MSBuild 求值实测保留） |
+| InfVerif（DPVerifier） | 真实运行，`Signability test complete.`（x64\InfVerif.dll 经进程 PATH 注入解析成功） |
+| Inf2Cat / 测试签名 | `Catalog generation complete.`；`Successfully signed: ...miclinkvirtualmic.cat`（WDK 默认测试证书） |
+| 产物（artifact `miclink-driver-x64`，646,546 B） | `MicLinkVirtualMic.sys` 74,056 B（本地解包 PE 校验 **0x8664 = x64**）、`MicLinkVirtualMic.inf` 11,402 B（UTF-16，`Signature=$Windows NT$`，`Class=MEDIA`，`ClassGUID={4d36e96c-e325-11ce-bfc1-08002be10318}`，`CatalogFile=MicLinkVirtualMic.cat`）、`miclinkvirtualmic.cat` 3,758 B、4 个 PDB |
+
+## R4.3 对第 3 节 B 类清单的状态更新
+
+| # | 验证项 | 新状态 |
+|---|---|---|
+| B1 | WDK 驱动编译（x64 Release） | ✅ **已通过（CI）**：`.sys`/`.inf`/`.cat` 三产物齐备，InfVerif + Inf2Cat + 测试签名全链路真实执行。Debug 配置未在 CI 覆盖 |
+| B2 | 测试签名 | 🟡 **部分推进**：签名动作已在 CI 真实执行（日志实证），但判据 `Get-AuthenticodeSignature` = Valid 仍需 Windows 真机 PowerShell 验证，**维持未执行** |
+| B3–B19 | 其余全部 | ❌ **维持"从未执行"**，本章不提供任何新证据 |
+
+## R4.4 诚实边界（本章未能证明的事）
+
+1. 编译通过 ≠ **驱动功能正确**。`adapter.cpp` 等 7 个 Main 源文件的**运行时行为**（WaveRT DMA、ring buffer、IOCTL 路径）从未在任何机器上执行过。
+2. CI 的测试签名是 **WDK 默认测试证书**，仅供本机 testsigning 模式验证；**不可用于生产分发**。
+3. **没有任何应用（Zoom/OBS/录音机/微信）采集过该虚拟麦克风**。上文第 1 节"不得对外声称可被 Zoom 采集"的约束**完全继续有效**。
+4. **综合判定不变**：仍是 **CONDITIONAL（有条件放行）**。B1 闭环只移除了放行条件中的编译一环；真机安装（B3）、端点枚举（B5–B7）、端到端音频（B10–B12/B14）一项未动。**对外发布仍为 NO-GO。**
+
+## R4.5 复跑方式
+
+```powershell
+# 任意人可复现本记录：推送触发或手动 dispatch
+# Actions → build-driver → Run workflow（configuration 选 Release）
+# 绿判据：8/8 步骤 success；artifact miclink-driver-x64 内含
+# MicLinkVirtualMic.sys（PE 0x8664）/ MicLinkVirtualMic.inf / miclinkvirtualmic.cat
+```
