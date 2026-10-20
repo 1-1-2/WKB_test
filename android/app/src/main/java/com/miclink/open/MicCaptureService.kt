@@ -23,34 +23,55 @@ import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import dev.womic.wifistream.protocol.Codec
+import dev.womic.wifistream.protocol.Defaults
+import dev.womic.wifistream.protocol.FrameDecoder
+import dev.womic.wifistream.protocol.SampleRates
+import dev.womic.wifistream.protocol.SessionEvent
+import dev.womic.wifistream.protocol.SessionHost
+import dev.womic.wifistream.protocol.WomicSession
+import java.io.IOException
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.NetworkInterface
+import java.net.ServerSocket
+import java.net.Socket
+import java.net.SocketException
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.PI
+import kotlin.math.sin
 
 /**
- * MicCaptureService -- 采集 + 编码 + 发送的前台服务。
+ * MicCaptureService -- WO Mic 手机侧前台服务：TCP 控制服务器 + UDP 媒体发送。
  *
- * 链路：
+ * 链路（角色与官方 app 完全一致，规格 v1 第 1 节）：
  * ```
- * AudioRecord(VOICE_COMMUNICATION, PCM16 单声道)
- *   -> 采集线程阻塞 read(frameSize)
- *   -> OpusEncoder.encode()
- *   -> Packetizer.pack(32B 头, 大端)
- *   -> UdpSender.send()  ---- UDP ---->  Windows miclinkserver
+ * PC 客户端 (WOMicClient.exe)
+ *   |                                     ^
+ *   |-- TCP 8125: hello/config/start/stop/heartbeat --> 本服务（WomicSession）
+ *   |                                     |
+ *   +-- UDP <mediaPort> <---- Opus 格式 C 包 <------+
+ *         AudioRecord -> OpusEncoder -> WomicPacketizer -> UdpSender
  * ```
  *
  * 关键设计：
- *   1) **前台服务**：保证息屏/切后台后仍持续采集，通知栏提供"停止"入口；
- *   2) **PARTIAL_WAKE_LOCK**：防止息屏后 CPU 休眠导致采集线程被拖慢；
- *   3) **独立采集线程 + 阻塞 read**（不用轮询）：read() 在数据不足时阻塞，CPU 占用最低；
- *   4) **硬件热切换 / ERROR_DEAD_OBJECT 自愈**：AudioDeviceCallback 置位后重建 AudioRecord，
- *      read 返回 ERROR_DEAD_OBJECT 时按退避重建，超过阈值才报错停止；
- *   5) **音频源用 VOICE_COMMUNICATION**：复用平台既有的 AEC/NS 通路。
- *      **本项目明确不自研 AEC/NS**（见 PRD 非目标），选 MIC 会绕过这套处理。
+ *   1) **手机是 TCP server**：启动后监听控制端口（默认 8125），等待 PC 客户端连入；
+ *      连接由 [serverLoop] accept，[connectionLoop] 驱动 [WomicSession] 状态机，
+ *      PC 发 START 才真正开始采集推流（对应 [SessionEvent.StartStreaming]）；
+ *   2) **心跳看门狗**：镜像官方 V1/k.java —— 每 5s 检查一次，期间无 105 心跳即断开；
+ *   3) **前台服务 + PARTIAL_WAKE_LOCK**：息屏/切后台后仍持续推流；
+ *   4) **硬件热切换自愈**：AudioDeviceCallback 置位后重建 AudioRecord；
+ *   5) **调试音模式**：无麦克风权限（或只想验证链路）时发送 440Hz 正弦，
+ *      不创建 AudioRecord；
+ *   6) **协议层全部委托 :core**（帧编解码/会话/包化均有字节级单元测试），
+ *      本类只负责 Android 侧的线程与资源编排。
  */
 class MicCaptureService : Service() {
 
     /** UI 侧状态回调（全部在主线程执行）。 */
     interface CaptureStatusListener {
-        /** 状态变化：state 见 [STATE_IDLE] / [STATE_STARTING] / [STATE_RUNNING] / [STATE_STOPPED] / [STATE_ERROR]。 */
+        /** 状态变化：state 见 [STATE_IDLE] / [STATE_LISTENING] / [STATE_CONNECTED] / [STATE_STREAMING] 等。 */
         fun onState(state: String, detail: String)
 
         /** 电平更新（约 20 次/秒）。 */
@@ -66,20 +87,19 @@ class MicCaptureService : Service() {
         const val ACTION_START = "com.miclink.open.action.START"
         const val ACTION_STOP = "com.miclink.open.action.STOP"
 
-        const val EXTRA_HOST = "extra.host"
-        const val EXTRA_PORT = "extra.port"
-        const val EXTRA_SAMPLE_RATE = "extra.sample_rate"
-        const val EXTRA_FRAME_MS = "extra.frame_ms"
-        const val EXTRA_BITRATE = "extra.bitrate"
-        const val EXTRA_FEC = "extra.fec"
+        const val EXTRA_CONTROL_PORT = "extra.control_port"
+        const val EXTRA_VOLUME = "extra.volume"
+        const val EXTRA_DEBUG_TONE = "extra.debug_tone"
 
-        const val CHANNEL_ID = "miclink_capture"
-        const val CHANNEL_NAME = "麦克风采集"
+        const val CHANNEL_ID = "womic_capture"
+        const val CHANNEL_NAME = "WO Mic 麦克风采集"
         const val NOTIFICATION_ID = 0x574F4D50.toInt()
 
         const val STATE_IDLE = "空闲"
         const val STATE_STARTING = "启动中"
-        const val STATE_RUNNING = "采集中"
+        const val STATE_LISTENING = "等待连接"
+        const val STATE_CONNECTED = "已连接"
+        const val STATE_STREAMING = "推流中"
         const val STATE_STOPPED = "已停止"
         const val STATE_ERROR = "错误"
 
@@ -98,15 +118,30 @@ class MicCaptureService : Service() {
         /** 通知文案刷新节流（ms）。 */
         private const val NOTIFY_INTERVAL_MS = 2000L
 
-        /** 服务是否正在采集（供 UI 在 onResume 时同步按钮状态）。 */
+        /** 心跳看门狗周期：与 BuildConfig.HEARTBEAT_TIMEOUT_MS（官方 V1/k.java 5s）一致。 */
+        private val WATCHDOG_PERIOD_MS: Long = BuildConfig.HEARTBEAT_TIMEOUT_MS
+
+        /** 调试音频率（Hz）与幅度（满量程比例）。 */
+        private const val TONE_FREQUENCY_HZ = 440.0
+        private const val TONE_AMPLITUDE = 0.3
+
+        /** Opus 编码复杂度（0..10）：官方 app 用默认 5。 */
+        private const val OPUS_COMPLEXITY = 5
+
+        /** 服务是否已启动（server socket 已打开），供 UI 同步按钮状态。 */
         @Volatile
         var isRunning: Boolean = false
+
+        /** 是否正在推流（PC 已发 START 且采集线程在跑）。 */
+        @Volatile
+        var isStreaming: Boolean = false
+            private set
 
         /** 最后一次错误原因（UI 显示用）。 */
         @Volatile
         var lastError: String? = null
 
-        /** 最近一次采集的实际采样率（可能与请求值不同，见 [MicCaptureService.openRecorder]）。 */
+        /** 最近一次采集的实际采样率（平台可能调整请求值，见 [MicCaptureService.openRecorder]）。 */
         @Volatile
         var actualSampleRate: Int = 0
 
@@ -116,12 +151,9 @@ class MicCaptureService : Service() {
         fun buildStartIntent(context: Context, config: Prefs.Config): Intent {
             return Intent(context, MicCaptureService::class.java).apply {
                 action = ACTION_START
-                putExtra(EXTRA_HOST, config.host)
-                putExtra(EXTRA_PORT, config.port)
-                putExtra(EXTRA_SAMPLE_RATE, config.sampleRate)
-                putExtra(EXTRA_FRAME_MS, config.frameMs)
-                putExtra(EXTRA_BITRATE, config.bitrateBps)
-                putExtra(EXTRA_FEC, config.fecEnabled)
+                putExtra(EXTRA_CONTROL_PORT, config.controlPort)
+                putExtra(EXTRA_VOLUME, config.volume)
+                putExtra(EXTRA_DEBUG_TONE, config.debugTone)
             }
         }
 
@@ -129,6 +161,13 @@ class MicCaptureService : Service() {
             return Intent(context, MicCaptureService::class.java).apply {
                 action = ACTION_STOP
             }
+        }
+
+        /** 协议编码器 id -> 可读名。 */
+        fun codecName(codec: Int): String = when (codec) {
+            Codec.OPUS -> "Opus"
+            Codec.SPEEX -> "Speex"
+            else -> "codec#$codec"
         }
     }
 
@@ -141,14 +180,31 @@ class MicCaptureService : Service() {
     @Volatile
     private var listener: CaptureStatusListener? = null
 
+    // TCP server（服务级）
+    @Volatile
+    private var serverThread: Thread? = null
+    @Volatile
+    private var serverSocket: ServerSocket? = null
+
+    // 单连接（连接级）
+    @Volatile
+    private var connThread: Thread? = null
+    @Volatile
+    private var watchdogThread: Thread? = null
+    @Volatile
+    private var connection: Socket? = null
+
+    /** 当前连接的会话状态机（:core 纯逻辑，无 socket）。 */
+    @Volatile
+    private var session: WomicSession? = null
+
+    // 采集线程与媒体链路（推流级）
     @Volatile
     private var captureThread: Thread? = null
-
     @Volatile
     private var recorder: AudioRecord? = null
 
-    // encoder / udpSender 由主线程（startCapture / stopCapture）创建与释放，
-    // 由采集线程读写，必须 volatile 才能保证跨线程可见性。
+    // encoder / udpSender 由主线程创建释放、采集线程读写，必须 volatile。
     @Volatile
     private var encoder: OpusEncoder? = null
     @Volatile
@@ -170,26 +226,25 @@ class MicCaptureService : Service() {
         }
     }
 
-    // 运行期参数
-    //
-    // 全部 @Volatile：主线程 onStartCommand 写，采集线程读（部分还由采集线程在
-    // 设备重建路径里写，见 openRecorder 对 framesPerPacket 的改写）。
-    // 没有 volatile 时采集线程可能一直读到旧帧长，导致 AudioRecord.read 的参数
-    // 与编码器帧长不一致（缺陷 D-03）。
+    // 运行期参数（主线程写、采集线程读）
     @Volatile
-    private var host: String = ""
+    private var controlPort: Int = Prefs.DEFAULT_CONTROL_PORT
     @Volatile
-    private var port: Int = Prefs.DEFAULT_PORT
+    private var volume: Int = Prefs.DEFAULT_VOLUME
     @Volatile
-    private var requestedSampleRate: Int = Prefs.DEFAULT_SAMPLE_RATE
+    private var debugTone: Boolean = false
+
+    /** 协商出的编码参数（CONFIG 消息，主线程写、UI 线程读）。 */
     @Volatile
-    private var frameMs: Int = Prefs.DEFAULT_FRAME_MS
+    private var negotiatedSampleRate: Int = 0
     @Volatile
-    private var bitrateBps: Int = Prefs.DEFAULT_BITRATE_BPS
+    private var negotiatedMediaPort: Int = -1
     @Volatile
-    private var fecEnabled: Boolean = true
+    private var peerDescription: String = ""
+
+    /** 每帧样本数（由协商采样率 + 20ms 推导）。 */
     @Volatile
-    private var framesPerPacket: Int = OpusEncoder.framesOf(Prefs.DEFAULT_SAMPLE_RATE, Prefs.DEFAULT_FRAME_MS)
+    private var framesPerPacket: Int = 0
 
     // ------------------------------------------------------------------
     // 生命周期
@@ -208,13 +263,9 @@ class MicCaptureService : Service() {
                 return START_NOT_STICKY
             }
             ACTION_START -> {
-                host = intent.getStringExtra(EXTRA_HOST) ?: ""
-                port = intent.getIntExtra(EXTRA_PORT, Prefs.DEFAULT_PORT)
-                requestedSampleRate = intent.getIntExtra(EXTRA_SAMPLE_RATE, Prefs.DEFAULT_SAMPLE_RATE)
-                frameMs = intent.getIntExtra(EXTRA_FRAME_MS, Prefs.DEFAULT_FRAME_MS)
-                bitrateBps = intent.getIntExtra(EXTRA_BITRATE, Prefs.DEFAULT_BITRATE_BPS)
-                fecEnabled = intent.getBooleanExtra(EXTRA_FEC, true)
-                framesPerPacket = OpusEncoder.framesOf(requestedSampleRate, frameMs)
+                controlPort = intent.getIntExtra(EXTRA_CONTROL_PORT, Prefs.DEFAULT_CONTROL_PORT)
+                volume = intent.getIntExtra(EXTRA_VOLUME, Prefs.DEFAULT_VOLUME)
+                debugTone = intent.getBooleanExtra(EXTRA_DEBUG_TONE, false)
                 startCapture()
             }
             else -> {
@@ -255,20 +306,51 @@ class MicCaptureService : Service() {
 
     /** 当前状态的中文描述。 */
     fun currentState(): String = when {
-        isRunning -> STATE_RUNNING
+        isStreaming -> STATE_STREAMING
+        isConnected() -> STATE_CONNECTED
+        isRunning -> STATE_LISTENING
         lastError != null -> STATE_ERROR
         else -> STATE_IDLE
     }
 
-    /** 当前状态细节（目标地址 + 统计）。 */
+    /** 当前状态细节（监听地址 / 对端 / 协商参数 + 统计）。 */
     fun currentDetail(): String {
         val sender = udpSender
-        return if (isRunning && sender != null) {
-            "${sender.targetDescription()} · ${sender.packetsSent} 包 · ${actualSampleRate}Hz"
-        } else {
-            lastError ?: "未采集"
+        return when {
+            isStreaming && sender != null ->
+                "→ ${peerDescription} · ${sender.targetDescription()} · " +
+                    "${sender.packetsSent} 包 · ${actualSampleRate}Hz"
+            isConnected() ->
+                "PC 已连接：${peerDescription} · 协商 ${codecName(negotiatedCodec())}/" +
+                    "${negotiatedSampleRate}Hz/媒体端口 ${negotiatedMediaPort}"
+            isRunning ->
+                "等待 PC 连接 · 手机 ${listeningAddress()}"
+            else ->
+                lastError ?: "未启动"
         }
     }
+
+    /** 本机监听地址（IPv4:port），UI 提示用户在 PC 客户端填写。 */
+    fun listeningAddress(): String {
+        val port = if (controlPort in 1..65535) controlPort else Prefs.DEFAULT_CONTROL_PORT
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces()
+            for (ni in Collections.list(interfaces)) {
+                if (!ni.isUp || ni.isLoopback) continue
+                for (addr in Collections.list(ni.inetAddresses)) {
+                    if (!addr.isLoopbackAddress && addr is Inet4Address && addr.isSiteLocalAddress) {
+                        return "${addr.hostAddress}:$port"
+                    }
+                }
+            }
+        } catch (e: SocketException) {
+            android.util.Log.w(TAG, "枚举网卡失败：${e.message}")
+        }
+        return "0.0.0.0:$port"
+    }
+
+    /** 当前协商的编码器 id（未连接时为 Opus 默认）。 */
+    fun negotiatedCodec(): Int = session?.codec ?: Codec.OPUS
 
     /** 已发送包数（UI 轮询显示）。 */
     fun packetsSent(): Long = udpSender?.packetsSent ?: 0L
@@ -279,120 +361,78 @@ class MicCaptureService : Service() {
     /** 连续发送失败次数。 */
     fun sendFailures(): Int = udpSender?.failureStreak ?: 0
 
+    private fun isConnected(): Boolean = connection?.isClosed == false && connection != null
+
     // ------------------------------------------------------------------
-    // 采集主流程
+    // 服务启停
     // ------------------------------------------------------------------
 
-    /** 启动采集：先上前台通知，再初始化各组件，最后起线程。 */
+    /** 启动服务：上前台通知，打开 TCP 控制端口，进入监听。 */
     private fun startCapture() {
         if (isRunning) {
             return
         }
         lastError = null
         actualSampleRate = 0
-        notifyState(STATE_STARTING, "正在初始化…")
+        notifyState(STATE_STARTING, "正在启动…")
 
-        // 1) 前台通知：必须在 startForegroundService 之后尽快调用，否则会被系统判为 ANR/崩溃
-        try {
-            ServiceCompat.startForeground(
-                this,
-                NOTIFICATION_ID,
-                buildNotification("正在启动…"),
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                } else {
-                    0
-                }
-            )
-        } catch (t: Throwable) {
-            fail("无法启动前台服务：${t.message}（请确认已授予通知权限）")
+        // 1) 前台通知：必须在 startForegroundService 之后尽快调用，否则会被系统判为 ANR/崩溃。
+        //    Android 14+ 对 microphone 型前台服务有权限校验；拿不到麦克风权限时逐级降级，
+        //    保证"调试音模式"在无麦克风权限的设备上仍可用。
+        if (!startForegroundSafely()) {
+            fail("无法启动前台服务（请确认已授予通知权限）")
             return
         }
 
         // 2) 参数校验
-        if (host.isBlank()) {
-            fail("目标 IP 为空")
+        if (controlPort !in 1..65535) {
+            fail("控制端口非法：$controlPort")
             return
         }
-        if (port !in 1..65535) {
-            fail("端口非法：$port")
-            return
-        }
-        if (requestedSampleRate !in Prefs.SUPPORTED_RATES) {
-            fail("采样率不支持：$requestedSampleRate（服务端支持 16000/44100/48000，Opus 只能用 16000/48000）")
-            return
-        }
-        if (!OpusEncoder.isValidFrame(requestedSampleRate, framesPerPacket)) {
-            fail("帧长不是 2.5ms 整数倍：${requestedSampleRate}Hz / ${frameMs}ms")
+        if (volume !in 0..255) {
+            fail("音量非法：$volume（协议字段为 u8）")
             return
         }
 
         // 3) WakeLock：息屏后保持 CPU 运行
         acquireWakeLock()
 
-        // 4) UDP
-        val sender = UdpSender()
-        if (!sender.open(host, port)) {
-            fail(sender.lastError ?: "UDP 打开失败")
+        // 4) TCP 控制服务器（手机 = server，等 PC 客户端连入）
+        val sock = try {
+            ServerSocket(controlPort)
+        } catch (e: IOException) {
+            fail("无法监听控制端口 $controlPort：${e.message}（可能被其他应用占用）")
             releaseWakeLock()
             return
         }
-        udpSender = sender
+        serverSocket = sock
 
-        // 5) Opus 编码器
-        val enc = OpusEncoder()
-        if (!enc.create(
-                sampleRate = requestedSampleRate,
-                channels = 1,
-                bitrateBps = bitrateBps,
-                frameSize = framesPerPacket,
-                complexity = 5,
-                inbandFec = fecEnabled
-            )
-        ) {
-            fail("Opus 编码器创建失败：" + (OpusEncoder.loadErrorMessage() ?: "未知原因"))
-            releaseWakeLock()
-            return
-        }
-        encoder = enc
-
-        // 6) AudioRecord
-        val rec = openRecorder(requestedSampleRate, framesPerPacket)
-        if (rec == null) {
-            fail(lastError ?: "AudioRecord 初始化失败（麦克风可能被其他应用独占，或权限未授予）")
-            releaseWakeLock()
-            return
-        }
-        recorder = rec
-
-        // 7) 硬件热切换监听
-        try {
-            audioManager?.registerAudioDeviceCallback(deviceCallback, mainHandler)
-        } catch (t: Throwable) {
-            android.util.Log.w(TAG, "注册 AudioDeviceCallback 失败：${t.message}")
-        }
-
-        // 8) 采集线程
+        // 5) accept 循环
         isRunning = true
-        hardwareChanged.set(false)
-        val thread = Thread({ captureLoop() }, "miclink-capture")
-        captureThread = thread
+        val thread = Thread({ serverLoop(sock) }, "womic-tcp-server")
+        serverThread = thread
         thread.start()
 
-        notifyState(STATE_RUNNING, "已连接 ${sender.targetDescription()} · ${actualSampleRate}Hz")
-        updateNotification("正在采集 → ${sender.targetDescription()}")
+        notifyState(STATE_LISTENING, "等待 PC 连接 · 手机 ${listeningAddress()}")
+        updateNotification("等待 PC 连接 · ${listeningAddress()}")
     }
 
-    /** 停止采集并释放全部资源（可重复调用）。 */
+    /** 停止服务并释放全部资源（可重复调用）。 */
     private fun stopCapture(state: String, reason: String) {
-        val thread = captureThread
-        captureThread = null
-        if (thread != null) {
-            thread.interrupt()
+        // 采集链路
+        stopStreaming("服务停止")
+
+        // 连接与服务器
+        teardownConnection("服务停止", notify = false)
+        val sock = serverSocket
+        serverSocket = null
+        serverThread?.interrupt()
+        serverThread = null
+        if (sock != null) {
             try {
-                thread.join(1500)
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
+                sock.close()
+            } catch (t: Throwable) {
+                android.util.Log.w(TAG, "关闭 ServerSocket 异常：${t.message}")
             }
         }
 
@@ -402,14 +442,9 @@ class MicCaptureService : Service() {
             android.util.Log.w(TAG, "注销 AudioDeviceCallback 失败：${t.message}")
         }
 
-        releaseRecorder()
-        encoder?.destroy()
-        encoder = null
-        udpSender?.close()
-        udpSender = null
         releaseWakeLock()
-
         isRunning = false
+
         try {
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         } catch (t: Throwable) {
@@ -436,29 +471,308 @@ class MicCaptureService : Service() {
         }
     }
 
-    /** 采集线程主体：阻塞读 -> 编码 -> 封包 -> 发送。 */
+    // ------------------------------------------------------------------
+    // TCP 服务器与连接驱动
+    // ------------------------------------------------------------------
+
+    /** accept 循环：一次只服务一个客户端，断开后继续等下一个。 */
+    private fun serverLoop(sock: ServerSocket) {
+        android.util.Log.i(TAG, "TCP 控制服务器已监听 :$controlPort")
+        while (!Thread.currentThread().isInterrupted && !sock.isClosed) {
+            try {
+                val client = sock.accept()
+                synchronized(this) {
+                    // 已有连接：礼貌拒绝（官方 app 同样只服务一个客户端）
+                    val existing = connection
+                    if (existing != null && !existing.isClosed) {
+                        try {
+                            client.close()
+                        } catch (_: IOException) {
+                        }
+                        continue
+                    }
+                    connection = client
+                    peerDescription = client.inetAddress.hostAddress ?: "?"
+                    val thread = Thread({ connectionLoop(client) }, "womic-conn")
+                    connThread = thread
+                    thread.start()
+                }
+                android.util.Log.i(TAG, "PC 客户端已连接：${peerDescription}")
+                notifyState(STATE_CONNECTED, "PC 已连接：${peerDescription}")
+                updateNotification("已连接 ${peerDescription}，等待协商…")
+            } catch (e: IOException) {
+                if (!sock.isClosed) {
+                    android.util.Log.w(TAG, "accept 失败：${e.message}")
+                }
+                break
+            }
+        }
+        android.util.Log.i(TAG, "TCP 控制服务器退出")
+    }
+
+    /**
+     * 单连接驱动：阻塞读 -> FrameDecoder -> [WomicSession] -> 写回应答 -> 分派事件。
+     * 返回即连接结束（对端关闭/异常/看门狗超时）。
+     */
+    private fun connectionLoop(client: Socket) {
+        var closeReason = "连接结束"
+        try {
+            client.tcpNoDelay = true
+            val input = client.getInputStream()
+            val output = client.getOutputStream()
+            val decoder = FrameDecoder()
+            val sess = WomicSession(object : SessionHost {
+                override fun nowMs(): Long = SystemClock.elapsedRealtime()
+            })
+            session = sess
+
+            // 心跳看门狗：镜像官方 V1/k.java（每 5s，无心跳即断）
+            startWatchdog(sess, client)
+
+            val buf = ByteArray(4096)
+            while (!Thread.currentThread().isInterrupted && !client.isClosed) {
+                val n = input.read(buf)
+                if (n < 0) {
+                    closeReason = "PC 客户端关闭了连接"
+                    break
+                }
+                val frames = decoder.feed(buf, n)
+                for (frame in frames) {
+                    sess.onFrame(frame)
+                    // 先写应答（协议顺序：PC 收到 status 才认为请求完成）
+                    val replies = sess.drainReplies()
+                    for (r in replies) {
+                        output.write(r)
+                    }
+                    if (replies.isNotEmpty()) {
+                        output.flush()
+                    }
+                    // 再分派副作用事件（start/stop/disconnect）
+                    val events = sess.drainEvents()
+                    for (event in events) {
+                        dispatchEvent(event, peerDescription)
+                    }
+                }
+            }
+        } catch (e: IOException) {
+            closeReason = "连接异常：${e.message}"
+        } finally {
+            teardownConnection(closeReason)
+        }
+    }
+
+    /** 会话事件 -> 主线程执行（start/stop 触摸编码器与采集线程，只允许主线程）。 */
+    private fun dispatchEvent(event: SessionEvent, peer: String) {
+        mainHandler.post {
+            when (event) {
+                is SessionEvent.StartStreaming -> {
+                    negotiatedMediaPort = event.mediaPort
+                    negotiatedSampleRate = session?.sampleRate ?: SampleRates.TABLE[SampleRates.DEFAULT_INDEX]
+                    framesPerPacket = OpusEncoder.framesOf(negotiatedSampleRate, Defaults.FRAME_MS)
+                    startStreaming(peer)
+                }
+                SessionEvent.StopStreaming -> {
+                    stopStreaming("PC 客户端请求停止")
+                }
+                is SessionEvent.Disconnected -> {
+                    teardownConnection("连接断开（reason ${event.reason}）")
+                }
+            }
+        }
+    }
+
+    /** 看门狗线程：每 5s 调一次 [WomicSession.checkHeartbeatWatchdog]，超时则关闭 socket。 */
+    private fun startWatchdog(sess: WomicSession, client: Socket) {
+        val thread = Thread({
+            while (!Thread.currentThread().isInterrupted && !client.isClosed) {
+                try {
+                    Thread.sleep(WATCHDOG_PERIOD_MS)
+                } catch (e: InterruptedException) {
+                    break
+                }
+                if (client.isClosed) break
+                val alive = sess.checkHeartbeatWatchdog(SystemClock.elapsedRealtime())
+                if (!alive) {
+                    android.util.Log.w(TAG, "心跳看门狗超时（${WATCHDOG_PERIOD_MS}ms 无 105 心跳），断开连接")
+                    try {
+                        client.close()
+                    } catch (_: IOException) {
+                    }
+                    break
+                }
+            }
+        }, "womic-watchdog")
+        watchdogThread = thread
+        thread.isDaemon = true
+        thread.start()
+    }
+
+    /** 连接级清理：停推流、关 socket、清会话；服务器保持监听。 */
+    private fun teardownConnection(reason: String, notify: Boolean = true) {
+        stopStreaming(reason)
+
+        val client = connection
+        connection = null
+        session = null
+        negotiatedSampleRate = 0
+        negotiatedMediaPort = -1
+        peerDescription = ""
+
+        watchdogThread?.interrupt()
+        watchdogThread = null
+        connThread?.interrupt()
+        connThread = null
+
+        if (client != null && !client.isClosed) {
+            try {
+                client.close()
+            } catch (t: Throwable) {
+                android.util.Log.w(TAG, "关闭连接异常：${t.message}")
+            }
+        }
+        android.util.Log.i(TAG, "连接已清理：$reason")
+
+        if (notify && isRunning) {
+            notifyState(STATE_LISTENING, "等待 PC 连接 · 手机 ${listeningAddress()}")
+            updateNotification("等待 PC 连接 · ${listeningAddress()}")
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 推流启停（START / STOP 事件驱动）
+    // ------------------------------------------------------------------
+
+    /** PC 发来 START：开 UDP（协商媒体端口）-> 编码器 -> 采集线程。 */
+    private fun startStreaming(peer: String) {
+        if (isStreaming) {
+            return
+        }
+        val rate = negotiatedSampleRate
+        if (rate !in SampleRates.TABLE) {
+            fail("协商采样率非法：$rate（协议表 ${SampleRates.TABLE.toList()}）")
+            return
+        }
+        val port = negotiatedMediaPort
+        if (port !in 1..65535) {
+            fail("协商媒体端口非法：$port")
+            return
+        }
+
+        lastError = null
+        notifyState(STATE_STARTING, "正在启动推流…")
+
+        // 1) UDP：目标 = PC 客户端地址 + CONFIG 协商的媒体端口
+        val sender = UdpSender()
+        if (!sender.open(peer, port)) {
+            fail(sender.lastError ?: "UDP 打开失败")
+            return
+        }
+        udpSender = sender
+
+        // 2) Opus 编码器（协商采样率，20ms 帧；协议无带内 FEC 通道，关闭）
+        val frames = OpusEncoder.framesOf(rate, Defaults.FRAME_MS)
+        val enc = OpusEncoder()
+        if (!enc.create(
+                sampleRate = rate,
+                channels = 1,
+                bitrateBps = BuildConfig.DEFAULT_BITRATE,
+                frameSize = frames,
+                complexity = OPUS_COMPLEXITY,
+                inbandFec = false
+            )
+        ) {
+            fail("Opus 编码器创建失败：" + (OpusEncoder.loadErrorMessage() ?: "未知原因"))
+            return
+        }
+        encoder = enc
+        framesPerPacket = frames
+
+        // 3) AudioRecord（调试音模式跳过，直接合成正弦）
+        if (!debugTone) {
+            val rec = openRecorder(rate, frames)
+            if (rec == null) {
+                fail(lastError ?: "AudioRecord 初始化失败（麦克风可能被其他应用独占，或权限未授予）")
+                return
+            }
+            recorder = rec
+            actualSampleRate = rec.sampleRate
+
+            try {
+                audioManager?.registerAudioDeviceCallback(deviceCallback, mainHandler)
+            } catch (t: Throwable) {
+                android.util.Log.w(TAG, "注册 AudioDeviceCallback 失败：${t.message}")
+            }
+        } else {
+            actualSampleRate = rate
+            android.util.Log.i(TAG, "调试音模式：不打开 AudioRecord，合成 ${TONE_FREQUENCY_HZ}Hz 正弦")
+        }
+
+        // 4) 采集线程
+        hardwareChanged.set(false)
+        val thread = Thread({ captureLoop() }, "womic-capture")
+        captureThread = thread
+        thread.start()
+        isStreaming = true
+
+        notifyState(
+            STATE_STREAMING,
+            "→ ${peerDescription} · ${sender.targetDescription()} · ${actualSampleRate}Hz"
+        )
+        updateNotification("正在推流 → ${sender.targetDescription()}")
+    }
+
+    /** 停推流：停采集线程、释放 recorder/编码器/UDP；TCP 连接保持。 */
+    private fun stopStreaming(reason: String) {
+        val thread = captureThread
+        captureThread = null
+        if (thread != null) {
+            thread.interrupt()
+            try {
+                thread.join(1500)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+        isStreaming = false
+
+        releaseRecorder()
+        encoder?.destroy()
+        encoder = null
+        udpSender?.close()
+        udpSender = null
+
+        try {
+            audioManager?.unregisterAudioDeviceCallback(deviceCallback)
+        } catch (t: Throwable) {
+            // 未注册时忽略
+        }
+        android.util.Log.i(TAG, "推流已停止：$reason")
+    }
+
+    // ------------------------------------------------------------------
+    // 采集主流程
+    // ------------------------------------------------------------------
+
+    /** 采集线程主体：阻塞读 -> 编码 -> 封包（格式 C）-> 发送。 */
     private fun captureLoop() {
-        // 按 Opus 单帧上限分配：平台把采样率改成 48k 后 framesPerPacket 会变大，
-        // 若按启动时大小分配，重建 AudioRecord 后 read() 会越界。
         val pcm = ShortArray(OpusEncoder.MAX_FRAME)
-        val payload = ByteArray(Packetizer.MAX_PAYLOAD)
-        val redundant = ByteArray(Packetizer.MAX_PAYLOAD)
-        val packet = ByteArray(Packetizer.MAX_PACKET_SIZE)
+        val payload = ByteArray(OpusEncoder.MAX_PAYLOAD)
 
         var seq = 0
         var restarts = 0
         var shortReads = 0L
         var lastLevelPostMs = 0L
         var lastNotifyMs = 0L
-        val startTimeMs = SystemClock.elapsedRealtime()
+        var tonePhase = 0.0
+        val toneInc = 2.0 * PI * TONE_FREQUENCY_HZ / actualSampleRate.coerceAtLeast(1)
 
         while (!Thread.currentThread().isInterrupted) {
-            // 硬件变化（插拔耳机/USB 声卡/蓝牙）：重建 AudioRecord
-            if (hardwareChanged.getAndSet(false)) {
+            // 硬件变化（插拔耳机/USB 声卡/蓝牙）：重建 AudioRecord（调试音模式无此问题）
+            if (hardwareChanged.getAndSet(false) && !debugTone) {
                 android.util.Log.i(TAG, "检测到音频设备变化，重建 AudioRecord")
                 releaseRecorder()
                 SystemClock.sleep(RESTART_BACKOFF_MS)
-                val rec = openRecorder(requestedSampleRate, framesPerPacket)
+                val rec = openRecorder(negotiatedSampleRate, framesPerPacket)
                 if (rec == null) {
                     mainHandler.post { fail("音频设备变化后无法重新初始化 AudioRecord") }
                     return
@@ -468,13 +782,22 @@ class MicCaptureService : Service() {
             }
 
             val rec = recorder
-            if (rec == null) {
-                mainHandler.post { fail("AudioRecord 已释放") }
-                return
+            val read: Int
+            if (debugTone || rec == null) {
+                // 调试音：合成 440Hz 正弦，按帧长睡眠模拟实时节奏
+                var i = 0
+                while (i < framesPerPacket) {
+                    pcm[i] = (sin(tonePhase) * TONE_AMPLITUDE * 32767.0).toInt().toShort()
+                    tonePhase += toneInc
+                    if (tonePhase > 2.0 * PI) tonePhase -= 2.0 * PI
+                    i++
+                }
+                read = framesPerPacket
+                SystemClock.sleep(Defaults.FRAME_MS.toLong())
+            } else {
+                // 阻塞读取：没有数据时线程挂起，不占用 CPU
+                read = rec.read(pcm, 0, framesPerPacket)
             }
-
-            // 阻塞读取：没有数据时线程挂起，不占用 CPU
-            val read = rec.read(pcm, 0, framesPerPacket)
 
             if (read == framesPerPacket) {
                 restarts = 0
@@ -494,23 +817,12 @@ class MicCaptureService : Service() {
                     continue
                 }
 
-                // 封包（32 字节头 + payload，大端）
-                val ts = SystemClock.elapsedRealtime() - startTimeMs
-                // 本帧占用的序号。**只有真实帧才推进序号**：FEC 冗余包是它的
-                // 第二份拷贝，复用同一个 seq，绝不能占用新序号。
+                // 封包（WO Mic 格式 C：11 字节头 + payload，规格 v1 第 3 节）
+                // 时间戳用采集侧单调时钟（elapsedRealtime 毫秒），seq 每真实帧 +1。
+                val ts = SystemClock.elapsedRealtime()
                 val frameSeq = seq
-                val total = Packetizer.pack(
-                    dst = packet,
-                    seq = frameSeq,
-                    timestampMs = ts,
-                    sampleRate = actualSampleRate,
-                    channels = 1,
-                    frames = framesPerPacket,
-                    payload = payload,
-                    payloadLen = payloadLen,
-                    flags = 0
-                )
-                seq++
+                val packet = WomicPacketizer.build(frameSeq, ts, payload.copyOf(payloadLen), volume)
+                seq = (seq + 1) and 0xFFFF
 
                 // 发送
                 val sender = udpSender
@@ -518,45 +830,23 @@ class MicCaptureService : Service() {
                     mainHandler.post { fail("UDP sender 为空") }
                     return
                 }
-                if (!sender.send(packet, total)) {
+                if (!sender.send(packet, packet.size)) {
                     if (sender.failureStreak >= MAX_SEND_FAILURES) {
                         mainHandler.post {
                             fail("连续 ${sender.failureStreak} 次发送失败，已停止：${sender.lastError}")
                         }
                         return
                     }
-                } else if (fecEnabled && ((frameSeq + 1) and 0x0F) == 0) {
-                    // 每 16 个**真实帧**（frameSeq = 15, 31, 47, …）附一份刚刚那
-                    // 一帧的冗余重发包（带内 FEC），服务端若发现原包丢失可用它补洞。
-                    // 失败不影响主链路。
-                    //
-                    // !!! 必须复用 frameSeq，且**不要** seq++ !!!
-                    // 带内 FEC 的语义是"同一个 seq 的第二份拷贝"：服务端据此判定
-                    // 为重复包（原包已到则丢弃，原包丢失则补洞）。若给冗余包分配
-                    // 新 seq，服务端无从分辨它和新帧，只能当成新的一帧注入 ——
-                    // 于是每 16 帧多产出 20ms，播放速率快 6.25%，抖动缓冲被持续
-                    // 积压直至驱逐丢帧（缺陷 D-01）。
-                    val redLen = encoder?.plc(redundant) ?: 0
-                    if (redLen > 0) {
-                        val redTotal = Packetizer.pack(
-                            dst = packet,
-                            seq = frameSeq,
-                            timestampMs = ts,
-                            sampleRate = actualSampleRate,
-                            channels = 1,
-                            frames = framesPerPacket,
-                            payload = redundant,
-                            payloadLen = redLen,
-                            flags = Packetizer.FLAG_FEC
-                        )
-                        sender.send(packet, redTotal)
-                    }
                 }
 
                 if (now - lastNotifyMs >= NOTIFY_INTERVAL_MS) {
                     lastNotifyMs = now
-                    updateNotification("正在采集 → ${sender.targetDescription()} · ${sender.packetsSent} 包")
+                    updateNotification("正在推流 → ${sender.targetDescription()} · ${sender.packetsSent} 包")
                 }
+                continue
+            }
+
+            if (debugTone || rec == null) {
                 continue
             }
 
@@ -579,7 +869,7 @@ class MicCaptureService : Service() {
                     }
                     releaseRecorder()
                     SystemClock.sleep(RESTART_BACKOFF_MS * restarts)
-                    val newRec = openRecorder(requestedSampleRate, framesPerPacket)
+                    val newRec = openRecorder(negotiatedSampleRate, framesPerPacket)
                     if (newRec == null) {
                         mainHandler.post { fail("重建 AudioRecord 失败") }
                         return
@@ -592,7 +882,6 @@ class MicCaptureService : Service() {
                 }
                 else -> {
                     // 0 < read < framesPerPacket：短读。首帧常见，攒够一帧再编码更稳。
-                    // 这里简单跳过；若长期短读说明底层 buffer 配置异常。
                     shortReads++
                     if (shortReads % 100L == 0L) {
                         android.util.Log.w(TAG, "累计短读 $shortReads 次（read=$read < $framesPerPacket）")
@@ -611,13 +900,14 @@ class MicCaptureService : Service() {
     /**
      * 打开 AudioRecord。
      *
-     * 音频源固定为 [MediaRecorder.AudioSource.VOICE_COMMUNICATION]：
-     * 复用平台既有的回声消除/噪声抑制通路；本项目**不自研 AEC/NS**（PRD 非目标）。
+     * 音频源用 [MediaRecorder.AudioSource.DEFAULT]：与官方 app 默认值一致
+     * （证据 V1/f.java：audioSource=0）。WO Mic 是单向推流（手机麦克风 -> PC），
+     * 手机上不存在回声环路，无需 VOICE_COMMUNICATION 的 AEC 通路；且 DEFAULT
+     * 不会像 VOICE_COMMUNICATION 那样在部分设备上强制降到 16kHz。
      *
-     * 采样率：按 [sampleRate] 申请；部分设备（尤其用 VOICE_COMMUNICATION 时）会强制
-     * 降到 16 kHz，此时以 [AudioRecord.getSampleRate] 的**实际值**为准重新推导编码器参数，
-     * 并在 UI 上提示——服务端会在 capture_rate != decode_rate 时自动重采样（不致命），
-     * 但端点率与解码率不一致会被服务端拒绝启动（见 shared/core miclink_sample_rate.h）。
+     * 采样率：按协商值申请；部分设备仍会强制调整，此时以 [AudioRecord.getSampleRate]
+     * 的**实际值**为准重新推导编码器参数并继续推流（PC 端按协商率解码，极端情况下
+     * 会变调，但好过直接失败；日志会明确告警）。
      *
      * @return 成功返回 AudioRecord；失败返回 null 并置 [lastError]
      */
@@ -637,7 +927,7 @@ class MicCaptureService : Service() {
 
         val rec = try {
             AudioRecord.Builder()
-                .setAudioSource(MediaRecorder.AudioSource.VOICE_COMMUNICATION)
+                .setAudioSource(MediaRecorder.AudioSource.DEFAULT)
                 .setAudioFormat(
                     AudioFormat.Builder()
                         .setSampleRate(sampleRate)
@@ -671,10 +961,10 @@ class MicCaptureService : Service() {
         actualSampleRate = actual
 
         // 实际采样率与请求值不同时，必须同步帧长与编码器，否则 Opus 帧长非法
-        if (actual != requestedSampleRate) {
-            val newFrames = OpusEncoder.framesOf(actual, frameMs)
+        if (actual != sampleRate) {
+            val newFrames = OpusEncoder.framesOf(actual, Defaults.FRAME_MS)
             if (!OpusEncoder.isValidFrame(actual, newFrames)) {
-                lastError = "平台返回采样率 ${actual}Hz 与帧长 ${frameMs}ms 组合非法"
+                lastError = "平台返回采样率 ${actual}Hz 与帧长 ${Defaults.FRAME_MS}ms 组合非法"
                 try {
                     rec.release()
                 } catch (t: Throwable) {
@@ -688,10 +978,10 @@ class MicCaptureService : Service() {
             if (!enc.create(
                     sampleRate = actual,
                     channels = 1,
-                    bitrateBps = bitrateBps,
-                    frameSize = framesPerPacket,
-                    complexity = 5,
-                    inbandFec = fecEnabled
+                    bitrateBps = BuildConfig.DEFAULT_BITRATE,
+                    frameSize = newFrames,
+                    complexity = OPUS_COMPLEXITY,
+                    inbandFec = false
                 )
             ) {
                 lastError = "按实际采样率 ${actual}Hz 重建编码器失败"
@@ -756,7 +1046,7 @@ class MicCaptureService : Service() {
             return
         }
         val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
-        val lock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MicLinkOpen:MicCapture")
+        val lock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WomicWifiClient:MicCapture")
         if (lock != null) {
             try {
                 // 10 小时兜底，正常停止时会显式 release
@@ -781,6 +1071,33 @@ class MicCaptureService : Service() {
     }
 
     // ------------------------------------------------------------------
+    // 前台服务类型降级链
+    // ------------------------------------------------------------------
+
+    /**
+     * Android 14+ 对 microphone 型前台服务有 while-in-use 权限校验。
+     * 拿不到 RECORD_AUDIO 时（例如只用调试音验证链路），按
+     * microphone -> 0（无类型）的顺序降级，全部失败才返回 false。
+     */
+    private fun startForegroundSafely(): Boolean {
+        val notification = buildNotification("正在启动…")
+        val attempts = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            listOf(ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE, 0)
+        } else {
+            listOf(0)
+        }
+        for (type in attempts) {
+            try {
+                ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, type)
+                return true
+            } catch (t: Throwable) {
+                android.util.Log.w(TAG, "startForeground(type=$type) 失败：${t.message}")
+            }
+        }
+        return false
+    }
+
+    // ------------------------------------------------------------------
     // 通知
     // ------------------------------------------------------------------
     private fun createNotificationChannel() {
@@ -792,7 +1109,7 @@ class MicCaptureService : Service() {
                     CHANNEL_NAME,
                     NotificationManager.IMPORTANCE_LOW
                 ).apply {
-                    description = "MicLink 麦克风采集正在运行时显示"
+                    description = "WO Mic 采集推流正在运行时显示"
                     setShowBadge(false)
                 }
                 manager.createNotificationChannel(channel)
@@ -835,8 +1152,7 @@ class MicCaptureService : Service() {
     }
 
     private fun updateNotification(text: String) {
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
-            ?: return
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
         try {
             manager.notify(NOTIFICATION_ID, buildNotification(text))
         } catch (t: Throwable) {

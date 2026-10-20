@@ -1,11 +1,9 @@
 package com.miclink.open
 
 import android.Manifest
-import android.app.Activity
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
-import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 
 /**
@@ -16,11 +14,12 @@ import androidx.core.content.ContextCompat
  *   - `POST_NOTIFICATIONS` 自 Android 13（API 33）起需要申请，否则前台服务通知不可见
  *     （服务仍能跑，但用户看不到停止入口，体验很差，所以一起申请）；
  *   - `INTERNET` / `FOREGROUND_SERVICE` / `WAKE_LOCK` 是普通权限，安装时自动授予。
+ *
+ * 申请动作统一走 Activity Result API（`ActivityResultContracts.RequestMultiplePermissions`）：
+ * 由调用方注册 launcher 并发起，结果回调里重新检查 [allGranted] 判定成败
+ * （不信任回调 Map 本身，兼容"用户直接划掉对话框"等返回空 Map 的行为）。
  */
 object Permissions {
-
-    /** 权限请求码（onRequestPermissionsResult 中回传）。 */
-    const val REQ_CAPTURE = 1001
 
     /** 采集所需的全部危险权限。 */
     fun requiredPermissions(): List<String> {
@@ -40,51 +39,6 @@ object Permissions {
 
     /** 是否全部已授予。 */
     fun allGranted(context: Context): Boolean = missing(context).isEmpty()
-
-    /** 是否还能再弹系统权限框（用户勾选"不再询问"后返回 false）。 */
-    fun canAskAgain(activity: Activity, permission: String): Boolean {
-        return ActivityCompat.shouldShowRequestPermissionRationale(activity, permission) ||
-            ContextCompat.checkSelfPermission(activity, permission) != PackageManager.PERMISSION_GRANTED
-    }
-
-    /**
-     * 申请缺失权限。
-     *
-     * @return true 表示已全部拥有（无需弹框）；false 表示已发起申请，
-     *         结果在 Activity 的 onRequestPermissionsResult 中回调。
-     */
-    fun requestIfNeeded(activity: Activity): Boolean {
-        val need = missing(activity)
-        if (need.isEmpty()) {
-            return true
-        }
-        ActivityCompat.requestPermissions(activity, need.toTypedArray(), REQ_CAPTURE)
-        return false
-    }
-
-    /**
-     * 处理申请结果。
-     *
-     * @return true 表示本请求码是采集权限且**全部通过**；false 表示被拒绝（或部分拒绝）。
-     */
-    fun handleResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ): Boolean {
-        if (requestCode != REQ_CAPTURE) {
-            return false
-        }
-        if (grantResults.isEmpty()) {
-            return false
-        }
-        for (result in grantResults) {
-            if (result != PackageManager.PERMISSION_GRANTED) {
-                return false
-            }
-        }
-        return permissions.isNotEmpty()
-    }
 
     /** 给用户看的权限说明（被拒绝时展示）。 */
     fun describeMissing(context: Context): String {

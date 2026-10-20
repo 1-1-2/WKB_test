@@ -10,7 +10,6 @@ import android.util.Log
  * val enc = OpusEncoder()
  * enc.create(sampleRate = 48000, channels = 1, bitrateBps = 64000, frameSize = 960)
  * val n = enc.encode(pcmShorts, outBytes)   // n > 0 才发送
- * val m = enc.plc(redundantBytes)           // m > 0 表示可发一份前向冗余包
  * enc.destroy()
  * ```
  *
@@ -21,7 +20,7 @@ class OpusEncoder {
     companion object {
         private const val TAG = "OpusEncoder"
 
-        /** 单包 payload 上限，与 Packetizer.MAX_PAYLOAD / MICLINK_PROTO_MAX_PAYLOAD 一致。 */
+        /** 单包 payload 上限（WO Mic 格式 C 头部固定 11 字节，Opus 20ms@48k 远小于此）。 */
         const val MAX_PAYLOAD = 4096
 
         /** Opus 单帧样本数上限（120ms @ 48kHz）。 */
@@ -185,9 +184,9 @@ class OpusEncoder {
     /**
      * 生成前向冗余包（上一帧 payload 的重发副本）。
      *
-     * 注意：**这不是解码侧的 PLC**。解码侧丢包隐藏由 Windows 服务端
-     * （server/src/opus_decoder.cpp）用 opus_decode(NULL) 完成；本方法只是给服务端
-     * 多一份补救材料，调用方应把结果包的 flags 打上 [Packetizer.FLAG_FEC]。
+     * ⚠️ WO Mic 协议**没有**带内 FEC 通道（格式 C 头部无 flags 字段），
+     * 本方法在当前协议下不再被调用，仅为兼容旧 miclink 链路保留。
+     * 丢包隐藏由 PC 端 opus_decode(NULL) 完成。
      *
      * @return 冗余包字节数；0 表示还没有历史帧；<0 为错误码
      */

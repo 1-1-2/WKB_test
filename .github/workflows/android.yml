@@ -1,0 +1,317 @@
+name: android
+
+on:
+  push:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+      - '.github/scripts/**'      # CI 脚本变更也要触发（否则改脚本没人验证）
+  pull_request:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+      - '.github/scripts/**'
+  workflow_dispatch:
+    inputs:
+      interactive:
+        description: 'Windows 交互式联调（SSH 进 runner 手动验证）'
+        type: boolean
+        required: false
+        default: false
+
+# 作业是一条流水线（needs 串联），不是四个平行作业各做一遍同样的事：
+#
+#   protocol-tests ──┐
+#                    ├──► build-apk ──► integration-test
+#   script-tests ────┘        │
+#   (:core:test 1~2min)  (SDK+opus+三 ABI 编译, 产出 app-debug-apk)
+#   (CI 脚本单测 ~10s)         └──► integration-test 只装模拟器组件 + 下载 APK + 跑协议闭环
+#
+# 好处：SDK 组件安装、opus 源码下载、Gradle 构建各只发生一次；integration-test
+# 不再重复构建（原先三个作业各装一遍 SDK、各下一次 opus）。
+#
+# 每一步都有 timeout-minutes：卡死会在几分钟内结束，不会像 run 39422464400
+# 那样在 `adb wait-for-device` 上挂 25 分钟。
+#
+# windows-interactive 保持独立，仅 workflow_dispatch 勾选后运行
+# （WarpBuilds/action-debugger —— mxschmitt/action-tmate 的 Windows 可用分支，
+#  详见 docs/devops/windows-interactive-debug.md）。
+
+# 同一分支连续 push 时取消上一轮（省 runner 分钟、避免排队）；
+# 注意：这里的 cancelled 是**主动取消旧 run**，不是失败。
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  protocol-tests:
+    name: Protocol conformance (:core:test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Run protocol unit tests
+        timeout-minutes: 12
+        run: ./gradlew :core:test --no-daemon --configure-on-demand
+
+      - name: Upload test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-report
+          path: android/core/build/reports/tests/
+
+  # CI 脚本自身的单元测试：用 stub 的 adb/emulator/avdmanager 构造"会挂死"的场景，
+  # 验证脚本必须在预算内退出（挂死类缺陷看日志发现不了，只能这样测）。
+  script-tests:
+    name: CI script unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run CI script tests (stub adb/emulator/avdmanager)
+        timeout-minutes: 5
+        run: bash .github/scripts/tests/run-tests.sh
+
+  build-apk:
+    name: Build debug APK (all ABIs)
+    needs: [protocol-tests, script-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ubuntu-latest 镜像不再把 cmdline-tools 放进 PATH（实测 sdkmanager: command not found，
+      # 见 run 39408485677），这里自行定位 SDK 并把工具链写入 GITHUB_PATH；
+      # 万一镜像连 cmdline-tools 都没带，就现场下载官方 commandlinetools 包。
+      - name: Set up Android SDK tools
+        timeout-minutes: 5
+        run: bash ../.github/scripts/setup-android-sdk.sh
+
+      # compileSdk 37（platforms;android-37.0，次版本命名）/ build-tools 36 需显式补齐；
+      # CMake 版本由 app/build.gradle.kts 的 externalNativeBuild.cmake.version 固定为 3.22.1；
+      # NDK 用 AGP 9.1 默认的 28.2.13676358（本地实测值，见 docs/VERIFICATION.md）
+      - name: Install Android SDK components
+        timeout-minutes: 20
+        run: |
+          sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-37.0" "build-tools;36.0.0" \
+            "cmake;3.22.1" "ndk;28.2.13676358"
+
+      # libopus 源码不入库（体积 + 许可证单独保留），CI 现场下载；
+      # 缺了它 CMake 会 FATAL_ERROR（见 app/src/main/cpp/CMakeLists.txt）。
+      - name: Fetch Opus source
+        timeout-minutes: 8
+        run: bash ../.github/scripts/fetch-opus.sh
+
+      - name: Assemble debug APK
+        timeout-minutes: 25
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Upload APK
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          retention-days: 3
+
+  integration-test:
+    name: Interop closed loop (emulator + pc_client.py)
+    needs: build-apk
+    runs-on: ubuntu-latest
+    # 硬上限：任何一步卡住都会在 25 分钟内结束，不会像上次那样挂 25 分钟无人可知
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK tools
+        timeout-minutes: 5
+        run: bash ../.github/scripts/setup-android-sdk.sh
+
+      # 不构建，只需要：adb（platform-tools）+ emulator + 系统镜像
+      - name: Install emulator components
+        timeout-minutes: 15
+        run: |
+          sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "emulator" "system-images;android-34;default;x86_64"
+          echo "--- 已安装组件 ---"
+          ls "$ANDROID_HOME/system-images/android-34/default/" 2>/dev/null || true
+
+      - name: Download APK from build-apk
+        timeout-minutes: 5
+        uses: actions/download-artifact@v4
+        with:
+          name: app-debug-apk
+          path: apk
+        # 下载到 <repo>/apk/app-debug.apk（working-directory 不作用于 uses 步骤）
+
+      # ubuntu-24.04 镜像没装 libpulse0，而 emulator 的 qemu 二进制链接了它——
+      # 即便传 -no-audio 也会在启动时 "error while loading shared libraries"（run 39459335348 实证）。
+      #
+      # 注意：**不要**用裸 `ldd qemu-system-x86_64` 判断缺库——emulator 的 libQt6*.so /
+      # libandroid-emu-tracing.so 等私有库在 emulator/lib64 下，靠 emulator 自己设置的
+      # LD_LIBRARY_PATH 才能解析，裸 ldd 必然报 not found（run 39461011547 实证误杀）。
+      # 缺不缺系统库，交给 start-emulator.sh 的失败路径读 emulator.log 判断。
+      - name: Install emulator system dependencies
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            libpulse0 libnss3 libxdamage1 libxcomposite1 libxcursor1 \
+            libxi6 libxtst6 libglu1-mesa
+          echo "--- 系统依赖安装完成（libpulse 等）---"
+          dpkg -l libpulse0 2>/dev/null | tail -2 || true
+
+      - name: Verify KVM and AVD prerequisites
+        timeout-minutes: 3
+        run: bash ../.github/scripts/verify-kvm.sh
+
+      # 关键：绝不使用无超时的 `adb wait-for-device`（上次就是它把作业挂死 25 分钟）。
+      # 改为"进程存活 + adb 设备数 + boot_completed"三重轮询，每 10s 打一行进度，
+      # 失败时自动打印 emulator.log 尾部。脚本内部预算 480s，这里再兜一层 12 分钟。
+      - name: Start emulator (with timeout and progress logs)
+        timeout-minutes: 12
+        run: bash ../.github/scripts/start-emulator.sh womic_interop android-34
+
+      - name: Install and launch app
+        timeout-minutes: 10
+        run: bash ../.github/scripts/install-app.sh ../apk/app-debug.apk
+
+      # 闭环联调：C01~C15 见 android/verify/integration/README.md
+      - name: Interop closed loop (pc_client.py)
+        timeout-minutes: 6
+        run: |
+          set +e
+          set -o pipefail
+          timeout 240 python3 verify/integration/pc_client.py --hold-seconds 12 2>&1 | tee /tmp/interop.out
+          rc=$?
+          echo "pc_client exit=$rc（0=全绿，1=有断言失败，2=环境错误，124=超时）"
+          exit $rc
+
+      # 无论成功/失败/取消都收集：取消时 previously 什么都没留下，无法事后诊断。
+      # 脚本内部给每条 adb 命令 15s 上限，这里再兜一层 4 分钟。
+      - name: Collect diagnostics
+        if: always()
+        timeout-minutes: 4
+        continue-on-error: true
+        run: bash ../.github/scripts/collect-diagnostics.sh
+
+      - name: Upload diagnostics
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-diagnostics
+          path: /tmp/diag/
+          if-no-files-found: warn
+          retention-days: 7
+
+  windows-interactive:
+    name: Windows interactive debug (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.interactive
+    runs-on: windows-latest
+    timeout-minutes: 150
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # windows-latest 的 SDK 布局随镜像变化：显式定位 cmdline-tools 并写入 GITHUB_PATH。
+      # 这是手动交互作业，找不到时直接报错（会话里可人工追加安装）。
+      - name: Set up Android SDK tools
+        shell: pwsh
+        run: |
+          $cands = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT,
+                     "C:\Android\android-sdk", "$env:LOCALAPPDATA\Android\Sdk") |
+                   Where-Object { $_ -and (Test-Path $_) }
+          $sdk = $cands | Select-Object -First 1
+          if (-not $sdk) { throw "未找到 Android SDK（ANDROID_HOME/ANDROID_SDK_ROOT 均为空且默认路径不存在）" }
+          $ct = Get-ChildItem "$sdk\cmdline-tools" -Directory -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $ct) { throw "$sdk\cmdline-tools 下没有可用的 cmdline-tools" }
+          $bin = Join-Path $ct.FullName "bin"
+          "ANDROID_HOME=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ANDROID_SDK_ROOT=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Append
+          "$sdk\platform-tools" | Out-File -FilePath $env:GITHUB_PATH -Append
+          Write-Host "SDK=$sdk  TOOLS=$bin"
+          & (Join-Path $bin "sdkmanager.bat") --version
+
+      - name: Install Android SDK components
+        shell: pwsh
+        run: |
+          sdkmanager --licenses > $null 2>&1 || true
+          sdkmanager "platforms;android-37.0" "build-tools;36.0.0" `
+            "cmake;3.22.1" "ndk;28.2.13676358"
+
+      # 与 build-apk 相同：CI 现场下载 opus 源码，缺了它 CMake 会 FATAL_ERROR
+      - name: Fetch Opus source
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path app/src/main/cpp | Out-Null
+          if (Test-Path app/src/main/cpp/opus) { Remove-Item -Recurse -Force app/src/main/cpp/opus }
+          $urls = @(
+            "https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz",
+            "https://codeload.github.com/xiph/opus/tar.gz/refs/tags/v1.5.2"
+          )
+          $ok = $false
+          foreach ($u in $urls) {
+            try {
+              Invoke-WebRequest -Uri $u -OutFile opus.tar.gz -MaximumRetryCount 3
+              $ok = $true; break
+            } catch { Write-Host "download failed: $u" }
+          }
+          if (-not $ok) { throw "opus source download failed" }
+          New-Item -ItemType Directory -Force -Path opus-src | Out-Null
+          tar -xzf opus.tar.gz -C opus-src
+          $dir = Get-ChildItem -Directory opus-src | Select-Object -First 1
+          Move-Item $dir.FullName app/src/main/cpp/opus
+          if (-not (Test-Path app/src/main/cpp/opus/CMakeLists.txt)) { throw "opus CMakeLists.txt missing" }
+
+      - name: Prebuild artifacts
+        run: ./gradlew :core:test :app:assembleDebug --no-daemon
+
+      # 交互式会话：连接信息打印在日志与 Checks 页底部；
+      # 在会话里 touch continue 放行后续步骤（或直接退出 shell 结束作业）。
+      - name: Interactive SSH session
+        uses: WarpBuilds/action-debugger@v1.3
+        with:
+          limit-access-to-actor: true
+        timeout-minutes: 120
