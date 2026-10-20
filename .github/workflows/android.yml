@@ -17,18 +17,31 @@ on:
         required: false
         default: false
 
-# 作业分层：
-#   protocol-tests  :core:test（纯 JVM，字节级一致性，不需要 Android SDK）
-#   app-build       真构建：含 opus 源码下载 + CMake/NDK 原生编译（三 ABI）
-#   integration-test 闭环联调：ubuntu + KVM 模拟器跑真协议（pc_client.py ↔ app）
-#   windows-interactive 仅 workflow_dispatch 勾选后运行
-#     （WarpBuilds/action-debugger —— mxschmitt/action-tmate 的 Windows 可用分支，
-#      详见 docs/devops/windows-interactive-debug.md）。
+# 作业是一条流水线（needs 串联），不是三个平行作业各做一遍同样的事：
+#
+#   protocol-tests ──► build-apk ──► integration-test
+#   (:core:test,          (SDK 安装 + opus 下载 +        (只装模拟器相关组件,
+#    1~2 分钟)             三 ABI 原生编译 + APK)          下载 build-apk 的 APK,
+#                          产出 app-debug-apk artifact     启模拟器跑协议闭环)
+#
+# 好处：SDK 组件安装、opus 源码下载、Gradle 构建各只发生一次；integration-test
+# 不再重复构建，作业时长从 ~30min（且互相抢磁盘/网络）降到 ~5min。
+#
+# windows-interactive 保持独立，仅 workflow_dispatch 勾选后运行
+# （WarpBuilds/action-debugger —— mxschmitt/action-tmate 的 Windows 可用分支，
+#  详见 docs/devops/windows-interactive-debug.md）。
+
+# 同一分支连续 push 时取消上一轮（省 runner 分钟、避免排队）；
+# 注意：这里的 cancelled 是**主动取消旧 run**，不是失败。
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   protocol-tests:
     name: Protocol conformance (:core:test)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: android
@@ -51,9 +64,11 @@ jobs:
           name: core-test-report
           path: android/core/build/reports/tests/
 
-  app-build:
-    name: Build debug APK (:app:assembleDebug)
+  build-apk:
+    name: Build debug APK (all ABIs)
+    needs: protocol-tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: android
@@ -70,30 +85,7 @@ jobs:
       # 见 run 39408485677），这里自行定位 SDK 并把工具链写入 GITHUB_PATH；
       # 万一镜像连 cmdline-tools 都没带，就现场下载官方 commandlinetools 包。
       - name: Set up Android SDK tools
-        run: |
-          set -e
-          SDK=""
-          for cand in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk /opt/android-sdk; do
-            if [ -n "$cand" ] && [ -d "$cand" ]; then SDK="$cand"; break; fi
-          done
-          SDK="${SDK:-/usr/local/lib/android/sdk}"
-          TOOLS="$(ls -d "$SDK"/cmdline-tools/*/bin 2>/dev/null | tail -1)"
-          if [ -z "$TOOLS" ]; then
-            echo "镜像缺少 cmdline-tools，下载官方 commandlinetools"
-            curl -fsSL --retry 3 -o /tmp/cmdline-tools.zip \
-              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-            mkdir -p "$SDK/cmdline-tools"
-            unzip -q /tmp/cmdline-tools.zip -d "$SDK/cmdline-tools"
-            mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
-            TOOLS="$SDK/cmdline-tools/latest/bin"
-          fi
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "$TOOLS" >> "$GITHUB_PATH"
-          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
-          echo "$SDK/emulator" >> "$GITHUB_PATH"
-          echo "SDK=$SDK  TOOLS=$TOOLS"
-          "$TOOLS/sdkmanager" --version | head -1
+        run: bash ../.github/scripts/setup-android-sdk.sh
 
       # compileSdk 37（platforms;android-37.0，次版本命名）/ build-tools 36 需显式补齐；
       # CMake 版本由 app/build.gradle.kts 的 externalNativeBuild.cmake.version 固定为 3.22.1；
@@ -107,19 +99,7 @@ jobs:
       # libopus 源码不入库（体积 + 许可证单独保留），CI 现场下载；
       # 缺了它 CMake 会 FATAL_ERROR（见 app/src/main/cpp/CMakeLists.txt）。
       - name: Fetch Opus source
-        run: |
-          set -e
-          mkdir -p app/src/main/cpp
-          rm -rf app/src/main/cpp/opus
-          curl -fsSL --retry 3 -o /tmp/opus.tar.gz \
-            https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz \
-            || curl -fsSL --retry 3 -o /tmp/opus.tar.gz \
-            https://codeload.github.com/xiph/opus/tar.gz/refs/tags/v1.5.2
-          rm -rf /tmp/opus-src && mkdir -p /tmp/opus-src
-          tar -xzf /tmp/opus.tar.gz -C /tmp/opus-src
-          mv "$(ls -d /tmp/opus-src/opus-*/ | head -1)" app/src/main/cpp/opus
-          test -f app/src/main/cpp/opus/CMakeLists.txt
-          test -f app/src/main/cpp/opus/include/opus.h
+        run: bash ../.github/scripts/fetch-opus.sh
 
       - name: Assemble debug APK
         run: ./gradlew :app:assembleDebug --no-daemon
@@ -129,10 +109,14 @@ jobs:
         with:
           name: app-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
+          retention-days: 3
 
   integration-test:
     name: Interop closed loop (emulator + pc_client.py)
+    needs: build-apk
     runs-on: ubuntu-latest
+    # 硬上限：任何一步卡住都会在 25 分钟内结束，不会像上次那样挂 25 分钟无人可知
+    timeout-minutes: 25
     defaults:
       run:
         working-directory: android
@@ -145,140 +129,65 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # 同 app-build：ubuntu-latest 的 cmdline-tools 不在 PATH，自行定位/补齐
       - name: Set up Android SDK tools
-        run: |
-          set -e
-          SDK=""
-          for cand in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk /opt/android-sdk; do
-            if [ -n "$cand" ] && [ -d "$cand" ]; then SDK="$cand"; break; fi
-          done
-          SDK="${SDK:-/usr/local/lib/android/sdk}"
-          TOOLS="$(ls -d "$SDK"/cmdline-tools/*/bin 2>/dev/null | tail -1)"
-          if [ -z "$TOOLS" ]; then
-            echo "镜像缺少 cmdline-tools，下载官方 commandlinetools"
-            curl -fsSL --retry 3 -o /tmp/cmdline-tools.zip \
-              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-            mkdir -p "$SDK/cmdline-tools"
-            unzip -q /tmp/cmdline-tools.zip -d "$SDK/cmdline-tools"
-            mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
-            TOOLS="$SDK/cmdline-tools/latest/bin"
-          fi
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "$TOOLS" >> "$GITHUB_PATH"
-          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
-          echo "$SDK/emulator" >> "$GITHUB_PATH"
-          echo "SDK=$SDK  TOOLS=$TOOLS"
-          "$TOOLS/sdkmanager" --version | head -1
+        run: bash ../.github/scripts/setup-android-sdk.sh
 
-      # 联调需要：编译平台（android-37.0）+ 运行镜像（android-34）+ emulator + platform-tools
-      # + CMake 3.22.1 / NDK 28.2.13676358（原生 opus 编译）
-      - name: Install Android SDK components
+      # 不构建，只需要：adb（platform-tools）+ emulator + 系统镜像
+      - name: Install emulator components
         run: |
           sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-37.0" "build-tools;36.0.0" \
-            "cmake;3.22.1" "ndk;28.2.13676358" \
-            "system-images;android-34;default;x86_64" "emulator" "platform-tools"
+          sdkmanager "platform-tools" "emulator" "system-images;android-34;default;x86_64"
+          echo "--- 已安装组件 ---"
+          ls "$ANDROID_HOME/system-images/android-34/default/" 2>/dev/null || true
 
-      - name: Fetch Opus source
-        run: |
-          set -e
-          mkdir -p app/src/main/cpp
-          rm -rf app/src/main/cpp/opus
-          curl -fsSL --retry 3 -o /tmp/opus.tar.gz \
-            https://downloads.xiph.org/releases/opus/opus-1.6.1.tar.gz \
-            || curl -fsSL --retry 3 -o /tmp/opus.tar.gz \
-            https://codeload.github.com/xiph/opus/tar.gz/refs/tags/v1.5.2
-          rm -rf /tmp/opus-src && mkdir -p /tmp/opus-src
-          tar -xzf /tmp/opus.tar.gz -C /tmp/opus-src
-          mv "$(ls -d /tmp/opus-src/opus-*/ | head -1)" app/src/main/cpp/opus
-          test -f app/src/main/cpp/opus/CMakeLists.txt
-          test -f app/src/main/cpp/opus/include/opus.h
+      - name: Download APK from build-apk
+        uses: actions/download-artifact@v4
+        with:
+          name: app-debug-apk
+          path: apk
+        # 下载到 <repo>/apk/app-debug.apk（working-directory 不作用于 uses 步骤）
 
-      # GitHub ubuntu runner 默认带 /dev/kvm（嵌套虚拟化）；没有它软件模拟基本跑不动
-      - name: Verify KVM
-        run: |
-          if [ ! -e /dev/kvm ]; then
-            echo "::error::/dev/kvm 不存在，无法硬件加速运行 Android 模拟器"
-            exit 1
-          fi
-          ls -la /dev/kvm
+      - name: Verify KVM and AVD prerequisites
+        run: bash ../.github/scripts/verify-kvm.sh
 
-      # 只打 x86_64：省两次跨 ABI 原生编译（opus + JNI），模拟器只要这一个 ABI
-      - name: Assemble debug APK
-        run: ./gradlew :app:assembleDebug --no-daemon -PwomicAbis=x86_64
-
-      - name: Create AVD
-        run: |
-          echo "no" | avdmanager create avd -n womic_interop \
-            -k "system-images;android-34;default;x86_64" -d pixel_6 --force \
-          || echo "no" | avdmanager create avd -n womic_interop \
-            -k "system-images;android-34;default;x86_64" --force
-
-      - name: Start emulator
-        run: |
-          EMU="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}/emulator/emulator"
-          [ -x "$EMU" ] || EMU=emulator
-          nohup "$EMU" -avd womic_interop \
-            -no-window -no-audio -no-boot-anim -no-metrics -accel on \
-            -gpu swiftshader_indirect -memory 2048 > /tmp/emulator.log 2>&1 &
-          adb wait-for-device
-          for i in $(seq 1 60); do
-            boot=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
-            [ "$boot" = "1" ] && break
-            sleep 10
-          done
-          if [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" != "1" ]; then
-            echo "::error::模拟器 10 分钟未启动完成"
-            tail -50 /tmp/emulator.log
-            exit 1
-          fi
-          adb shell input keyevent 82 || true
+      # 关键：绝不使用无超时的 `adb wait-for-device`（上次就是它把作业挂死 25 分钟）。
+      # 改为"进程存活 + adb 设备数 + boot_completed"三重轮询，每 10s 打一行进度，
+      # 失败时自动打印 emulator.log 尾部。
+      - name: Start emulator (with timeout and progress logs)
+        run: bash ../.github/scripts/start-emulator.sh womic_interop android-34
 
       - name: Install and launch app
-        run: |
-          # 模拟器镜像是 userdebug：adb root 后 am start-service 不受后台启动限制
-          adb root
-          adb wait-for-device
-          # -g：安装即授予 RECORD_AUDIO / POST_NOTIFICATIONS 等运行时权限
-          adb install -r -g app/build/outputs/apk/debug/app-debug.apk
-          adb shell wm dismiss-keyguard || true
-          # 先拉前台 Activity：既是 UI 启动冒烟，也让 FGS 启动合规
-          adb shell am start -n com.miclink.open/.MainActivity
-          sleep 3
-          # 调试音模式：不需要真麦克风，440Hz 正弦即可验证整条媒体链路
-          adb shell am start-service -n com.miclink.open/.MicCaptureService \
-            -a com.miclink.open.action.START \
-            --ei extra.control_port 8125 --ei extra.volume 5 --ez extra.debug_tone true
-          sleep 2
-          adb shell dumpsys activity services com.miclink.open | grep -i MicCapture || true
+        run: bash ../.github/scripts/install-app.sh ../apk/app-debug.apk
 
       # 闭环联调：C01~C15 见 android/verify/integration/README.md
       - name: Interop closed loop (pc_client.py)
-        run: python3 verify/integration/pc_client.py --hold-seconds 12
-
-      - name: Collect diagnostics
-        if: failure()
         run: |
-          mkdir -p /tmp/diag
-          adb logcat -d > /tmp/diag/logcat.txt 2>&1 || true
-          cp /tmp/emulator.log /tmp/diag/emulator.log 2>/dev/null || true
-          adb shell dumpsys activity services com.miclink.open > /tmp/diag/services.txt 2>&1 || true
-          adb shell getprop > /tmp/diag/props.txt 2>&1 || true
+          set +e
+          set -o pipefail
+          timeout 240 python3 verify/integration/pc_client.py --hold-seconds 12 2>&1 | tee /tmp/interop.out
+          rc=$?
+          echo "pc_client exit=$rc（0=全绿，1=有断言失败，2=环境错误，124=超时）"
+          exit $rc
+
+      # 无论成功/失败/取消都收集：取消时 previously 什么都没留下，无法事后诊断
+      - name: Collect diagnostics
+        if: always()
+        run: bash ../.github/scripts/collect-diagnostics.sh
 
       - name: Upload diagnostics
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: interop-diagnostics
           path: /tmp/diag/
           if-no-files-found: warn
+          retention-days: 7
 
   windows-interactive:
     name: Windows interactive debug (manual)
     if: github.event_name == 'workflow_dispatch' && inputs.interactive
     runs-on: windows-latest
+    timeout-minutes: 150
     defaults:
       run:
         working-directory: android
@@ -319,7 +228,7 @@ jobs:
           sdkmanager "platforms;android-37.0" "build-tools;36.0.0" `
             "cmake;3.22.1" "ndk;28.2.13676358"
 
-      # 与 app-build 相同：CI 现场下载 opus 源码，缺了它 CMake 会 FATAL_ERROR
+      # 与 build-apk 相同：CI 现场下载 opus 源码，缺了它 CMake 会 FATAL_ERROR
       - name: Fetch Opus source
         shell: pwsh
         run: |
