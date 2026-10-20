@@ -20,6 +20,11 @@ cmake-build-*/
 # ---- Gradle / Android ----
 .gradle/
 local.properties
+# AGP 的 native（CMake/ninja）构建缓存：每次构建可重建，绝不入库
+.cxx/
+# libopus 源码：不内置（体积 + 许可证单独保留），按 android/README.md
+# 下载到 app/src/main/cpp/opus/；CI 现场下载，绝不入库。
+android/app/src/main/cpp/opus/
 
 # ---- CMake ----
 CMakeCache.txt

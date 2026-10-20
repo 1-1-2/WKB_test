@@ -6,6 +6,16 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// ABI 过滤：默认三 ABI（arm64-v8a / armeabi-v7a / x86_64）。
+// CI 的模拟器联调只需 x86_64，用 -PwomicAbis=x86_64 收窄，省两次跨 ABI
+// 原生编译（opus + JNI）；需要全 ABI 时不传该属性即可。
+val womicAbis: List<String> = (project.findProperty("womicAbis") as String?)
+    ?.split(",")
+    ?.map { it.trim() }
+    ?.filter { it.isNotEmpty() }
+    ?.takeIf { it.isNotEmpty() }
+    ?: listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+
 android {
     namespace = "com.miclink.open"
     // Android 17 (API 37)：Compose 1.12 / core-ktx 1.19 / lifecycle 2.11 要求
@@ -64,14 +74,17 @@ android {
     defaultConfig {
         externalNativeBuild {
             cmake {
-                // 默认只打主流 ABI；需要全 ABI 时改成空数组或删除 abiFilters
-                abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+                // 默认只打主流 ABI；需要全 ABI 时改成空数组或删除 abiFilters。
+                // CI 模拟器联调只装 x86_64：./gradlew -PwomicAbis=x86_64
+                abiFilters.clear()
+                abiFilters += womicAbis
                 cFlags += listOf("-fvisibility=hidden", "-O2")
                 cppFlags += listOf("-fvisibility=hidden", "-O2", "-std=c++17")
             }
         }
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+            abiFilters.clear()
+            abiFilters += womicAbis
         }
     }
 
