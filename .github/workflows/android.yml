@@ -66,7 +66,36 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # GitHub 镜像自带 Android SDK；compileSdk 37（platforms;android-37.0，次版本命名）/ build-tools 36 需显式补齐
+      # ubuntu-latest 镜像不再把 cmdline-tools 放进 PATH（实测 sdkmanager: command not found，
+      # 见 run 39408485677），这里自行定位 SDK 并把工具链写入 GITHUB_PATH；
+      # 万一镜像连 cmdline-tools 都没带，就现场下载官方 commandlinetools 包。
+      - name: Set up Android SDK tools
+        run: |
+          set -e
+          SDK=""
+          for cand in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk /opt/android-sdk; do
+            if [ -n "$cand" ] && [ -d "$cand" ]; then SDK="$cand"; break; fi
+          done
+          SDK="${SDK:-/usr/local/lib/android/sdk}"
+          TOOLS="$(ls -d "$SDK"/cmdline-tools/*/bin 2>/dev/null | tail -1)"
+          if [ -z "$TOOLS" ]; then
+            echo "镜像缺少 cmdline-tools，下载官方 commandlinetools"
+            curl -fsSL --retry 3 -o /tmp/cmdline-tools.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            mkdir -p "$SDK/cmdline-tools"
+            unzip -q /tmp/cmdline-tools.zip -d "$SDK/cmdline-tools"
+            mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+            TOOLS="$SDK/cmdline-tools/latest/bin"
+          fi
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "$TOOLS" >> "$GITHUB_PATH"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK/emulator" >> "$GITHUB_PATH"
+          echo "SDK=$SDK  TOOLS=$TOOLS"
+          "$TOOLS/sdkmanager" --version | head -1
+
+      # compileSdk 37（platforms;android-37.0，次版本命名）/ build-tools 36 需显式补齐；
       # CMake 版本由 app/build.gradle.kts 的 externalNativeBuild.cmake.version 固定为 3.22.1；
       # NDK 用 AGP 9.1 默认的 28.2.13676358（本地实测值，见 docs/VERIFICATION.md）
       - name: Install Android SDK components
@@ -115,6 +144,33 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+
+      # 同 app-build：ubuntu-latest 的 cmdline-tools 不在 PATH，自行定位/补齐
+      - name: Set up Android SDK tools
+        run: |
+          set -e
+          SDK=""
+          for cand in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" /usr/local/lib/android/sdk /opt/android-sdk; do
+            if [ -n "$cand" ] && [ -d "$cand" ]; then SDK="$cand"; break; fi
+          done
+          SDK="${SDK:-/usr/local/lib/android/sdk}"
+          TOOLS="$(ls -d "$SDK"/cmdline-tools/*/bin 2>/dev/null | tail -1)"
+          if [ -z "$TOOLS" ]; then
+            echo "镜像缺少 cmdline-tools，下载官方 commandlinetools"
+            curl -fsSL --retry 3 -o /tmp/cmdline-tools.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            mkdir -p "$SDK/cmdline-tools"
+            unzip -q /tmp/cmdline-tools.zip -d "$SDK/cmdline-tools"
+            mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+            TOOLS="$SDK/cmdline-tools/latest/bin"
+          fi
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "$TOOLS" >> "$GITHUB_PATH"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK/emulator" >> "$GITHUB_PATH"
+          echo "SDK=$SDK  TOOLS=$TOOLS"
+          "$TOOLS/sdkmanager" --version | head -1
 
       # 联调需要：编译平台（android-37.0）+ 运行镜像（android-34）+ emulator + platform-tools
       # + CMake 3.22.1 / NDK 28.2.13676358（原生 opus 编译）
@@ -234,6 +290,27 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+
+      # windows-latest 的 SDK 布局随镜像变化：显式定位 cmdline-tools 并写入 GITHUB_PATH。
+      # 这是手动交互作业，找不到时直接报错（会话里可人工追加安装）。
+      - name: Set up Android SDK tools
+        shell: pwsh
+        run: |
+          $cands = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT,
+                     "C:\Android\android-sdk", "$env:LOCALAPPDATA\Android\Sdk") |
+                   Where-Object { $_ -and (Test-Path $_) }
+          $sdk = $cands | Select-Object -First 1
+          if (-not $sdk) { throw "未找到 Android SDK（ANDROID_HOME/ANDROID_SDK_ROOT 均为空且默认路径不存在）" }
+          $ct = Get-ChildItem "$sdk\cmdline-tools" -Directory -ErrorAction SilentlyContinue |
+                Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $ct) { throw "$sdk\cmdline-tools 下没有可用的 cmdline-tools" }
+          $bin = Join-Path $ct.FullName "bin"
+          "ANDROID_HOME=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ANDROID_SDK_ROOT=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Append
+          "$sdk\platform-tools" | Out-File -FilePath $env:GITHUB_PATH -Append
+          Write-Host "SDK=$sdk  TOOLS=$bin"
+          & (Join-Path $bin "sdkmanager.bat") --version
 
       - name: Install Android SDK components
         shell: pwsh
