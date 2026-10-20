@@ -243,6 +243,91 @@ out=$(PATH="$STUB:$PATH" ANDROID_DIR="$FAKE_ANDROID13" bash "$SCRIPTS/fetch-opus
 assert_contains "$out" "::error::" "T13b 输出 ::error::"
 
 # ---------------------------------------------------------------------------
+# T14/T15：pc_client.py 的 AdbUdpTap.restart()
+#
+# 背景：toybox `nc -u -l` 收到首个数据报后 xconnect 到该对端
+# （netcat.c:229），之后内核只交付该对端的包；app 每个会话新建
+# DatagramSocket（新源端口）→ 重连会话必须换一个新监听，否则 C15
+# udp=none（run 39473353065 实证）。这里用假 adb 验证 restart 的
+# 行为契约：换新进程、旧进程退出、parser/queue 换新、起不来时重试。
+# ---------------------------------------------------------------------------
+REPO_ROOT="$(cd "$SCRIPTS/../.." && pwd)"
+TAP_STUB="$TMP/bin/adb-tap"
+cat > "$TAP_STUB" <<'STUB_EOF'
+#!/usr/bin/env bash
+# FAKE_ADB_NC_FAILS_ON: 空格分隔的调用序号列表，命中序号的 nc 调用立即退出
+# （模拟"旧 nc 还没释放端口/新 nc 绑定失败"）；其余 nc 调用常驻（sleep）。
+if [ "${1:-}" = "shell" ]; then
+  shift
+  # pkill 的模式串里也含 "nc -u -l" 字样，必须先于 nc 匹配退出，否则挂起
+  case "$*" in
+    pkill*) exit 0 ;;
+  esac
+  case "$*" in
+    *"nc -u -l"*|*"nc -ulp"*)
+      if [ "${FAKE_ADB_NC_FAILS_ON:-}" ]; then
+        cnt_file="${FAKE_ADB_NC_COUNT:-/tmp/fake_adb_tap_count}"
+        n=$(( $(cat "$cnt_file" 2>/dev/null || echo 0) + 1 ))
+        echo "$n" > "$cnt_file"
+        for bad in $FAKE_ADB_NC_FAILS_ON; do
+          [ "$n" -eq "$bad" ] && exit 1
+        done
+      fi
+      exec sleep 600 ;;
+    *) exit 0 ;;
+  esac
+fi
+exit 0
+STUB_EOF
+chmod +x "$TAP_STUB"
+
+cat > "$TMP/restart_test.py" <<'PY'
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import pc_client
+
+adb = pc_client.Adb(sys.argv[2])
+tap = pc_client.AdbUdpTap(adb, 5004)
+old_pid = tap.proc.pid
+old_parser = tap.parser
+try:
+    tap.restart()
+    assert tap.proc is not None and tap.proc.poll() is None, "restart 后监听应存活"
+    new_pid = tap.proc.pid
+    assert new_pid != old_pid, "restart 后应换新进程（旧 %d 新 %d）" % (old_pid, new_pid)
+    try:
+        os.kill(old_pid, 0); alive = True
+    except OSError:
+        alive = False
+    assert not alive, "旧 nc 宿主进程应已退出"
+    assert tap.parser is not old_parser, "parser 应换新（杜绝残字节喂新会话）"
+    assert tap.queue.empty(), "queue 应为空"
+    assert tap.received == 0, "received 应清零"
+    print("RESTART-OK %d -> %d" % (old_pid, new_pid))
+finally:
+    tap.close()
+PY
+
+echo "== T14 AdbUdpTap.restart: 换新监听、旧进程退出、状态清零 =="
+out=$(python3 "$TMP/restart_test.py" "$REPO_ROOT/android/verify/integration" "$TAP_STUB" 2>&1); rc=$?
+assert_eq "$rc" "0" "T14a restart 基本路径成功"
+assert_contains "$out" "RESTART-OK" "T14b 报告新旧进程 pid"
+
+echo "== T15 AdbUdpTap.restart: 前两次监听起不来时自动重试 =="
+rm -f "$TMP/nc_count15"
+out=$(FAKE_ADB_NC_FAILS_ON="2 3" FAKE_ADB_NC_COUNT="$TMP/nc_count15" \
+      python3 "$TMP/restart_test.py" "$REPO_ROOT/android/verify/integration" "$TAP_STUB" 2>&1); rc=$?
+assert_eq "$rc" "0" "T15a 重试后成功"
+assert_contains "$out" "RESTART-OK" "T15b 报告新旧进程 pid"
+
+echo "== T16 AdbUdpTap.restart: 始终起不来时必须报错而不是假装成功 =="
+rm -f "$TMP/nc_count16"
+out=$(FAKE_ADB_NC_FAILS_ON="2 3 4 5 6 7 8 9" FAKE_ADB_NC_COUNT="$TMP/nc_count16" \
+      python3 "$TMP/restart_test.py" "$REPO_ROOT/android/verify/integration" "$TAP_STUB" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "T16a 退出码非 0" || bad "T16a 退出码非 0" "实得 $rc"
+assert_contains "$out" "无法启动 UDP 监听" "T16b 报错信息可定位"
+
+# ---------------------------------------------------------------------------
 echo
 echo "================ 单元测试结果 ================"
 echo "  通过 $PASS，失败 $FAIL"

@@ -18,6 +18,11 @@ on:
         type: boolean
         required: false
         default: false
+      linux_debug:
+        description: 'Linux 交互式调试（模拟器已就绪后开 SSH 会话，可直接改脚本重跑）'
+        type: boolean
+        required: false
+        default: false
 
 # 作业是一条流水线（needs 串联），不是四个平行作业各做一遍同样的事：
 #
@@ -39,9 +44,12 @@ on:
 
 # 同一分支连续 push 时取消上一轮（省 runner 分钟、避免排队）；
 # 注意：这里的 cancelled 是**主动取消旧 run**，不是失败。
+#
+# 但手动触发（workflow_dispatch，含 Linux SSH 调试会话）必须自成一组且不取消别人：
+# 否则一次 push 就会把正在连着的调试会话掐断（实测发生过）。
 concurrency:
-  group: android-${{ github.ref }}
-  cancel-in-progress: true
+  group: android-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   protocol-tests:
@@ -52,10 +60,10 @@ jobs:
       run:
         working-directory: android
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
@@ -66,7 +74,7 @@ jobs:
 
       - name: Upload test report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: core-test-report
           path: android/core/build/reports/tests/
@@ -78,7 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Run CI script tests (stub adb/emulator/avdmanager)
         timeout-minutes: 5
@@ -93,10 +101,10 @@ jobs:
       run:
         working-directory: android
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
@@ -130,7 +138,7 @@ jobs:
 
       - name: Upload APK
         timeout-minutes: 5
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: app-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
@@ -146,10 +154,10 @@ jobs:
       run:
         working-directory: android
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
@@ -169,7 +177,7 @@ jobs:
 
       - name: Download APK from build-apk
         timeout-minutes: 5
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: app-debug-apk
           path: apk
@@ -229,12 +237,113 @@ jobs:
       - name: Upload diagnostics
         if: always()
         timeout-minutes: 5
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: interop-diagnostics
           path: /tmp/diag/
           if-no-files-found: warn
           retention-days: 7
+
+  # 调试用：把"装环境 + 起模拟器 + 装 app"全部做完后开一个 SSH 会话。
+  # 会话里可以直接：改脚本 / git pull / 重跑 pc_client.py / 看 logcat / tail -f 日志，
+  # 不必每次都重新触发一次完整流水线（省掉 SDK 安装 + 三 ABI 编译的 5 分钟）。
+  linux-debug:
+    name: Linux interactive debug (manual, SSH)
+    if: github.event_name == 'workflow_dispatch' && inputs.linux_debug
+    needs: build-apk
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK tools
+        timeout-minutes: 5
+        run: bash ../.github/scripts/setup-android-sdk.sh
+
+      - name: Install emulator components
+        timeout-minutes: 15
+        run: |
+          sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "emulator" "system-images;android-34;default;x86_64"
+
+      - name: Install emulator system dependencies
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            libpulse0 libnss3 libxdamage1 libxcomposite1 libxcursor1 \
+            libxi6 libxtst6 libglu1-mesa
+
+      - name: Download APK from build-apk
+        timeout-minutes: 5
+        uses: actions/download-artifact@v8
+        with:
+          name: app-debug-apk
+          path: apk
+
+      - name: Verify KVM and AVD prerequisites
+        timeout-minutes: 3
+        continue-on-error: true
+        run: bash ../.github/scripts/verify-kvm.sh
+
+      # 失败也继续：目的就是进去手工排查
+      - name: Start emulator
+        timeout-minutes: 12
+        continue-on-error: true
+        run: bash ../.github/scripts/start-emulator.sh womic_interop android-34
+
+      - name: Install and launch app
+        timeout-minutes: 10
+        continue-on-error: true
+        run: bash ../.github/scripts/install-app.sh ../apk/app-debug.apk
+
+      - name: Print session cheat sheet
+        run: |
+          {
+            echo "## 交互式调试会话"
+            echo
+            echo "连接后先跑 \`bash .github/scripts/debug-help.sh\` 查看当前状态。"
+            echo
+            echo "| 想做什么 | 命令 |"
+            echo "|---|---|"
+            echo "| 看当前状态 | \`bash .github/scripts/debug-help.sh\` |"
+            echo "| 重跑协议闭环 | \`python3 verify/integration/pc_client.py --hold-seconds 12 2>&1 \\| tee /tmp/interop.out\` |"
+            echo "| 实时看模拟器日志 | \`tail -f /tmp/emulator.log\` |"
+            echo "| 实时看 logcat | \`adb logcat \\| grep -iE 'miclink\\|womic\\|UdpSender'\` |"
+            echo "| 同步最新的脚本改动 | \`git fetch origin && git checkout origin/dev/wifi-client -- .github/scripts\` |"
+            echo "| 收集诊断 | \`bash ../.github/scripts/collect-diagnostics.sh\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # SSH 交互通道：WarpBuilds/action-debugger（tmate 系，中继 gha.warp.build）。
+      #
+      # 授权方式：limit-access-to-actor=true 时只放行**触发者 GitHub 档案里
+      # 注册的 SSH 公钥**（https://github.com/settings/keys）。若档案里没有
+      # 公钥，本步骤直接报 "No public SSH keys registered with <actor>'s
+      # GitHub profile" 并失败——这不是 bug，去设置页加一把公钥即可
+      # （私钥留在自己机器上，连接时 ssh -i <私钥> <日志里的连接串>）。
+      #
+      # 已移除的旧通道：公共 tmate.io / nyc1.tmate.io——两站点 DNS 均已失效
+      # （沙箱与 runner 双侧实证：tmate 步骤 40s 拿不到连接串、artifact 为
+      # 空 zip），继续留着只会误导。action-debugger 的 gha.warp.build 可达
+      # （沙箱实测 tcp/22 OK）。
+      #
+      # 连接串位置：本步骤日志里会打印 ssh 命令（job 日志需作业结束后才能
+      # 下载，所以先手动触发本作业、等它打印连接串再连；会话最长保留到
+      # 本步骤的 timeout）。
+      - name: Interactive SSH session (action-debugger)
+        uses: WarpBuilds/action-debugger@v1.3
+        with:
+          limit-access-to-actor: true
+        timeout-minutes: 110
 
   windows-interactive:
     name: Windows interactive debug (manual)
@@ -245,10 +354,10 @@ jobs:
       run:
         working-directory: android
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'

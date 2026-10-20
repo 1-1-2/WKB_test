@@ -14,6 +14,32 @@
 | `watch-ci-run.sh` | 外部看门狗：按步骤预算判断是否卡死，超预算主动 `cancel` | 步骤级实时进度（GitHub 无运行中行级日志 API） |
 | `tests/run-tests.sh` | 上面脚本的单元测试 | stub 的 adb/emulator/avdmanager，不需要设备 |
 
+## 交互式调试（SSH 进 runner）：现状与前置条件
+
+`linux-debug` 作业（手动触发）会 boot 模拟器、装好 app，然后用
+`WarpBuilds/action-debugger@v1.3` 开一个可交互的 SSH 会话（中继
+`gha.warp.build`，沙箱实测 tcp/22 可达）。
+
+| 通道 | 实测结果 | 说明 |
+|---|---|---|
+| 公共 `tmate.io` / `nyc1.tmate.io` | ❌ DNS 已失效 | 双侧实证：沙箱解析失败；runner 内 tmate 步骤 40s 拿不到连接串、artifact 为空 zip。**已从工作流移除**，别再走这条路 |
+| `WarpBuilds/action-debugger@v1.3` | ✅ 通道可用，但需一次性的用户操作 | `limit-access-to-actor: true` 时，它用**触发者 GitHub 账号已注册的 SSH 公钥**做授权；账号没注册公钥就直接报 `No public SSH keys registered with <actor>'s GitHub profile` |
+
+**一次性前置条件（只有用户本人能做）**：
+1. 生成密钥对（助手可代生成）：`ssh-keygen -t ed25519 -f womic_ci_debug -N ""`；
+2. 把**公钥**贴到 GitHub **Settings → SSH and GPG keys**（需登录账号，
+   API token 无权代改用户档案）；
+3. 手动触发 `android.yml`（`linux_debug=true`），等 `Interactive SSH session`
+   步骤在日志里打印连接串；
+4. 连接：`ssh -i <私钥路径> <日志里的连接串>`。会话最长保留到该步骤的
+   timeout（110 分钟）。
+
+> 安全提示：仓库是公开的，**不要**为了省事去掉 `limit-access-to-actor`——
+> 那样连接串本身就是凭证，任何拿到日志/artifact 的人都能进 runner。
+
+在那之前，调试靠"失败后读 artifact 里的 logcat / emulator.log / interop.out"——
+这一路已经能定位到心跳、看门狗、Opus、UDP 目标等具体问题（run 39470634964 实证）。
+
 ## 跑单元测试
 
 ```bash

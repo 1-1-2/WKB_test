@@ -376,8 +376,19 @@ class FormatCParser:
 class AdbUdpTap:
     """模拟器内 `toybox nc -u -l -p PORT`，回收的字节流重分帧。
 
-    必须在 103 START 之前启动：app 的 UDP 是 connect 语义，监听不存在时会
-    收到 ICMP port-unreachable 并把 socket 打坏（UdpSender.send 连续失败）。
+    必须在 103 START 之前启动：app 的 UDP socket 未 connect，Linux 不会把
+    ICMP port-unreachable 上报给发送方，但监听就绪再 START 更接近真实场景
+    （真实 PC 客户端总是先占住媒体端口）。
+
+    **已知局限（重连会话必须 restart）**：toybox `nc -u -l` 收到**首个**数据报后
+    会把 socket connect 到该对端（netcat.c：recvfrom(..., MSG_PEEK) 取到对端
+    地址后 xconnect），之后内核只交付该对端的包。而 app 每个会话都会新建
+    DatagramSocket（UdpSender.open() 先 close 再建），第二会话的源端口必然
+    不同 → 旧监听把新会话的包全部丢弃。run 39473353065 实证：重连后 app 侧
+    "已打开 UDP -> 127.0.0.1:5004" + "合成 440.0Hz 正弦"日志齐全、UdpSender
+    无任何发送错误，PC 却 10s 收不到一个包（C15 udp=none）。这不是 app 缺陷
+    （真实 PC 客户端用未 connect 的 UDP socket，从任何源端口都能收），而是本
+    harness 的局限，所以重连前必须 restart() 换一个未 connect 的新监听。
     """
 
     MODE = "adb"
@@ -389,6 +400,7 @@ class AdbUdpTap:
         self.parser = FormatCParser()
         self.queue = queue.Queue()
         self.received = 0
+        self._pump_thread = None
         self._start_process()
 
     def _start_process(self):
@@ -411,7 +423,11 @@ class AdbUdpTap:
             if proc.poll() is None:
                 self.proc = proc
                 self.cmd = cmd
-                threading.Thread(target=self._pump, name="udp-tap", daemon=True).start()
+                # proc 以参数传入：restart() 换新进程后，旧线程仍读旧管道，
+                # 不会串到新会话的字节流上
+                self._pump_thread = threading.Thread(
+                    target=self._pump, args=(proc,), name="udp-tap", daemon=True)
+                self._pump_thread.start()
                 return
             proc.kill()
         raise EnvError(
@@ -419,10 +435,10 @@ class AdbUdpTap:
             "请确认系统镜像是标准 Android 镜像（含 toybox nc）。" % " / ".join(candidates)
         )
 
-    def _pump(self):
+    def _pump(self, proc):
         while True:
             try:
-                chunk = self.proc.stdout.read(65536)
+                chunk = proc.stdout.read(65536)
             except OSError:
                 return
             if not chunk:
@@ -445,6 +461,32 @@ class AdbUdpTap:
                 continue
             self.parser.feed(chunk)
 
+    def restart(self, attempts=4):
+        """换一个全新的设备内监听（重连会话专用；host tap 无此问题）。
+
+        原理见类文档字符串：toybox nc 的 connect-to-first-peer 语义会让旧监听
+        丢掉 app 第二会话（新 DatagramSocket、新源端口）的全部包。这里关旧起新，
+        并把 parser/queue 一起换掉，杜绝把上个会话的残字节喂给新会话。
+
+        调用时机：app 的 CONFIG 与 START 之间——那段时间 app 不发 UDP，
+        更换监听零丢包风险。旧 nc 退出到端口释放可能有几百 ms 延迟，
+        新监听起不来时自动重试。
+        """
+        self.close()
+        last_err = None
+        for _ in range(attempts):
+            # 换干净的解析器/队列：杜绝把上个会话的残字节喂给新会话
+            self.parser = FormatCParser()
+            self.queue = queue.Queue()
+            self.received = 0
+            try:
+                self._start_process()
+                return
+            except EnvError as e:
+                last_err = e
+                time.sleep(0.8)
+        raise last_err if last_err else EnvError("UDP 监听重启失败")
+
     def close(self):
         if self.proc is not None:
             try:
@@ -455,6 +497,13 @@ class AdbUdpTap:
                 self.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+            self.proc = None
+        # 等旧读取线程自然退出（管道 EOF）：否则 restart 后两个线程会同时
+        # 往 queue 里灌新旧会话的字节
+        t = self._pump_thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=3)
+        self._pump_thread = None
         # 兜底：确保设备侧 nc 也退出（覆盖两种命令形式的匹配）
         for pattern in ("nc -u -l -p %d" % self.media_port, "nc -ulp %d" % self.media_port):
             try:
@@ -722,6 +771,13 @@ def run_interop(args):
     results.check("C01", "tcp_connect",
                   True, "%s:%d 已连接" % (args.control_host, args.control_port))
 
+    # ---- 心跳必须**连接即开始** ----
+    # 官方 app 的看门狗是连接级的（accept 后立刻开始计时，每 5s 检查一次），
+    # 与推流与否无关。上版把心跳放在"等首包 10s"之后才启动，结果 app 在
+    # 连接后 5s 就把链断了（run 39464501266 日志：看门狗超时 → 采集线程退出）。
+    heartbeats = Heartbeats(client, interval=args.heartbeat_interval)
+    heartbeats.start()
+
     # ---- hello（101）----
     client.send_frame(MSG_HELLO, HELLO_PAYLOAD)
     reply = client.recv_frame(timeout=10)
@@ -761,13 +817,17 @@ def run_interop(args):
     first_packet_failed = False
     if pkt is None:
         first_packet_failed = True
-        # 没有 UDP 流，后续断言全部失去意义：探一下 TCP 是否还活着，给出指向性诊断后收尾
-        tcp_alive = client.recv_frame(timeout=1.0) is None
+        # 没有 UDP 流，后续断言全部失去意义：探一下 TCP 是否还活着，给出指向性诊断后收尾。
+        # 注意：对端关闭时 recv_frame 抛 ConnectionClosed，必须兜住（否则整个脚本崩掉）。
+        try:
+            alive = client.recv_frame(timeout=1.0) is None
+            state = "仍存活（app 在跑但没发包：查 OpusEncoder/UdpSender）" \
+                if alive else "已收到帧（异常）"
+        except ConnectionClosed:
+            state = "已断开（app 侧主动关闭：看门狗超时？或 app 报错退出，查 logcat）"
         results.check("C05", "udp_first_packet_format_c", False,
                       "%ds 内未收到任何 UDP 包；TCP 控制通道%s"
-                      % (args.first_packet_timeout,
-                         "仍存活（app 在跑但没发包：查 OpusEncoder/UdpSender）"
-                         if tcp_alive else "已断开（app 侧报错退出：查 logcat）"))
+                      % (args.first_packet_timeout, state))
         results.info("诊断建议：adb logcat -d | grep -iE 'womic|UdpSender|OpusEncoder|MicCapture'")
     else:
         hdr = tracker.observe(pkt)
@@ -788,6 +848,7 @@ def run_interop(args):
 
     if first_packet_failed:
         # 提前收尾：UDP 流不存在时，推流质量/看门狗/重连断言都无从谈起
+        heartbeats.stop()
         try:
             client.close()
         except OSError:
@@ -801,16 +862,21 @@ def run_interop(args):
         return results.summary()
 
     # ---- 推流观察窗口（心跳跨看门狗 + 流质量断言）----
-    heartbeats = Heartbeats(client, interval=args.heartbeat_interval)
-    heartbeats.start()
+    # 心跳线程已在 C01 之后启动（见上），这里直接进入观察窗口
     window_start = time.monotonic()
     deadline = window_start + args.hold_seconds
     dumped = 1 if args.dump_packets > 0 else 0
+    # 看门狗第一个检查点在连接后 5s；若 6s 之后仍在收包，说明心跳把它喂住了。
+    # 之前用"最后一包距现在 < 2s"做判据会误判：nc 的 stdout 有缓冲，数据可能
+    # 成批到达，最后一包的到达时刻不代表窗口末段没有流量（run 39470634964 实证）。
+    late_count = 0
     while time.monotonic() < deadline:
         pkt = tap.read_packet(timeout=0.25)
         if pkt is None:
             continue
         tracker.observe(pkt)
+        if (time.monotonic() - window_start) > (WATCHDOG_MS / 1000.0) + 1.0:
+            late_count += 1
         if dumped < args.dump_packets:
             print("       [dump] seq=%d %s" % (tracker.prev_seq, hexs(pkt[:48])), flush=True)
             dumped += 1
@@ -832,15 +898,13 @@ def run_interop(args):
     results.check("C10", "udp_rate_sane", rate >= args.min_rate,
                   "%.1f 包/秒（窗口 %.1fs，共 %d 包，阈值 %.1f）"
                   % (rate, window_seconds, tracker.count, args.min_rate))
-    # 看门狗生存：窗口 > 5s（看门狗周期）且末段仍有包 → 心跳跨过了看门狗
+    # 看门狗生存：窗口跨过第 1 个检查点（5s）之后仍在持续收包 → 心跳喂住了看门狗
     alive_after_watchdog = (
-        window_seconds > (WATCHDOG_MS / 1000.0) + 1.0
-        and tracker.last_packet_at is not None
-        and (time.monotonic() - tracker.last_packet_at) < 2.0
+        window_seconds > (WATCHDOG_MS / 1000.0) + 1.0 and late_count > 0
     )
     results.check("C11", "heartbeat_survives_watchdog", alive_after_watchdog,
-                  "窗口 %.1fs > 看门狗 %ds，且连接仍存活（心跳已发 %d 个）"
-                  % (window_seconds, WATCHDOG_MS // 1000, heartbeats.sent))
+                  "窗口 %.1fs > 看门狗 %ds；其后（>6s）又收到 %d 包，心跳已发 %d 个"
+                  % (window_seconds, WATCHDOG_MS // 1000, late_count, heartbeats.sent))
     results.info("payload 长度分布：min=%dB max=%dB avg=%dB"
                  % (min(tracker.payload_lens) if tracker.payload_lens else 0,
                     max(tracker.payload_lens) if tracker.payload_lens else 0,
@@ -881,6 +945,10 @@ def run_interop(args):
     tracker.reset()
     try:
         client2 = connect_with_retry(args.control_host, args.control_port, args.reconnect_timeout)
+        # 重连 = 全新会话，app 会起一个**新的**看门狗，因此心跳必须重新发，
+        # 否则 5s 后又被断（run 39470634964 日志实证：重连后 5s 看门狗超时）。
+        heartbeats2 = Heartbeats(client2, interval=args.heartbeat_interval)
+        heartbeats2.start()
         ok = True
         detail = []
         client2.send_frame(MSG_HELLO, HELLO_PAYLOAD)
@@ -892,6 +960,13 @@ def run_interop(args):
         r = client2.recv_frame(timeout=10)
         ok = ok and r is not None and r[0] == MSG_CONFIG and r[1] == bytes([0])
         detail.append("config=%s" % ("ok" if r and r[0] == MSG_CONFIG and r[1] == bytes([0]) else "bad"))
+        # app 每个会话新建 DatagramSocket（新源端口），旧 nc 已 connect 到上个
+        # 会话的源端口、收不到新会话的包（toybox netcat.c xconnect 语义；
+        # run 39473353065 实证 C15 udp=none）。在 START 之前换一个新监听：
+        # app 在 CONFIG→START 之间不发 UDP，此时更换零丢包风险。
+        if tap.MODE == "adb":
+            tap.restart()
+            results.info("C15：已更换 UDP 监听以适配新会话源端口（toybox nc connect 语义）")
         client2.send_frame(MSG_START)
         r = client2.recv_frame(timeout=10)
         ok = ok and r is not None and r[0] == MSG_START and r[1] == bytes([0])
@@ -904,7 +979,9 @@ def run_interop(args):
         r = client2.recv_frame(timeout=10)
         ok = ok and r is not None and r[0] == MSG_CONFIG and r[1] == bytes([0])
         detail.append("stop_quirk=%s" % ("ok" if r and r[0] == MSG_CONFIG else "bad"))
-        results.check("C15", "reconnect_full_session", ok, "，".join(detail))
+        results.check("C15", "reconnect_full_session", ok, "，".join(detail)
+                      + ("，心跳 %d 个" % heartbeats2.sent))
+        heartbeats2.stop()
         client2.close()
     except (EnvError, ConnectionClosed) as e:
         results.check("C15", "reconnect_full_session", False, str(e))
