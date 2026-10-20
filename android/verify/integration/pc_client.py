@@ -817,11 +817,17 @@ def run_interop(args):
     window_start = time.monotonic()
     deadline = window_start + args.hold_seconds
     dumped = 1 if args.dump_packets > 0 else 0
+    # 看门狗第一个检查点在连接后 5s；若 6s 之后仍在收包，说明心跳把它喂住了。
+    # 之前用"最后一包距现在 < 2s"做判据会误判：nc 的 stdout 有缓冲，数据可能
+    # 成批到达，最后一包的到达时刻不代表窗口末段没有流量（run 39470634964 实证）。
+    late_count = 0
     while time.monotonic() < deadline:
         pkt = tap.read_packet(timeout=0.25)
         if pkt is None:
             continue
         tracker.observe(pkt)
+        if (time.monotonic() - window_start) > (WATCHDOG_MS / 1000.0) + 1.0:
+            late_count += 1
         if dumped < args.dump_packets:
             print("       [dump] seq=%d %s" % (tracker.prev_seq, hexs(pkt[:48])), flush=True)
             dumped += 1
@@ -843,15 +849,13 @@ def run_interop(args):
     results.check("C10", "udp_rate_sane", rate >= args.min_rate,
                   "%.1f 包/秒（窗口 %.1fs，共 %d 包，阈值 %.1f）"
                   % (rate, window_seconds, tracker.count, args.min_rate))
-    # 看门狗生存：窗口 > 5s（看门狗周期）且末段仍有包 → 心跳跨过了看门狗
+    # 看门狗生存：窗口跨过第 1 个检查点（5s）之后仍在持续收包 → 心跳喂住了看门狗
     alive_after_watchdog = (
-        window_seconds > (WATCHDOG_MS / 1000.0) + 1.0
-        and tracker.last_packet_at is not None
-        and (time.monotonic() - tracker.last_packet_at) < 2.0
+        window_seconds > (WATCHDOG_MS / 1000.0) + 1.0 and late_count > 0
     )
     results.check("C11", "heartbeat_survives_watchdog", alive_after_watchdog,
-                  "窗口 %.1fs > 看门狗 %ds，且连接仍存活（心跳已发 %d 个）"
-                  % (window_seconds, WATCHDOG_MS // 1000, heartbeats.sent))
+                  "窗口 %.1fs > 看门狗 %ds；其后（>6s）又收到 %d 包，心跳已发 %d 个"
+                  % (window_seconds, WATCHDOG_MS // 1000, late_count, heartbeats.sent))
     results.info("payload 长度分布：min=%dB max=%dB avg=%dB"
                  % (min(tracker.payload_lens) if tracker.payload_lens else 0,
                     max(tracker.payload_lens) if tracker.payload_lens else 0,
@@ -892,6 +896,10 @@ def run_interop(args):
     tracker.reset()
     try:
         client2 = connect_with_retry(args.control_host, args.control_port, args.reconnect_timeout)
+        # 重连 = 全新会话，app 会起一个**新的**看门狗，因此心跳必须重新发，
+        # 否则 5s 后又被断（run 39470634964 日志实证：重连后 5s 看门狗超时）。
+        heartbeats2 = Heartbeats(client2, interval=args.heartbeat_interval)
+        heartbeats2.start()
         ok = True
         detail = []
         client2.send_frame(MSG_HELLO, HELLO_PAYLOAD)
@@ -915,7 +923,9 @@ def run_interop(args):
         r = client2.recv_frame(timeout=10)
         ok = ok and r is not None and r[0] == MSG_CONFIG and r[1] == bytes([0])
         detail.append("stop_quirk=%s" % ("ok" if r and r[0] == MSG_CONFIG else "bad"))
-        results.check("C15", "reconnect_full_session", ok, "，".join(detail))
+        results.check("C15", "reconnect_full_session", ok, "，".join(detail)
+                      + ("，心跳 %d 个" % heartbeats2.sent))
+        heartbeats2.stop()
         client2.close()
     except (EnvError, ConnectionClosed) as e:
         results.check("C15", "reconnect_full_session", False, str(e))

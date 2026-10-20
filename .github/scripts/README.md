@@ -14,6 +14,26 @@
 | `watch-ci-run.sh` | 外部看门狗：按步骤预算判断是否卡死，超预算主动 `cancel` | 步骤级实时进度（GitHub 无运行中行级日志 API） |
 | `tests/run-tests.sh` | 上面脚本的单元测试 | stub 的 adb/emulator/avdmanager，不需要设备 |
 
+## 交互式调试（SSH 进 runner）：现状与前置条件
+
+已实测（`linux-debug` 作业，run 39470807984），两条路子都被环境挡住，记在这里
+避免重复踩：
+
+| 通道 | 实测结果 | 说明 |
+|---|---|---|
+| 自建 `tmate`（apt 装，连接串经 artifact 发布） | ❌ 拿不到连接串 | `tmate.io` 公共服务器已停服（tmate 项目 2024 起停止维护），`tmate_ssh` 变量一直为空 |
+| `WarpBuilds/action-debugger@v1.3` | ❌ `No public SSH keys registered with 1-1-2's GitHub profile` | 开 `limit-access-to-actor: true` 时，它用**你的 GitHub 账号已注册的 SSH 公钥**做授权；账号没注册公钥就直接报错 |
+
+要让 SSH 调试可用，需要做的两件事：
+1. 在 GitHub 账号 **Settings → SSH and GPG keys** 添加至少一把公钥
+   （`action-debugger` 靠它判断"谁可以连"）；
+2. 连接串的获取：`action-debugger` 只在运行日志里打印，而 GitHub **没有运行中
+   作业的行级日志 API**，所以要先把连接串写到文件并用 artifact 发布（作业运行中
+   就能下载），或改用它写入 `$GITHUB_STEP_SUMMARY` 的部分（只有 UI 可见）。
+
+在那之前，调试靠"失败后读 artifact 里的 logcat / emulator.log / interop.out"——
+这一路已经能定位到心跳、看门狗、Opus、UDP 目标等具体问题（run 39470634964 实证）。
+
 ## 跑单元测试
 
 ```bash
