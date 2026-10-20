@@ -1,9 +1,6 @@
-// 根构建脚本：只声明插件版本，具体配置在 app/build.gradle.kts。
+// Root build file - plugins are declared here and applied in modules.
 plugins {
-    id("com.android.application") version "8.1.4" apply false
-    id("org.jetbrains.kotlin.android") version "1.9.22" apply false
-}
-
-tasks.register<Delete>("clean") {
-    delete(rootProject.layout.buildDirectory)
+    alias(libs.plugins.android.application) apply false
+    alias(libs.plugins.kotlin.jvm) apply false
+    alias(libs.plugins.kotlin.compose) apply false
 }
