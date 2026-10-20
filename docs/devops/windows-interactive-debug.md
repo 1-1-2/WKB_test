@@ -5,6 +5,16 @@
 > **`WarpBuilds/action-debugger@v1.3`**（tmate 的定制分支，支持 Linux/macOS/Windows）。
 > 本仓库的 `.github/workflows/android.yml` 已按其能力配置 `windows-interactive` 作业。
 
+> **与 `integration-test` 作业的分工**（别混用）：
+> | 作业 | 跑在哪 | 干什么 | 触发 |
+> |---|---|---|---|
+> | `integration-test` | ubuntu-latest + KVM 模拟器 | **自动化**协议闭环（真 APK ↔ `pc_client.py`，C01–C15），无人值守、逐条断言 | push / PR / 手动 |
+> | `windows-interactive` | windows-latest + SSH 会话 | **人工**排查：装官方客户端、抓包回放、看注册表/断点 | 仅手动勾选 |
+>
+> 之所以自动化闭环不放 Windows：GitHub 的 windows-latest 不提供可用的嵌套虚拟化，
+> Android 模拟器只能软件模拟，启动慢且不稳定；ubuntu-latest 有 `/dev/kvm`，
+> 模拟器能在 1 分钟内启动完成。
+
 ## 1. 背景：为什么需要交互式联调
 
 安卓端真机验证清单（协议规格 v1 第 6 节 T1-T6）需要在**装好官方 WO Mic Windows 客户端
