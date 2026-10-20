@@ -722,6 +722,13 @@ def run_interop(args):
     results.check("C01", "tcp_connect",
                   True, "%s:%d 已连接" % (args.control_host, args.control_port))
 
+    # ---- 心跳必须**连接即开始** ----
+    # 官方 app 的看门狗是连接级的（accept 后立刻开始计时，每 5s 检查一次），
+    # 与推流与否无关。上版把心跳放在"等首包 10s"之后才启动，结果 app 在
+    # 连接后 5s 就把链断了（run 39464501266 日志：看门狗超时 → 采集线程退出）。
+    heartbeats = Heartbeats(client, interval=args.heartbeat_interval)
+    heartbeats.start()
+
     # ---- hello（101）----
     client.send_frame(MSG_HELLO, HELLO_PAYLOAD)
     reply = client.recv_frame(timeout=10)
@@ -761,13 +768,17 @@ def run_interop(args):
     first_packet_failed = False
     if pkt is None:
         first_packet_failed = True
-        # 没有 UDP 流，后续断言全部失去意义：探一下 TCP 是否还活着，给出指向性诊断后收尾
-        tcp_alive = client.recv_frame(timeout=1.0) is None
+        # 没有 UDP 流，后续断言全部失去意义：探一下 TCP 是否还活着，给出指向性诊断后收尾。
+        # 注意：对端关闭时 recv_frame 抛 ConnectionClosed，必须兜住（否则整个脚本崩掉）。
+        try:
+            alive = client.recv_frame(timeout=1.0) is None
+            state = "仍存活（app 在跑但没发包：查 OpusEncoder/UdpSender）" \
+                if alive else "已收到帧（异常）"
+        except ConnectionClosed:
+            state = "已断开（app 侧主动关闭：看门狗超时？或 app 报错退出，查 logcat）"
         results.check("C05", "udp_first_packet_format_c", False,
                       "%ds 内未收到任何 UDP 包；TCP 控制通道%s"
-                      % (args.first_packet_timeout,
-                         "仍存活（app 在跑但没发包：查 OpusEncoder/UdpSender）"
-                         if tcp_alive else "已断开（app 侧报错退出：查 logcat）"))
+                      % (args.first_packet_timeout, state))
         results.info("诊断建议：adb logcat -d | grep -iE 'womic|UdpSender|OpusEncoder|MicCapture'")
     else:
         hdr = tracker.observe(pkt)
@@ -788,6 +799,7 @@ def run_interop(args):
 
     if first_packet_failed:
         # 提前收尾：UDP 流不存在时，推流质量/看门狗/重连断言都无从谈起
+        heartbeats.stop()
         try:
             client.close()
         except OSError:
@@ -801,8 +813,7 @@ def run_interop(args):
         return results.summary()
 
     # ---- 推流观察窗口（心跳跨看门狗 + 流质量断言）----
-    heartbeats = Heartbeats(client, interval=args.heartbeat_interval)
-    heartbeats.start()
+    # 心跳线程已在 C01 之后启动（见上），这里直接进入观察窗口
     window_start = time.monotonic()
     deadline = window_start + args.hold_seconds
     dumped = 1 if args.dump_packets > 0 else 0
