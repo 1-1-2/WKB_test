@@ -37,7 +37,11 @@ echo "[emu] avd    : $AVD_NAME (system-images;$API_LEVEL;default;x86_64)"
 echo "[emu] 预算   : ${BOOT_TIMEOUT}s，轮询间隔 ${POLL_INTERVAL}s"
 
 avd_exists() {
-    timeout 30 "$EMU" -list-avds 2>/dev/null | grep -qx "$AVD_NAME"
+    # 用 avdmanager 判断，而不是 `emulator -list-avds`：
+    # emulator 在缺动态库（如 libpulse.so.0）时会静默失败并返回空列表，
+    # 于是"明明创建成功"却被判成失败（run 39459335348 实测）。
+    timeout 30 "$AVDMANAGER" list avd 2>/dev/null \
+        | grep -qE "^[[:space:]]*Name:[[:space:]]*${AVD_NAME}[[:space:]]*$"
 }
 
 if avd_exists; then
@@ -54,7 +58,7 @@ else
         exit 1
     fi
 fi
-timeout 30 "$EMU" -list-avds 2>&1 | sed 's/^/[emu] avd: /' || true
+timeout 30 "$AVDMANAGER" list avd 2>&1 | sed 's/^/[emu] avd: /' || true
 
 : > "$LOG"
 "$EMU" -avd "$AVD_NAME" \
