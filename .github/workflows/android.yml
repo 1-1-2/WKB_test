@@ -44,9 +44,12 @@ on:
 
 # 同一分支连续 push 时取消上一轮（省 runner 分钟、避免排队）；
 # 注意：这里的 cancelled 是**主动取消旧 run**，不是失败。
+#
+# 但手动触发（workflow_dispatch，含 Linux SSH 调试会话）必须自成一组且不取消别人：
+# 否则一次 push 就会把正在连着的调试会话掐断（实测发生过）。
 concurrency:
-  group: android-${{ github.ref }}
-  cancel-in-progress: true
+  group: android-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   protocol-tests:
