@@ -176,7 +176,12 @@ jobs:
         # 下载到 <repo>/apk/app-debug.apk（working-directory 不作用于 uses 步骤）
 
       # ubuntu-24.04 镜像没装 libpulse0，而 emulator 的 qemu 二进制链接了它——
-      # 即便传 -no-audio 也会在启动时 "error while loading shared libraries"（run 39459335348 实证）
+      # 即便传 -no-audio 也会在启动时 "error while loading shared libraries"（run 39459335348 实证）。
+      #
+      # 注意：**不要**用裸 `ldd qemu-system-x86_64` 判断缺库——emulator 的 libQt6*.so /
+      # libandroid-emu-tracing.so 等私有库在 emulator/lib64 下，靠 emulator 自己设置的
+      # LD_LIBRARY_PATH 才能解析，裸 ldd 必然报 not found（run 39461011547 实证误杀）。
+      # 缺不缺系统库，交给 start-emulator.sh 的失败路径读 emulator.log 判断。
       - name: Install emulator system dependencies
         timeout-minutes: 10
         run: |
@@ -184,13 +189,8 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends \
             libpulse0 libnss3 libxdamage1 libxcomposite1 libxcursor1 \
             libxi6 libxtst6 libglu1-mesa
-          echo "--- qemu 缺失动态库检查 ---"
-          missing=$(ldd "$ANDROID_HOME/emulator/qemu/linux-x86_64/qemu-system-x86_64" 2>/dev/null | grep "not found" || true)
-          if [ -n "$missing" ]; then
-            echo "::error::仍缺少动态库：$missing"
-            exit 1
-          fi
-          echo "动态库完整"
+          echo "--- 系统依赖安装完成（libpulse 等）---"
+          dpkg -l libpulse0 2>/dev/null | tail -2 || true
 
       - name: Verify KVM and AVD prerequisites
         timeout-minutes: 3

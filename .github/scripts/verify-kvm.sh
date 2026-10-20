@@ -60,18 +60,21 @@ if [ -z "$EMU" ] || [ ! -x "$EMU" ]; then
 fi
 echo "[emu] $EMU"
 
-# 动态库校验：直接 ldd qemu 二进制，缺什么列什么（比启动后猜错误更快）
+# 动态库提示（**不作为失败判据**）
+# emulator 的 libQt6*.so / libandroid-emu-tracing.so / libtcmalloc_minimal.so.4 等
+# 私有库在 emulator/lib64 下，靠 emulator 自己设置的 LD_LIBRARY_PATH 才能解析；
+# 裸 ldd 会把它们全报成 not found 从而误杀（run 39461011547 实证）。
+# 这里只做提示，缺不缺由 start-emulator.sh 的失败路径读 emulator.log 决定。
 QEMU="$SDK/emulator/qemu/linux-x86_64/qemu-system-x86_64"
 if [ -x "$QEMU" ]; then
-    MISSING=$(timeout 30 ldd "$QEMU" 2>/dev/null | grep "not found" | awk '{print $1}' | sort -u || true)
+    MISSING=$(LD_LIBRARY_PATH="$SDK/emulator/lib64:$SDK/emulator/lib64/qt/lib" \
+              timeout 30 ldd "$QEMU" 2>/dev/null | grep "not found" | awk '{print $1}' | sort -u || true)
     if [ -n "$MISSING" ]; then
-        echo "::error::qemu 缺少动态库：$(echo "$MISSING" | tr '\n' ' ')"
-        echo "  修复：sudo apt-get install -y libpulse0 libnss3 libxdamage1 libxcomposite1 libxcursor1 libxi6 libxtst6 libglu1-mesa"
-        exit 1
+        echo "::warning::qemu 仍有未解析库（可能含 emulator 自带私有库，不一定是问题）："
+        echo "$MISSING" | sed 's/^/    /'
+    else
+        echo "[emu] qemu 依赖全部可解析"
     fi
-    echo "[emu] qemu 动态库完整"
-else
-    echo "::warning::未找到 $QEMU，跳过动态库校验"
 fi
 timeout 30 "$EMU" -version 2>&1 | head -5 || true
 
