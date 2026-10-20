@@ -27,6 +27,17 @@ EMU="${EMU_BIN:-$SDK/emulator/emulator}"
 [ -x "$EMU" ] || EMU="$(command -v emulator || echo "")"
 AVDMANAGER="${AVDMANAGER_BIN:-avdmanager}"
 
+# ---- AVD 目录统一（run 39462796356 实证的坑）----
+# ubuntu-24.04 上 avdmanager 会把 AVD 建到 $XDG_CONFIG_HOME/.android/avd
+# （实测 /home/runner/.config/.android/avd），而 emulator 只查
+# $ANDROID_AVD_HOME → $ANDROID_SDK_HOME/avd → $HOME/.android/avd，
+# 于是报 "Unknown AVD name / HOME is defined but there is no file <avd>.ini"。
+# 显式把两个工具的 AVD 根目录钉死到同一处。
+export ANDROID_USER_HOME="${ANDROID_USER_HOME:-$HOME/.android}"
+export ANDROID_AVD_HOME="${ANDROID_AVD_HOME:-$ANDROID_USER_HOME/avd}"
+mkdir -p "$ANDROID_AVD_HOME"
+echo "[emu] ANDROID_AVD_HOME=$ANDROID_AVD_HOME"
+
 if [ -z "$EMU" ] || [ ! -x "$EMU" ]; then
     echo "::error::找不到 emulator 可执行文件（SDK=$SDK）"
     exit 1
@@ -37,15 +48,14 @@ echo "[emu] avd    : $AVD_NAME (system-images;$API_LEVEL;default;x86_64)"
 echo "[emu] 预算   : ${BOOT_TIMEOUT}s，轮询间隔 ${POLL_INTERVAL}s"
 
 avd_exists() {
-    # 用 avdmanager 判断，而不是 `emulator -list-avds`：
-    # emulator 在缺动态库（如 libpulse.so.0）时会静默失败并返回空列表，
-    # 于是"明明创建成功"却被判成失败（run 39459335348 实测）。
-    timeout 30 "$AVDMANAGER" list avd 2>/dev/null \
-        | grep -qE "^[[:space:]]*Name:[[:space:]]*${AVD_NAME}[[:space:]]*$"
+    # 与 emulator 的查找逻辑对齐：它认的就是 <ANDROID_AVD_HOME>/<name>.ini。
+    # 不用 `emulator -list-avds`（缺动态库时会静默返回空列表，见 run 39459335348），
+    # 也不用 `avdmanager list avd`（它可能看的是另一个 AVD 根目录，见 run 39462796356）。
+    [ -f "$ANDROID_AVD_HOME/$AVD_NAME.ini" ]
 }
 
 if avd_exists; then
-    echo "[emu] AVD 已存在，复用"
+    echo "[emu] AVD 已存在（$ANDROID_AVD_HOME/$AVD_NAME.ini），复用"
 else
     echo "[emu] 创建 AVD"
     echo "no" | timeout 120 "$AVDMANAGER" create avd -n "$AVD_NAME" \
@@ -53,12 +63,16 @@ else
         || echo "no" | timeout 120 "$AVDMANAGER" create avd -n "$AVD_NAME" \
         -k "system-images;${API_LEVEL};default;x86_64" --force
     if ! avd_exists; then
-        echo "::error::AVD 创建失败"
+        echo "::error::AVD 创建失败（$ANDROID_AVD_HOME/$AVD_NAME.ini 不存在）"
+        echo "--- avdmanager list avd ---"
         timeout 30 "$AVDMANAGER" list avd 2>&1 | sed -n '1,30p' || true
+        echo "--- AVD 根目录内容 ---"
+        ls -la "$ANDROID_AVD_HOME" 2>&1 || true
         exit 1
     fi
 fi
-timeout 30 "$AVDMANAGER" list avd 2>&1 | sed 's/^/[emu] avd: /' || true
+echo "--- AVD 根目录 ---"
+ls -la "$ANDROID_AVD_HOME" 2>&1 | head -10 || true
 
 : > "$LOG"
 "$EMU" -avd "$AVD_NAME" \

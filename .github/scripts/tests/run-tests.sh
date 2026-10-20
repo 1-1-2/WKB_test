@@ -81,9 +81,16 @@ STUB_EOF
 
 cat > "$STUB/avdmanager" <<'STUB_EOF'
 #!/usr/bin/env bash
-# FAKE_AVD_EXISTS: 非空时在 list 输出中包含该 AVD 名（模拟"已存在"）
+# create 时按真实行为在 $ANDROID_AVD_HOME 下写 <name>.ini（emulator 就是靠它找 AVD）
 if [ "${1:-}" = "create" ]; then
-  [ -n "${FAKE_AVD_LOG:-}" ] && echo "create $*" >> "$FAKE_AVD_LOG"
+  name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in -n) name="$2"; shift 2;; *) shift;; esac
+  done
+  [ -n "${FAKE_AVD_LOG:-}" ] && echo "create name=$name" >> "$FAKE_AVD_LOG"
+  if [ -n "${ANDROID_AVD_HOME:-}" ] && [ -n "$name" ]; then
+    mkdir -p "$ANDROID_AVD_HOME"; : > "$ANDROID_AVD_HOME/$name.ini"
+  fi
   exit 0
 fi
 echo "Available Android Virtual Devices:"
@@ -103,6 +110,10 @@ exit 22
 STUB_EOF
 
 chmod +x "$STUB"/*
+
+# "AVD 已存在"与"AVD 不存在"两个根目录（start-emulator.sh 用 <root>/<name>.ini 判断）
+AVDH="$TMP/avdh"; mkdir -p "$AVDH"; : > "$AVDH/womic_interop.ini"
+AVDH_EMPTY="$TMP/avdh_empty"; mkdir -p "$AVDH_EMPTY"
 
 # ---------------------------------------------------------------------------
 echo "== T01 setup-android-sdk: 定位已有 cmdline-tools =="
@@ -141,7 +152,7 @@ assert_contains "$out" "加速不可用" "T05b 给出明确原因"
 echo "== T06 start-emulator: 模拟器进程立刻崩溃 → 快速失败并打印自身日志 =="
 start=$SECONDS
 out=$(EMU_BIN="$STUB/emulator" ADB_BIN="$STUB/adb" AVDMANAGER_BIN="$STUB/avdmanager" \
-      EMULATOR_LOG="$TMP/emu6.log" FAKE_EMU_MODE=crash FAKE_ADB_MODE=none FAKE_AVD_EXISTS=womic_interop BOOT_TIMEOUT=60 \
+      EMULATOR_LOG="$TMP/emu6.log" FAKE_EMU_MODE=crash FAKE_ADB_MODE=none ANDROID_AVD_HOME="$AVDH" BOOT_TIMEOUT=60 \
       bash "$SCRIPTS/start-emulator.sh" womic_interop android-34 2>&1); rc=$?
 assert_eq "$rc" "1" "T06a 退出码 1"
 assert_contains "$out" "模拟器进程已退出" "T06b 捕获进程退出"
@@ -151,7 +162,7 @@ assert_lt $((SECONDS-start)) 20 "T06d 20s 内结束（不会挂住）"
 echo "== T07 start-emulator: 进程活着但永不 boot → 到点退出 =="
 start=$SECONDS
 out=$(EMU_BIN="$STUB/emulator" ADB_BIN="$STUB/adb" AVDMANAGER_BIN="$STUB/avdmanager" \
-      EMULATOR_LOG="$TMP/emu7.log" FAKE_EMU_MODE=alive FAKE_ADB_MODE=online FAKE_AVD_EXISTS=womic_interop BOOT_TIMEOUT=6 POLL_INTERVAL=1 \
+      EMULATOR_LOG="$TMP/emu7.log" FAKE_EMU_MODE=alive FAKE_ADB_MODE=online ANDROID_AVD_HOME="$AVDH" BOOT_TIMEOUT=6 POLL_INTERVAL=1 \
       bash "$SCRIPTS/start-emulator.sh" womic_interop android-34 2>&1); rc=$?
 elapsed=$((SECONDS-start))
 assert_eq "$rc" "1" "T07a 退出码 1"
@@ -162,7 +173,7 @@ assert_lt "$elapsed" 25 "T07d 在预算内退出（实测 ${elapsed}s）"
 echo "== T08 start-emulator: 正常 boot → 通过 =="
 start=$SECONDS
 out=$(EMU_BIN="$STUB/emulator" ADB_BIN="$STUB/adb" AVDMANAGER_BIN="$STUB/avdmanager" \
-      EMULATOR_LOG="$TMP/emu8.log" FAKE_EMU_MODE=alive FAKE_ADB_MODE=boot FAKE_AVD_EXISTS=womic_interop BOOT_TIMEOUT=15 POLL_INTERVAL=1 \
+      EMULATOR_LOG="$TMP/emu8.log" FAKE_EMU_MODE=alive FAKE_ADB_MODE=boot ANDROID_AVD_HOME="$AVDH" BOOT_TIMEOUT=15 POLL_INTERVAL=1 \
       bash "$SCRIPTS/start-emulator.sh" womic_interop android-34 2>&1); rc=$?
 assert_eq "$rc" "0" "T08a 退出码 0"
 assert_contains "$out" "boot_completed=1" "T08b 检测到启动完成"
@@ -178,18 +189,21 @@ EOF
 chmod +x "$TMP/bin2/emulator"
 AVD_LOG="$TMP/avd.log"; : > "$AVD_LOG"
 out=$(EMU_BIN="$TMP/bin2/emulator" ADB_BIN="$STUB/adb" AVDMANAGER_BIN="$STUB/avdmanager" \
-      EMULATOR_LOG="$TMP/emu9.log" FAKE_AVD_LOG="$AVD_LOG" FAKE_ADB_MODE=none BOOT_TIMEOUT=3 POLL_INTERVAL=1 \
+      EMULATOR_LOG="$TMP/emu9.log" FAKE_AVD_LOG="$AVD_LOG" FAKE_ADB_MODE=none \
+      ANDROID_AVD_HOME="$AVDH_EMPTY" BOOT_TIMEOUT=3 POLL_INTERVAL=1 \
       bash "$SCRIPTS/start-emulator.sh" womic_interop android-34 2>&1)
-assert_contains "$(cat "$AVD_LOG")" "create" "T09a 调用了 avdmanager create avd"
+assert_contains "$(cat "$AVD_LOG")" "create name=womic_interop" "T09a 调用了 avdmanager create avd"
+[ -f "$AVDH_EMPTY/womic_interop.ini" ] && ok "T09b create 后 ini 就位（emulator 能找到）" \
+    || bad "T09b create 后 ini 就位" "缺少 $AVDH_EMPTY/womic_interop.ini"
 
-echo "== T09b start-emulator: AVD 已存在时不得重复创建 =="
+echo "== T09c start-emulator: AVD 已存在时不得重复创建 =="
 AVD_LOG2="$TMP/avd2.log"; : > "$AVD_LOG2"
 out=$(EMU_BIN="$TMP/bin2/emulator" ADB_BIN="$STUB/adb" AVDMANAGER_BIN="$STUB/avdmanager" \
-      EMULATOR_LOG="$TMP/emu9b.log" FAKE_AVD_LOG="$AVD_LOG2" FAKE_AVD_EXISTS=womic_interop \
+      EMULATOR_LOG="$TMP/emu9b.log" FAKE_AVD_LOG="$AVD_LOG2" ANDROID_AVD_HOME="$AVDH" \
       FAKE_ADB_MODE=boot BOOT_TIMEOUT=5 POLL_INTERVAL=1 \
       bash "$SCRIPTS/start-emulator.sh" womic_interop android-34 2>&1)
-assert_eq "$(cat "$AVD_LOG2")" "" "T09b 未调用 create（复用已有 AVD）"
-assert_contains "$out" "AVD 已存在" "T09c 日志说明复用"
+assert_eq "$(cat "$AVD_LOG2")" "" "T09d 未调用 create（复用已有 AVD）"
+assert_contains "$out" "AVD 已存在" "T09e 日志说明复用"
 
 echo "== T10 collect-diagnostics: adb 挂死时仍在上限内结束 =="
 start=$SECONDS
