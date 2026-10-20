@@ -1,6 +1,5 @@
 package com.miclink.open
 
-import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -10,62 +9,98 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.text.Editable
-import android.text.TextWatcher
 import android.util.Log
-import android.view.View
-import android.widget.AdapterView
-import android.widget.ArrayAdapter
-import android.widget.Button
-import android.widget.CheckBox
-import android.widget.EditText
-import android.widget.ProgressBar
-import android.widget.Spinner
-import android.widget.TextView
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.AssistChipDefaults
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.dynamicDarkColorScheme
+import androidx.compose.material3.dynamicLightColorScheme
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 
 /**
- * MainActivity -- 采集端 UI。
+ * MainActivity -- WO Mic 采集端 UI（Compose Material 3，设置项平铺）。
  *
- * 职责：
- *   - 编辑目标 IP / 端口 / 采样率 / 帧长 / 码率 / 带内 FEC，并持久化到 [Prefs]；
- *   - 广播发现服务端（[Discovery]）并一键回填；
- *   - 启动 / 停止 [MicCaptureService]（前台服务）；
- *   - 显示电平条（RMS / peak）与运行状态、已发包数。
+ * 布局风格参考 MicYou：常用设置直接平铺在主页面，不套多层设置菜单；
+ * 顶部一张状态卡集中展示连接状态 / 手机地址 / 统计 / 电平，主操作按钮紧随其后。
  *
- * UI 与服务的通信方式：绑定服务 + [MicCaptureService.CaptureStatusListener] 回调，
- * 回调均在主线程执行，可直接操作 View。
+ * 与服务的通信：绑定 [MicCaptureService] + [MicCaptureService.CaptureStatusListener]
+ * 回调（主线程），状态汇入 [MainViewModel]；统计由 500ms 轮询补齐。
  */
-class MainActivity : Activity() {
+class MainActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "MainActivity"
         private const val UI_REFRESH_INTERVAL_MS = 500L
     }
 
-    private lateinit var prefs: Prefs
+    private val vm: MainViewModel by viewModels()
 
-    private lateinit var editHost: EditText
-    private lateinit var editPort: EditText
-    private lateinit var spinnerRate: Spinner
-    private lateinit var spinnerFrame: Spinner
-    private lateinit var spinnerBitrate: Spinner
-    private lateinit var checkFec: CheckBox
-    private lateinit var buttonStart: Button
-    private lateinit var buttonStop: Button
-    private lateinit var buttonDiscover: Button
-    private lateinit var progressLevel: ProgressBar
-    private lateinit var progressPeak: ProgressBar
-    private lateinit var textLevel: TextView
-    private lateinit var textStatus: TextView
-    private lateinit var textDetail: TextView
+    /**
+     * 运行时权限申请（Activity Result API）。
+     *
+     * 回调里**重新检查实际权限状态**而不是信任回调 Map：用户直接划掉对话框时
+     * 部分 ROM 会回传空 Map（`all {}` 对空集合恒为 true，会误判为全部授予）。
+     */
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        if (Permissions.allGranted(this)) {
+            startCaptureService()
+        } else {
+            vm.onError(getString(R.string.permission_denied, Permissions.describeMissing(this)))
+        }
+    }
 
-    private val mainHandler = Handler(Looper.getMainLooper())
-
-    /** 已绑定的服务实例；未绑定时为 null。 */
     private var service: MicCaptureService? = null
-
     private var bound = false
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -73,118 +108,75 @@ class MainActivity : Activity() {
             service = svc
             bound = svc != null
             svc?.setStatusListener(statusListener)
-            refreshUi()
+            svc?.let {
+                vm.onServiceState(it.currentState(), it.currentDetail())
+                vm.onListeningAddress(it.listeningAddress())
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             service = null
             bound = false
-            refreshUi()
         }
     }
 
     private val statusListener = object : MicCaptureService.CaptureStatusListener {
         override fun onState(state: String, detail: String) {
-            textStatus.text = getString(R.string.status_label, state)
-            textDetail.text = detail
-            refreshUi()
+            vm.onServiceState(state, detail)
+            service?.let { vm.onListeningAddress(it.listeningAddress()) }
         }
 
         override fun onLevel(rmsDb: Float, peakDb: Float) {
-            progressLevel.progress = LevelMeter.levelToProgress(LevelMeter.dbToLevel(rmsDb))
-            progressPeak.progress = LevelMeter.levelToProgress(LevelMeter.dbToLevel(peakDb))
-            textLevel.text = getString(R.string.level_label, rmsDb, peakDb)
+            vm.onLevel(rmsDb, peakDb)
         }
 
         override fun onError(message: String) {
-            textStatus.text = getString(R.string.status_label, MicCaptureService.STATE_ERROR)
-            textDetail.text = message
-            refreshUi()
+            vm.onError(message)
         }
     }
 
-    /** 定时刷新统计（包数/字节数）。 */
+    /** 定时刷新统计与监听地址。 */
     private val uiRefreshRunnable = object : Runnable {
         override fun run() {
-            val svc = service
-            if (svc != null && MicCaptureService.isRunning) {
-                textDetail.text = getString(
-                    R.string.detail_running,
-                    editHost.text.toString(),
-                    currentPort(),
-                    svc.packetsSent(),
-                    svc.bytesSent() / 1024L
-                )
-            }
+            vm.pollStats(service)
+            service?.let { vm.onListeningAddress(it.listeningAddress()) }
             mainHandler.postDelayed(this, UI_REFRESH_INTERVAL_MS)
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
 
         // 启动自检（缺陷 D-11）：默认值必须与 build.gradle.kts 的 BuildConfig 一致
         // 且落在合法区间，否则直接崩在启动阶段，而不是"连上了却没声音"。
         Prefs.verifyDefaults()
+        vm.loadConfig(Prefs(this))
 
-        prefs = Prefs(this)
-
-        editHost = findViewById(R.id.edit_host)
-        editPort = findViewById(R.id.edit_port)
-        spinnerRate = findViewById(R.id.spinner_rate)
-        spinnerFrame = findViewById(R.id.spinner_frame)
-        spinnerBitrate = findViewById(R.id.spinner_bitrate)
-        checkFec = findViewById(R.id.check_fec)
-        buttonStart = findViewById(R.id.button_start)
-        buttonStop = findViewById(R.id.button_stop)
-        buttonDiscover = findViewById(R.id.button_discover)
-        progressLevel = findViewById(R.id.progress_level)
-        progressPeak = findViewById(R.id.progress_peak)
-        textLevel = findViewById(R.id.text_level)
-        textStatus = findViewById(R.id.text_status)
-        textDetail = findViewById(R.id.text_detail)
-
-        progressLevel.max = 1000
-        progressPeak.max = 1000
-        progressLevel.progress = 0
-        progressPeak.progress = 0
-
-        setupSpinners()
-        bindConfigToUi(prefs.load())
-
-        buttonStart.setOnClickListener { onStartClicked() }
-        buttonStop.setOnClickListener { onStopClicked() }
-        buttonDiscover.setOnClickListener { onDiscoverClicked() }
-
-        // 参数改动即落盘（不自动重连，避免误触）
-        val watcher = object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
-            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
-            override fun afterTextChanged(s: Editable?) {
-                prefs.save(readConfigFromUi())
+        setContent {
+            WomicWifiClientTheme {
+                Surface {
+                    MainScreen(
+                        vm = vm,
+                        onStartClicked = { onStartClicked() },
+                        onStopClicked = { onStopClicked() }
+                    )
+                }
             }
-        }
-        editHost.addTextChangedListener(watcher)
-        editPort.addTextChangedListener(watcher)
-        checkFec.setOnCheckedChangeListener { _, _ -> prefs.save(readConfigFromUi()) }
-
-        textDetail.text = getString(R.string.opus_version, OpusEncoder.libraryVersion())
-        if (!OpusEncoder.isLoaded()) {
-            textStatus.text = getString(R.string.status_label, MicCaptureService.STATE_ERROR)
-            textDetail.text = getString(R.string.opus_not_loaded, OpusEncoder.loadErrorMessage() ?: "")
         }
     }
 
     override fun onStart() {
         super.onStart()
-        bindService(Intent(this, MicCaptureService::class.java), serviceConnection, Context.BIND_AUTO_CREATE)
+        bindService(
+            Intent(this, MicCaptureService::class.java),
+            serviceConnection,
+            Context.BIND_AUTO_CREATE
+        )
     }
 
     override fun onResume() {
         super.onResume()
         mainHandler.post(uiRefreshRunnable)
-        refreshUi()
     }
 
     override fun onPause() {
@@ -206,164 +198,44 @@ class MainActivity : Activity() {
         super.onStop()
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        when (requestCode) {
-            Permissions.REQ_CAPTURE -> {
-                if (Permissions.handleResult(requestCode, permissions, grantResults)) {
-                    startCaptureService()
-                } else {
-                    textStatus.text = getString(R.string.status_label, MicCaptureService.STATE_ERROR)
-                    textDetail.text = getString(R.string.permission_denied, Permissions.describeMissing(this))
-                }
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // UI 装配
-    // ------------------------------------------------------------------
-    private fun setupSpinners() {
-        spinnerRate.adapter = ArrayAdapter(
-            this,
-            android.R.layout.simple_spinner_item,
-            Prefs.SUPPORTED_RATES.map { "$it Hz" }
-        ).apply { setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
-
-        spinnerFrame.adapter = ArrayAdapter(
-            this,
-            android.R.layout.simple_spinner_item,
-            Prefs.SUPPORTED_FRAME_MS.map { "$it ms" }
-        ).apply { setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
-
-        spinnerBitrate.adapter = ArrayAdapter(
-            this,
-            android.R.layout.simple_spinner_item,
-            Prefs.SUPPORTED_BITRATES.map { "${it / 1000} kbps" }
-        ).apply { setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item) }
-
-        val saveListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                prefs.save(readConfigFromUi())
-                updateFrameHint()
-            }
-
-            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
-        }
-        spinnerRate.onItemSelectedListener = saveListener
-        spinnerFrame.onItemSelectedListener = saveListener
-        spinnerBitrate.onItemSelectedListener = saveListener
-    }
-
-    private fun bindConfigToUi(config: Prefs.Config) {
-        editHost.setText(config.host)
-        editPort.setText(config.port.toString())
-        spinnerRate.setSelection(Prefs.SUPPORTED_RATES.indexOf(config.sampleRate).coerceAtLeast(0))
-        spinnerFrame.setSelection(Prefs.SUPPORTED_FRAME_MS.indexOf(config.frameMs).coerceAtLeast(0))
-        spinnerBitrate.setSelection(Prefs.SUPPORTED_BITRATES.indexOf(config.bitrateBps).coerceAtLeast(0))
-        checkFec.isChecked = config.fecEnabled
-        updateFrameHint()
-    }
-
-    /** 把当前 UI 选择读成配置对象（带兜底，避免越界崩溃）。 */
-    private fun readConfigFromUi(): Prefs.Config {
-        val rate = Prefs.SUPPORTED_RATES.getOrNull(spinnerRate.selectedItemPosition)
-            ?: Prefs.DEFAULT_SAMPLE_RATE
-        val frame = Prefs.SUPPORTED_FRAME_MS.getOrNull(spinnerFrame.selectedItemPosition)
-            ?: Prefs.DEFAULT_FRAME_MS
-        val bitrate = Prefs.SUPPORTED_BITRATES.getOrNull(spinnerBitrate.selectedItemPosition)
-            ?: Prefs.DEFAULT_BITRATE_BPS
-        return Prefs.Config(
-            host = editHost.text.toString().trim(),
-            port = currentPort(),
-            sampleRate = rate,
-            frameMs = frame,
-            bitrateBps = bitrate,
-            fecEnabled = checkFec.isChecked
-        )
-    }
-
-    private fun currentPort(): Int {
-        val raw = editPort.text.toString().trim().toIntOrNull()
-        return if (raw == null || raw !in 1..65535) Prefs.DEFAULT_PORT else raw
-    }
-
-    /** 帧长提示：显示每包 PCM 帧数，并提示必须与服务端一致。 */
-    private fun updateFrameHint() {
-        val config = readConfigFromUi()
-        val frames = config.framesPerPacket()
-        val valid = OpusEncoder.isValidFrame(config.sampleRate, frames)
-        val hint = findViewById<TextView>(R.id.text_hint)
-        hint.text = if (valid) {
-            getString(R.string.hint_frame_ok, config.sampleRate, config.frameMs, frames)
-        } else {
-            getString(R.string.hint_frame_bad, config.sampleRate, config.frameMs)
-        }
-    }
-
-    private fun refreshUi() {
-        val running = MicCaptureService.isRunning
-        buttonStart.isEnabled = !running
-        buttonStop.isEnabled = running
-        spinnerRate.isEnabled = !running
-        spinnerFrame.isEnabled = !running
-        spinnerBitrate.isEnabled = !running
-        editHost.isEnabled = !running
-        editPort.isEnabled = !running
-        checkFec.isEnabled = !running
-        if (!running) {
-            progressLevel.progress = 0
-            progressPeak.progress = 0
-        }
-    }
+    // 权限结果经 [permissionLauncher]（Activity Result API）回调，无需重写
+    // onRequestPermissionsResult（activity 1.13 起该回调已废弃）。
 
     // ------------------------------------------------------------------
     // 动作
     // ------------------------------------------------------------------
+
     private fun onStartClicked() {
-        val config = readConfigFromUi()
-        if (config.host.isBlank()) {
-            textDetail.text = getString(R.string.error_empty_host)
+        val config = vm.readConfig()
+        if (config == null) {
+            vm.onError(getString(R.string.error_invalid_port))
             return
         }
-        if (!config.isValid()) {
-            textDetail.text = getString(R.string.error_invalid_config)
-            return
-        }
-        prefs.save(config)
+        Prefs(this).save(config)
         if (!Permissions.allGranted(this)) {
-            Permissions.requestIfNeeded(this)
+            permissionLauncher.launch(Permissions.missing(this).toTypedArray())
             return
         }
         startCaptureService()
     }
 
     private fun startCaptureService() {
-        val config = readConfigFromUi()
+        val config = vm.readConfig() ?: return
         val intent = MicCaptureService.buildStartIntent(this, config)
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                // Android 8+ 后台启动前台服务必须用 startForegroundService
-                ContextCompat.startForegroundService(this, intent)
-            } else {
-                startService(intent)
-            }
+            ContextCompat.startForegroundService(this, intent)
         } catch (t: Throwable) {
             Log.e(TAG, "启动服务失败", t)
-            textStatus.text = getString(R.string.status_label, MicCaptureService.STATE_ERROR)
-            textDetail.text = getString(R.string.error_start_service, t.message ?: "")
+            vm.onError(getString(R.string.error_start_service, t.message ?: ""))
             return
         }
-        // 绑定以便拿到状态回调
         if (!bound) {
-            bindService(Intent(this, MicCaptureService::class.java), serviceConnection, Context.BIND_AUTO_CREATE)
+            bindService(
+                Intent(this, MicCaptureService::class.java),
+                serviceConnection,
+                Context.BIND_AUTO_CREATE
+            )
         }
-        textStatus.text = getString(R.string.status_label, MicCaptureService.STATE_STARTING)
-        refreshUi()
     }
 
     private fun onStopClicked() {
@@ -372,47 +244,326 @@ class MainActivity : Activity() {
         } catch (t: Throwable) {
             Log.w(TAG, "停止服务失败：${t.message}")
         }
-        progressLevel.progress = 0
-        progressPeak.progress = 0
-        textStatus.text = getString(R.string.status_label, MicCaptureService.STATE_STOPPED)
-        refreshUi()
+    }
+}
+
+// ----------------------------------------------------------------------
+// 主题
+// ----------------------------------------------------------------------
+
+@Composable
+fun WomicWifiClientTheme(
+    darkTheme: Boolean = isSystemInDarkTheme(),
+    content: @Composable () -> Unit
+) {
+    val colorScheme = when {
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+            val context = LocalContext.current
+            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
+        }
+        darkTheme -> darkColorScheme()
+        else -> lightColorScheme()
+    }
+    MaterialTheme(colorScheme = colorScheme, content = content)
+}
+
+// ----------------------------------------------------------------------
+// 主界面
+// ----------------------------------------------------------------------
+
+@Composable
+fun MainScreen(
+    vm: MainViewModel,
+    onStartClicked: () -> Unit,
+    onStopClicked: () -> Unit
+) {
+    val state = vm.uiState
+
+    // 错误提示（一次性）：展示中 -> 关闭时消费
+    val error = state.error
+    if (error != null) {
+        AlertDialog(
+            onDismissRequest = { vm.consumeError() },
+            title = { Text(stringResource(R.string.app_name)) },
+            text = { Text(error) },
+            confirmButton = {
+                TextButton(onClick = { vm.consumeError() }) {
+                    Text("知道了")
+                }
+            }
+        )
     }
 
-    /**
-     * 广播发现：网络操作，必须放到子线程；结果回主线程更新 UI。
-     * 第一个结果直接回填 IP + 端口。
-     */
-    private fun onDiscoverClicked() {
-        buttonDiscover.isEnabled = false
-        textDetail.text = getString(R.string.discovering)
-        val thread = Thread {
-            val discovery = Discovery()
-            val servers = discovery.scan(Discovery.DEFAULT_DISCOVERY_PORT, Discovery.DEFAULT_TIMEOUT_MS)
-            mainHandler.post {
-                buttonDiscover.isEnabled = true
-                if (servers.isEmpty()) {
-                    textDetail.text = getString(
-                        R.string.discover_none,
-                        discovery.lastError ?: getString(R.string.discover_hint)
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        // ---- 状态卡 ----
+        StatusCard(state)
+
+        // ---- 主操作 ----
+        Button(
+            onClick = { if (state.isRunning) onStopClicked() else onStartClicked() },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp),
+            enabled = state.isRunning || !state.isStreaming
+        ) {
+            Icon(
+                imageVector = if (state.isRunning) Icons.Filled.Stop else Icons.Filled.PlayArrow,
+                contentDescription = null,
+                modifier = Modifier.size(20.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = stringResource(
+                    if (state.isRunning) R.string.action_stop else R.string.action_start
+                ),
+                style = MaterialTheme.typography.titleMedium
+            )
+        }
+
+        // ---- 平铺设置（不套嵌套层级）----
+        Text(
+            text = stringResource(R.string.group_settings),
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary
+        )
+
+        // 控制端口
+        OutlinedTextField(
+            value = state.controlPortText,
+            onValueChange = { vm.onControlPortTextChanged(it) },
+            label = { Text(stringResource(R.string.label_control_port)) },
+            supportingText = { Text(stringResource(R.string.hint_control_port)) },
+            singleLine = true,
+            enabled = !state.isRunning,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            isError = state.controlPortText.toIntOrNull()?.let { it !in 1..65535 } ?: true,
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        // 音量
+        Column {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = stringResource(R.string.label_volume),
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.width(96.dp)
+                )
+                Slider(
+                    value = state.volume.toFloat(),
+                    onValueChange = { vm.onVolumeChanged(it.toInt()) },
+                    valueRange = 0f..255f,
+                    steps = 254,
+                    enabled = !state.isRunning,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = state.volume.toString(),
+                    style = MaterialTheme.typography.bodyLarge,
+                    modifier = Modifier.width(40.dp)
+                )
+            }
+            Text(
+                text = stringResource(R.string.hint_volume),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        // 调试音
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(R.string.label_debug_tone),
+                    style = MaterialTheme.typography.bodyLarge
+                )
+                Text(
+                    text = stringResource(R.string.hint_debug_tone),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            Switch(
+                checked = state.debugTone,
+                onCheckedChange = { vm.onDebugToneChanged(it) },
+                enabled = !state.isRunning
+            )
+        }
+
+        // ---- 使用说明 ----
+        Card(
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
+            )
+        ) {
+            Column(Modifier.padding(12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Filled.Info,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
                     )
-                    return@post
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        text = stringResource(R.string.usage_title),
+                        style = MaterialTheme.typography.titleSmall
+                    )
                 }
-                val first = servers.first()
-                editHost.setText(first.address.hostAddress ?: "")
-                editPort.setText(first.audioPort.toString())
-                // 端点采样率若不在 Opus 可选集合内（44100），按最接近的可选值回落
-                val rate = if (first.sampleRate in Prefs.SUPPORTED_RATES) {
-                    first.sampleRate
-                } else {
-                    Prefs.DEFAULT_SAMPLE_RATE
-                }
-                spinnerRate.setSelection(Prefs.SUPPORTED_RATES.indexOf(rate).coerceAtLeast(0))
-                prefs.save(readConfigFromUi())
-                textDetail.text = getString(R.string.discover_found, servers.joinToString("\n") { it.toString() })
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = stringResource(R.string.usage_body),
+                    style = MaterialTheme.typography.bodySmall
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = stringResource(R.string.protocol_note),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
-        thread.name = "miclink-discovery"
-        thread.isDaemon = true
-        thread.start()
+    }
+}
+
+/** 状态卡：连接状态 + 手机地址 + 统计 + 电平。 */
+@Composable
+private fun StatusCard(state: MainUiState) {
+    Card {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(16.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = state.state,
+                    style = MaterialTheme.typography.titleLarge
+                )
+                Spacer(Modifier.weight(1f))
+                val (container, content) = statusColors(state.state)
+                AssistChip(
+                    onClick = {},
+                    enabled = false,
+                    colors = AssistChipDefaults.assistChipColors(
+                        containerColor = container,
+                        labelColor = content
+                    ),
+                    label = { Text(if (state.isStreaming) "LIVE" else "WO MIC") }
+                )
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            // 手机地址（PC 端要填的）
+            Text(
+                text = stringResource(R.string.phone_address),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = state.listeningAddress.ifBlank { "—" },
+                style = MaterialTheme.typography.headlineSmall,
+                fontFamily = FontFamily.Monospace
+            )
+            Text(
+                text = stringResource(R.string.phone_address_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Spacer(Modifier.height(8.dp))
+
+            // 统计行
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                StatItem(stringResource(R.string.stat_packets), state.packets.toString())
+                StatItem(
+                    stringResource(R.string.stat_bytes),
+                    stringResource(R.string.stat_kb, (state.bytes / 1024).toInt())
+                )
+                StatItem(stringResource(R.string.stat_failures), state.failures.toString())
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            // 电平（RMS / Peak 双条）
+            LevelBar(label = "RMS", level = LevelMeter.dbToLevel(state.rmsDb))
+            Spacer(Modifier.height(4.dp))
+            LevelBar(label = "Peak", level = LevelMeter.dbToLevel(state.peakDb))
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = stringResource(R.string.level_label, state.rmsDb, state.peakDb),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            if (state.detail.isNotBlank()) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = state.detail,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatItem(label: String, value: String) {
+    Column {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(text = value, style = MaterialTheme.typography.titleMedium)
+    }
+}
+
+@Composable
+private fun LevelBar(label: String, level: Float) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.width(40.dp)
+        )
+        LinearProgressIndicator(
+            progress = { level.coerceIn(0f, 1f) },
+            modifier = Modifier
+                .weight(1f)
+                .height(6.dp)
+        )
+    }
+}
+
+/** 状态 -> chip 配色（容器色, 内容色）。 */
+@Composable
+private fun statusColors(state: String): Pair<Color, Color> {
+    val scheme = MaterialTheme.colorScheme
+    return when (state) {
+        MicCaptureService.STATE_STREAMING -> scheme.tertiaryContainer to scheme.onTertiaryContainer
+        MicCaptureService.STATE_CONNECTED -> scheme.primaryContainer to scheme.onPrimaryContainer
+        MicCaptureService.STATE_LISTENING -> scheme.secondaryContainer to scheme.onSecondaryContainer
+        MicCaptureService.STATE_ERROR -> scheme.errorContainer to scheme.onErrorContainer
+        else -> scheme.surfaceVariant to scheme.onSurfaceVariant
+    }
+}
+
+@Preview(showBackground = true)
+@Composable
+private fun MainScreenPreview() {
+    WomicWifiClientTheme(darkTheme = false) {
+        MainScreen(vm = MainViewModel(), onStartClicked = {}, onStopClicked = {})
     }
 }

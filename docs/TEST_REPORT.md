@@ -1,5 +1,14 @@
 # MicLink-Open 最终全局验证与一致性审查报告
 
+> ⚠️ **历史报告（WOMP 时代快照，2026-10 上旬）**：本报告成文于 Android 采集端仍说
+> **MicLink/WOMP 自有协议**的时期。此后 `android/` 已切换为 **WO Mic 协议兼容实现**
+> （协议规格见 [`docs/protocol/womic-wifi-protocol-v1.md`](protocol/womic-wifi-protocol-v1.md)），
+> 因此报告中涉及 Android 端的部分（封包格式、发现协议、端口常量、
+> `protocol_crosscheck` 复跑命令等）**已过期**：旧的 `android/verify/protocol_crosscheck/`
+> 已删除，字节级验证改由纯 JVM 模块 `android/core` 的 23 个单元测试承担
+> （见 [`docs/VERIFICATION.md`](VERIFICATION.md) A4/A4b 节）。
+> 驱动 / 服务端 / `shared/core` 部分的结论不受影响，仍然有效。
+
 - **审查人**：QA（严格模式）
 - **审查环境**：Linux Ubuntu 22.04 / gcc 13.3 / cmake 3.28 / ninja / libopus 1.4（**Windows / WDK / Android SDK 均不可用**）
 - **审查时间**：本次会话内实跑

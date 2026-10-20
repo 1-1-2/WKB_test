@@ -17,6 +17,10 @@ cmake-build-*/
 *.sys
 *.pdb
 
+# ---- Gradle / Android ----
+.gradle/
+local.properties
+
 # ---- CMake ----
 CMakeCache.txt
 CMakeFiles/

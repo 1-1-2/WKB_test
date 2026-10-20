@@ -1,53 +1,47 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">MicLink 采集端</string>
+    <string name="app_name">WO Mic 采集端</string>
 
     <!-- 通知 -->
-    <string name="notification_title">MicLink 麦克风采集进行中</string>
+    <string name="notification_title">WO Mic 采集推流中</string>
     <string name="notification_action_stop">停止</string>
 
-    <!-- 状态区 -->
-    <string name="status_label">状态：%1$s</string>
-    <string name="detail_idle">未采集。填写服务端 IP 后点“开始采集”。</string>
-    <string name="detail_running">→ %1$s:%2$d · 已发 %3$d 包 · %4$d KB</string>
-    <string name="status_idle">状态：空闲</string>
-    <string name="level_idle">RMS — / Peak —</string>
-    <string name="hint_frame_placeholder">帧长提示</string>
-    <string name="level_label">RMS %1$.1f dBFS / Peak %2$.1f dBFS</string>
+    <!-- 主操作 -->
+    <string name="action_start">启动服务</string>
+    <string name="action_stop">停止服务</string>
 
-    <!-- 分组标题 -->
-    <string name="group_target">目标服务端</string>
-    <string name="group_audio">音频参数（须与服务端一致）</string>
-    <string name="group_level">输入电平</string>
+    <!-- 状态卡 -->
+    <string name="status_listening">等待 PC 连接</string>
+    <string name="status_connected">PC 已连接</string>
+    <string name="status_streaming">推流中</string>
+    <string name="status_idle">未启动</string>
+    <string name="status_error">错误</string>
+    <string name="phone_address">手机地址</string>
+    <string name="phone_address_hint">在 PC 端 WO Mic 客户端填入该地址（IP:控制端口）即可连接</string>
+    <string name="level_label">RMS %1$.1f / Peak %2$.1f dBFS</string>
+    <string name="stat_packets">已发包数</string>
+    <string name="stat_bytes">已发流量</string>
+    <string name="stat_failures">连续失败</string>
+    <string name="stat_kb">%1$d KB</string>
 
-    <!-- 表单 -->
-    <string name="hint_host">服务端 IP，如 192.168.1.10</string>
-    <string name="hint_port">5004</string>
-    <string name="label_rate">采样率</string>
-    <string name="label_frame">帧长</string>
-    <string name="label_bitrate">码率</string>
-    <string name="label_fec">带内 FEC（每 16 帧附一份上一帧的冗余重发包，复用同一序号）</string>
-    <string name="label_rms">RMS</string>
-    <string name="label_peak">峰值</string>
+    <!-- 平铺设置 -->
+    <string name="group_settings">设置</string>
+    <string name="label_control_port">控制端口</string>
+    <string name="hint_control_port">PC 客户端连接的 TCP 端口，默认 8125</string>
+    <string name="label_volume">推流音量</string>
+    <string name="hint_volume">写入 UDP 媒体头的音量字段（0-255），默认 5 为单位增益</string>
+    <string name="label_debug_tone">调试音</string>
+    <string name="hint_debug_tone">发送 440Hz 正弦波而不采集麦克风，用于无麦克风权限时验证链路</string>
 
-    <!-- 动作 -->
-    <string name="action_start">开始采集</string>
-    <string name="action_stop">停止采集</string>
-    <string name="action_discover">局域网发现服务端（UDP 5005）</string>
+    <!-- 说明 -->
+    <string name="usage_title">使用方式</string>
+    <string name="usage_body">1. 手机与 PC 接入同一局域网；\n2. 点“启动服务”，等待状态变为“等待 PC 连接”；\n3. 在 PC 端 WO Mic 客户端填入上方手机地址；\n4. PC 端点开始推流后，手机自动开始采集并发送。</string>
+    <string name="protocol_note">协议实现见 docs/protocol/womic-wifi-protocol-v1.md（双端实证）。</string>
 
     <!-- 提示 / 错误 -->
-    <string name="hint_frame_ok">%1$d Hz × %2$d ms = %3$d 帧/包（服务端会在 Opus 采样率与端点率不同时自动重采样）</string>
-    <string name="hint_frame_bad">%1$d Hz × %2$d ms 不是 2.5 ms 的整数倍，Opus 会拒绝，请更换组合</string>
-    <string name="error_empty_host">请先填写服务端 IP，或用“发现”按钮自动查找</string>
-    <string name="error_invalid_config">参数不合法：请检查 IP / 端口 / 采样率 / 帧长 / 码率</string>
+    <string name="error_invalid_port">控制端口须为 1-65535 的整数</string>
     <string name="error_start_service">启动前台服务失败：%1$s</string>
     <string name="permission_denied">权限被拒绝：%1$s（请在系统设置中授予后重试）</string>
     <string name="opus_version">libopus：%1$s</string>
     <string name="opus_not_loaded">native 库未加载：%1$s。请按 android/README.md 把 opus 源码放到 app/src/main/cpp/opus/ 后重新构建。</string>
-
-    <!-- 发现 -->
-    <string name="discovering">正在广播发现服务端…（需服务端开启 --discovery on）</string>
-    <string name="discover_none">未发现服务端：%1$s</string>
-    <string name="discover_hint">确认手机与 PC 在同一网段、服务端已用 --discovery on 启动、防火墙放行 UDP 5005</string>
-    <string name="discover_found">发现到：\n%1$s</string>
 </resources>

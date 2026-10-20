@@ -123,27 +123,46 @@ python3 /workspace/miclink-open/driver/verify/check_driver_consistency.py --json
 **注意**：这是**静态检查**（解析源码/工程文件，断言“做错了必然 BSOD 或静默失效”的强约束），
 **不是编译、更不是运行**。它无法替代 WDK 编译与真机安装。
 
-### A4. Android 端封包字节布局交叉校验（与 `shared/core` 权威实现逐字节比对）
+### A4. Android 端协议字节级一致性（WO Mic 协议，`:core` 纯 JVM 模块）
+
+背景：Android 采集端已切换为 **WO Mic 协议兼容实现**（协议规格
+[`docs/protocol/womic-wifi-protocol-v1.md`](womic-wifi-protocol-v1.md)，
+官方 APK 4.8 + Windows Client 6.3 双端逆向实证，证据目录 `docs/protocol/evidence/`）。
+协议逻辑被收进**纯 JVM 模块** `android/core`（零 Android 依赖），
+因此可在 Linux 沙箱内真实编译并执行字节级测试；
+旧的 WOMP `protocol_crosscheck/`（32 字节头比对）已随协议切换一并删除。
+
+命令（本机 Gradle 9.3.1，JDK 21）：
+
+```bash
+cd /workspace/miclink-open/android
+JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 /opt/gradle-9.3.1/bin/gradle :core:test --no-daemon --configure-on-demand
+```
+
+实测结果：`BUILD SUCCESSFUL`，**23 个用例全部通过**（退出码 0）。
+
+| 测试类 | 用例数 | 覆盖 |
+|---|---|---|
+| `ProtocolConformanceTest` | 16 | TCP 帧编解码（分片重组 / 合并拆分 / 大端长度）、101/102/103/104/105 消息与应答字节（含官方 104 停止应答实际写 **type 102** 的怪癖）、错误码 10/12/13、未知类型错误帧、看门狗两态（首个 5s 周期无心跳即断 / 持续心跳存活） |
+| `UdpPacketizerTest` | 7 | UDP 格式 C（magic `04 00`、len 字段含头尾、ts u32 回绕）、格式 B（XOR 校验 + 零字节）、格式 A（seq u32 + len u16）、variant→格式映射（2/3/4）、seq u16 回绕 |
+
+**边界（诚实声明）**：证明 `:core` 模块的字节级行为与官方反编译证据一一对应；
+**不证明** Android 装配层（AudioRecord / 前台服务 / Compose UI）与真机表现，属 B 类。
+
+### A4b. Android 端 Kotlin 编译验证（AGP 9.1.0 + Gradle 9.3.1 + JDK 21）
 
 命令：
 
 ```bash
-cd /workspace/miclink-open/android/verify/protocol_crosscheck && ./run.sh
+cd /workspace/miclink-open/android
+JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 /opt/gradle-9.3.1/bin/gradle :app:compileDebugKotlin --no-daemon
 ```
 
-实测结果：`PASS`（退出码 0）。
+实测结果：`BUILD SUCCESSFUL`（2026-10-20，零警告）。
 
-| 项 | 结果 |
-|---|---|
-| C 侧（真实 `shared/core/src/protocol.c` 的 `miclink_packet_encode`） | `len=37`，十六进制 `574F4D500001002012345678010203040000BB80000103C00005000100000000DEADBEEF01` |
-| Java 侧（`Packetizer.kt` 的逻辑镜像 `PacketizerProbe.java`） | **与 C 侧完全相同** |
-| 逐字节 diff | 一致 |
-| 用权威解码器回读 | `decode=37 seq=305419896 ts=16909060 rate=48000 ch=1 frames=960 payload=5 flags=1`（自洽） |
-| `Packetizer.selfCheck()` 等价校验 | `SELFFIELDS-OK` |
-
-**边界（诚实声明）**：校验的是**逻辑**（常量 / 偏移 / 字节序 / 长度自洽），
-**不是 Kotlin 源码本身**——沙箱没有 Kotlin 编译器。
-若改了 `Packetizer.kt` 却忘了同步 `PacketizerProbe.java`，本检查会给出失真绿灯。
+**边界（诚实声明）**：只验证 Kotlin 源码可编译（Compose UI / 服务装配 /
+Activity Result API 权限迁移均通过）；**未**执行 `assembleDebug`
+（需本机 Android SDK + NDK + opus 源码），属 B 类。
 
 ### A5. Android 端 JNI 接线冒烟测试（**链接假 libopus**）
 
@@ -235,8 +254,8 @@ ctest --test-dir /workspace/miclink-open/server/build --output-on-failure
 # A3: driver 静态一致性（127 项）
 python3 /workspace/miclink-open/driver/verify/check_driver_consistency.py --quiet
 
-# A4: Android 封包字节布局 vs shared/core 权威实现（逐字节比对）
-cd /workspace/miclink-open/android/verify/protocol_crosscheck && ./run.sh
+# A4: Android WO Mic 协议字节级一致性（:core 纯 JVM 模块，23 个用例）
+cd /workspace/miclink-open/android && JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 /opt/gradle-9.3.1/bin/gradle :core:test --no-daemon --configure-on-demand
 
 # A5: Android JNI 接线冒烟测试（链接 stub opus）
 cd /workspace/miclink-open/android/verify/jni_smoketest && ./run.sh

@@ -1,0 +1,108 @@
+name: android
+
+on:
+  push:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  pull_request:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+    inputs:
+      interactive:
+        description: 'Windows 交互式联调（SSH 进 runner 手动验证）'
+        type: boolean
+        required: false
+        default: false
+
+# 协议核心是纯 JVM 模块：push/PR 上跑 :core:test（字节级一致性，不需要 Android SDK）；
+# :app 组装需要 SDK/NDK；Windows 交互作业只在 workflow_dispatch 勾选后运行
+# （WarpBuilds/action-debugger —— mxschmitt/action-tmate 的 Windows 可用分支，
+#   详见 docs/devops/windows-interactive-debug.md）。
+
+jobs:
+  protocol-tests:
+    name: Protocol conformance (:core:test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Run protocol unit tests
+        run: ./gradlew :core:test --no-daemon --configure-on-demand
+
+      - name: Upload test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-test-report
+          path: android/core/build/reports/tests/
+
+  app-build:
+    name: Build debug APK (:app:assembleDebug)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # GitHub 镜像自带 Android SDK；compileSdk 37（platforms;android-37.0，次版本命名）/ build-tools 36 需显式补齐
+      - name: Install Android SDK components
+        run: |
+          sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-37.0" "build-tools;36.0.0"
+
+      # libopus 源码按 android/README.md 放入 app/src/main/cpp/opus/ 后才会真正编译；
+      # 未放入时 CMake 目标为空，assembleDebug 仍应成功（只打 Java/Kotlin 层）。
+      - name: Assemble debug APK
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
+
+  windows-interactive:
+    name: Windows interactive debug (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.interactive
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prebuild artifacts
+        run: ./gradlew :core:test :app:assembleDebug --no-daemon
+
+      # 交互式会话：连接信息打印在日志与 Checks 页底部；
+      # 在会话里 touch continue 放行后续步骤（或直接退出 shell 结束作业）。
+      - name: Interactive SSH session
+        uses: WarpBuilds/action-debugger@v1.3
+        with:
+          limit-access-to-actor: true
+        timeout-minutes: 120
