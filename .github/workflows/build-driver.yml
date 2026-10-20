@@ -58,19 +58,66 @@ jobs:
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $all = & $vswhere -latest -requires Microsoft.Component.MSBuild `
-                   -find MSBuild\**\Bin\MSBuild.exe
+          $install = & $vswhere -latest -requires Microsoft.Component.MSBuild -property installationPath
+          Write-Host "VS installationPath: $install"
+
           # WDK 28000 的 NuGet 包没有 x86 版 InfVerif.dll（包内
           # c\build\<ver>\bin\ 只有 x64/ 与 arm64/）。32 位 MSBuild 下
           # DPVerifierTask 选 x86 导入名，必然以
-          # "Unable to load DLL 'x86\InfVerif.dll'" 失败（CI run 39335899536 实证）。
-          # vswhere 返回的第一个结果（MSBuild\Current\Bin\MSBuild.exe）就是 32 位，
-          # 必须显式选 amd64 下的 64 位 MSBuild。
-          $msb = $all | Where-Object { $_ -like "*\amd64\MSBuild.exe" } | Select-Object -First 1
+          # "Unable to load DLL 'x86\InfVerif.dll'" 失败（CI run 39335899536 实证，
+          # 该 run 的 Tracker 加载 FileTracker32.dll，证实 Bin\MSBuild.exe 为 32 位进程）。
+          #
+          # VS 布局：Bin\MSBuild.exe 是 32 位，64 位在 Bin\amd64\MSBuild.exe。
+          # ⚠️ vswhere -find "MSBuild\**\Bin\MSBuild.exe" 的模式要求 Bin 与
+          # MSBuild.exe 直接相邻，结构上匹配不到 Bin\amd64\MSBuild.exe——
+          # 会零候选（CI run 39344356717 实证）。故不依赖该窄模式，
+          # 改为 installationPath 直接构造 + 宽松模式兜底 + PE 位宽验证。
+          $candidates = @()
+          if ($install) {
+            $candidates += Join-Path $install "MSBuild\Current\Bin\amd64\MSBuild.exe"
+            $candidates += Join-Path $install "MSBuild\Current\Bin\MSBuild.exe"
+          }
+          $candidates += & $vswhere -latest -requires Microsoft.Component.MSBuild `
+                           -find "MSBuild\**\Bin\**\MSBuild.exe"
+
+          # 读取 PE 机器类型：0x8664=x64 0x14C=x86 0xAA64=arm64
+          function Get-PeMachine($path) {
+            $fs = [System.IO.File]::OpenRead($path)
+            try {
+              $br = New-Object System.IO.BinaryReader($fs)
+              $fs.Seek(0x3C, 'Begin') | Out-Null
+              $peOff = $br.ReadInt32()
+              $fs.Seek($peOff + 4, 'Begin') | Out-Null
+              return $br.ReadUInt16()
+            } finally { $fs.Dispose() }
+          }
+
+          $msb = $null
+          foreach ($c in ($candidates | Where-Object { $_ } | Select-Object -Unique)) {
+            if (-not (Test-Path $c)) { Write-Host "  skip(不存在): $c"; continue }
+            $machine = Get-PeMachine $c
+            $arch = switch ($machine) {
+              0x8664 { "x64" }
+              0x14C  { "x86" }
+              0xAA64 { "arm64" }
+              default { ("0x{0:x4}" -f $machine) }
+            }
+            Write-Host "  candidate($arch): $c"
+            if (-not $msb -and $arch -eq "x64") { $msb = $c }
+          }
+
+          # 诊断：打印 Bin 目录一层结构，确认 amd64 子目录是否真实存在
+          if ($install) {
+            $binDir = Join-Path $install "MSBuild\Current\Bin"
+            if (Test-Path $binDir) {
+              Write-Host "--- $binDir 一层内容 ---"
+              Get-ChildItem $binDir | Select-Object -ExpandProperty Name
+            }
+          }
+
           if (-not $msb) {
-            Write-Host "!! 未找到 64 位 MSBuild（MSBuild\Current\Bin\amd64\MSBuild.exe）"
+            Write-Host "!! 未找到 64 位(x64) MSBuild"
             Write-Host "!! WDK 28000 NuGet 构建要求 64 位 MSBuild，拒绝回退 32 位"
-            $all | ForEach-Object { Write-Host "  candidate: $_" }
             exit 1
           }
           Write-Host "MSBuild: $msb"
