@@ -5,11 +5,15 @@
 > **`WarpBuilds/action-debugger@v1.3`**（tmate 的定制分支，支持 Linux/macOS/Windows）。
 > 本仓库的 `.github/workflows/android.yml` 已按其能力配置 `windows-interactive` 作业。
 
-> **与 `integration-test` 作业的分工**（别混用）：
+> **CI 作业分工**（别混用）：
 > | 作业 | 跑在哪 | 干什么 | 触发 |
 > |---|---|---|---|
-> | `integration-test` | ubuntu-latest + KVM 模拟器 | **自动化**协议闭环（真 APK ↔ `pc_client.py`，C01–C15），无人值守、逐条断言 | push / PR / 手动 |
+> | `protocol-tests` | ubuntu-latest | `:core:test` 字节级协议一致性（23 用例） | push / PR（`android/**`） |
+> | `script-tests` | ubuntu-latest | CI shell 脚本的单元测试（stub adb/emulator，34 断言） | 同上 |
+> | `build-apk` | ubuntu-latest | SDK + opus 下载 + 三 ABI 原生编译，产出 APK artifact | 同上（`needs` 前两者） |
+> | `integration-test` | ubuntu-latest + KVM 模拟器 | **自动化**协议闭环（真 APK ↔ `pc_client.py`，C01–C15） | 同上（`needs` build-apk） |
 > | `windows-interactive` | windows-latest + SSH 会话 | **人工**排查：装官方客户端、抓包回放、看注册表/断点 | 仅手动勾选 |
+> | `build-driver`（另一文件） | windows-2025-vs2026 | WDK 驱动编译 | 仅 `driver/**` `shared/**` `tools/**` 变更或手动（**不再随任意 push 触发**） |
 >
 > 之所以自动化闭环不放 Windows：GitHub 的 windows-latest 不提供可用的嵌套虚拟化，
 > Android 模拟器只能软件模拟，启动慢且不稳定；ubuntu-latest 有 `/dev/kvm`，

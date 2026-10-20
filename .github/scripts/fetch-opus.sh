@@ -10,7 +10,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$REPO_ROOT/android"
+ANDROID_DIR="${ANDROID_DIR:-$REPO_ROOT/android}"
+cd "$ANDROID_DIR"
 
 DEST="app/src/main/cpp/opus"
 ARCHIVE=/tmp/opus-src.tar.gz

@@ -223,6 +223,7 @@ Android 采集端现实现 WO Mic 协议，规格见
 | [`docs/Signing-Guide.md`](docs/Signing-Guide.md) | 测试签名 vs 生产签名（EV + WHQL / Attestation）的区别、流程、成本量级 |
 | [`docs/protocol/womic-wifi-protocol-v1.md`](docs/protocol/womic-wifi-protocol-v1.md) | WO Mic WiFi 协议规格 v1（官方 APK + PC 客户端双端逆向实证，附 35 个证据文件） |
 | [`docs/devops/windows-interactive-debug.md`](docs/devops/windows-interactive-debug.md) | Windows 交互式联调 CI（WarpBuilds/action-debugger，tmate 的 Windows 可用分支） |
+| [`.github/scripts/README.md`](.github/scripts/README.md) | CI shell 脚本说明、单元测试（34 断言）、外部看门狗用法 |
 | [`server/build_windows.md`](server/build_windows.md) | 服务端 Windows 构建 |
 | [`android/README.md`](android/README.md) | Android 采集端构建、opus 源码准备、WO Mic 协议实现要点 |
 | [`android/verify/integration/README.md`](android/verify/integration/README.md) | 协议闭环联调脚本 `pc_client.py`（C01–C15 断言、两种 UDP 回收拓扑、CI 作业） |

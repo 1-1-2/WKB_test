@@ -12,11 +12,13 @@
 
 set -euo pipefail
 
-SDK=""
-for cand in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" \
-            /usr/local/lib/android/sdk /opt/android-sdk "$HOME/Android/Sdk"; do
-    if [ -n "$cand" ] && [ -d "$cand" ]; then SDK="$cand"; break; fi
-done
+SDK="${SDK_ROOT:-}"
+if [ -z "$SDK" ]; then
+    for cand in "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" \
+                /usr/local/lib/android/sdk /opt/android-sdk "$HOME/Android/Sdk"; do
+        if [ -n "$cand" ] && [ -d "$cand" ]; then SDK="$cand"; break; fi
+    done
+fi
 SDK="${SDK:-/usr/local/lib/android/sdk}"
 echo "[sdk] 使用 SDK: $SDK"
 

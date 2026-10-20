@@ -5,10 +5,12 @@ on:
     paths:
       - 'android/**'
       - '.github/workflows/android.yml'
+      - '.github/scripts/**'      # CI 脚本变更也要触发（否则改脚本没人验证）
   pull_request:
     paths:
       - 'android/**'
       - '.github/workflows/android.yml'
+      - '.github/scripts/**'
   workflow_dispatch:
     inputs:
       interactive:
@@ -17,15 +19,19 @@ on:
         required: false
         default: false
 
-# 作业是一条流水线（needs 串联），不是三个平行作业各做一遍同样的事：
+# 作业是一条流水线（needs 串联），不是四个平行作业各做一遍同样的事：
 #
-#   protocol-tests ──► build-apk ──► integration-test
-#   (:core:test,          (SDK 安装 + opus 下载 +        (只装模拟器相关组件,
-#    1~2 分钟)             三 ABI 原生编译 + APK)          下载 build-apk 的 APK,
-#                          产出 app-debug-apk artifact     启模拟器跑协议闭环)
+#   protocol-tests ──┐
+#                    ├──► build-apk ──► integration-test
+#   script-tests ────┘        │
+#   (:core:test 1~2min)  (SDK+opus+三 ABI 编译, 产出 app-debug-apk)
+#   (CI 脚本单测 ~10s)         └──► integration-test 只装模拟器组件 + 下载 APK + 跑协议闭环
 #
 # 好处：SDK 组件安装、opus 源码下载、Gradle 构建各只发生一次；integration-test
-# 不再重复构建，作业时长从 ~30min（且互相抢磁盘/网络）降到 ~5min。
+# 不再重复构建（原先三个作业各装一遍 SDK、各下一次 opus）。
+#
+# 每一步都有 timeout-minutes：卡死会在几分钟内结束，不会像 run 39422464400
+# 那样在 `adb wait-for-device` 上挂 25 分钟。
 #
 # windows-interactive 保持独立，仅 workflow_dispatch 勾选后运行
 # （WarpBuilds/action-debugger —— mxschmitt/action-tmate 的 Windows 可用分支，
@@ -55,6 +61,7 @@ jobs:
           java-version: '17'
 
       - name: Run protocol unit tests
+        timeout-minutes: 12
         run: ./gradlew :core:test --no-daemon --configure-on-demand
 
       - name: Upload test report
@@ -64,9 +71,22 @@ jobs:
           name: core-test-report
           path: android/core/build/reports/tests/
 
+  # CI 脚本自身的单元测试：用 stub 的 adb/emulator/avdmanager 构造"会挂死"的场景，
+  # 验证脚本必须在预算内退出（挂死类缺陷看日志发现不了，只能这样测）。
+  script-tests:
+    name: CI script unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run CI script tests (stub adb/emulator/avdmanager)
+        timeout-minutes: 5
+        run: bash .github/scripts/tests/run-tests.sh
+
   build-apk:
     name: Build debug APK (all ABIs)
-    needs: protocol-tests
+    needs: [protocol-tests, script-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -85,12 +105,14 @@ jobs:
       # 见 run 39408485677），这里自行定位 SDK 并把工具链写入 GITHUB_PATH；
       # 万一镜像连 cmdline-tools 都没带，就现场下载官方 commandlinetools 包。
       - name: Set up Android SDK tools
+        timeout-minutes: 5
         run: bash ../.github/scripts/setup-android-sdk.sh
 
       # compileSdk 37（platforms;android-37.0，次版本命名）/ build-tools 36 需显式补齐；
       # CMake 版本由 app/build.gradle.kts 的 externalNativeBuild.cmake.version 固定为 3.22.1；
       # NDK 用 AGP 9.1 默认的 28.2.13676358（本地实测值，见 docs/VERIFICATION.md）
       - name: Install Android SDK components
+        timeout-minutes: 20
         run: |
           sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager "platforms;android-37.0" "build-tools;36.0.0" \
@@ -99,12 +121,15 @@ jobs:
       # libopus 源码不入库（体积 + 许可证单独保留），CI 现场下载；
       # 缺了它 CMake 会 FATAL_ERROR（见 app/src/main/cpp/CMakeLists.txt）。
       - name: Fetch Opus source
+        timeout-minutes: 8
         run: bash ../.github/scripts/fetch-opus.sh
 
       - name: Assemble debug APK
+        timeout-minutes: 25
         run: ./gradlew :app:assembleDebug --no-daemon
 
       - name: Upload APK
+        timeout-minutes: 5
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
@@ -130,10 +155,12 @@ jobs:
           java-version: '17'
 
       - name: Set up Android SDK tools
+        timeout-minutes: 5
         run: bash ../.github/scripts/setup-android-sdk.sh
 
       # 不构建，只需要：adb（platform-tools）+ emulator + 系统镜像
       - name: Install emulator components
+        timeout-minutes: 15
         run: |
           sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager "platform-tools" "emulator" "system-images;android-34;default;x86_64"
@@ -141,6 +168,7 @@ jobs:
           ls "$ANDROID_HOME/system-images/android-34/default/" 2>/dev/null || true
 
       - name: Download APK from build-apk
+        timeout-minutes: 5
         uses: actions/download-artifact@v4
         with:
           name: app-debug-apk
@@ -148,19 +176,23 @@ jobs:
         # 下载到 <repo>/apk/app-debug.apk（working-directory 不作用于 uses 步骤）
 
       - name: Verify KVM and AVD prerequisites
+        timeout-minutes: 3
         run: bash ../.github/scripts/verify-kvm.sh
 
       # 关键：绝不使用无超时的 `adb wait-for-device`（上次就是它把作业挂死 25 分钟）。
       # 改为"进程存活 + adb 设备数 + boot_completed"三重轮询，每 10s 打一行进度，
-      # 失败时自动打印 emulator.log 尾部。
+      # 失败时自动打印 emulator.log 尾部。脚本内部预算 480s，这里再兜一层 12 分钟。
       - name: Start emulator (with timeout and progress logs)
+        timeout-minutes: 12
         run: bash ../.github/scripts/start-emulator.sh womic_interop android-34
 
       - name: Install and launch app
+        timeout-minutes: 10
         run: bash ../.github/scripts/install-app.sh ../apk/app-debug.apk
 
       # 闭环联调：C01~C15 见 android/verify/integration/README.md
       - name: Interop closed loop (pc_client.py)
+        timeout-minutes: 6
         run: |
           set +e
           set -o pipefail
@@ -169,13 +201,17 @@ jobs:
           echo "pc_client exit=$rc（0=全绿，1=有断言失败，2=环境错误，124=超时）"
           exit $rc
 
-      # 无论成功/失败/取消都收集：取消时 previously 什么都没留下，无法事后诊断
+      # 无论成功/失败/取消都收集：取消时 previously 什么都没留下，无法事后诊断。
+      # 脚本内部给每条 adb 命令 15s 上限，这里再兜一层 4 分钟。
       - name: Collect diagnostics
         if: always()
+        timeout-minutes: 4
+        continue-on-error: true
         run: bash ../.github/scripts/collect-diagnostics.sh
 
       - name: Upload diagnostics
         if: always()
+        timeout-minutes: 5
         uses: actions/upload-artifact@v4
         with:
           name: interop-diagnostics

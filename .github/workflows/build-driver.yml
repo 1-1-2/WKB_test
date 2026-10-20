@@ -1,9 +1,26 @@
 name: build-driver
 
+# 【触发范围】只在与驱动编译有关的路径变更时自动跑：
+#   driver/**   驱动源码、inf、工程文件、packages.config
+#   shared/**   驱动 include 的共用契约头（miclink_protocol.h / miclink_ioctl.h 等）
+#   tools/**    签名/安装/验证脚本（打包链路的一部分）
+#   workflow 自身
+# 之前是 `paths-ignore: ['**.md']`，等于"只要不是改文档就构建驱动"——改一行
+# Android Kotlin 也会拉起一次 5~10 分钟的 Windows 驱动构建，纯属浪费。
+# 需要时仍可用 workflow_dispatch 手动触发（支持选 Release/Debug）。
 on:
   push:
-    paths-ignore:
-      - '**.md'
+    paths:
+      - 'driver/**'
+      - 'shared/**'
+      - 'tools/**'
+      - '.github/workflows/build-driver.yml'
+  pull_request:
+    paths:
+      - 'driver/**'
+      - 'shared/**'
+      - 'tools/**'
+      - '.github/workflows/build-driver.yml'
   workflow_dispatch:
     inputs:
       configuration:
@@ -28,6 +45,8 @@ jobs:
   build:
     name: Build MicLinkVirtualMic (x64)
     runs-on: windows-2025-vs2026
+    # 硬上限：NuGet 还原 ~200MB + MSBuild 全量 rebuild，正常 8~15 分钟
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
