@@ -376,8 +376,19 @@ class FormatCParser:
 class AdbUdpTap:
     """模拟器内 `toybox nc -u -l -p PORT`，回收的字节流重分帧。
 
-    必须在 103 START 之前启动：app 的 UDP 是 connect 语义，监听不存在时会
-    收到 ICMP port-unreachable 并把 socket 打坏（UdpSender.send 连续失败）。
+    必须在 103 START 之前启动：app 的 UDP socket 未 connect，Linux 不会把
+    ICMP port-unreachable 上报给发送方，但监听就绪再 START 更接近真实场景
+    （真实 PC 客户端总是先占住媒体端口）。
+
+    **已知局限（重连会话必须 restart）**：toybox `nc -u -l` 收到**首个**数据报后
+    会把 socket connect 到该对端（netcat.c：recvfrom(..., MSG_PEEK) 取到对端
+    地址后 xconnect），之后内核只交付该对端的包。而 app 每个会话都会新建
+    DatagramSocket（UdpSender.open() 先 close 再建），第二会话的源端口必然
+    不同 → 旧监听把新会话的包全部丢弃。run 39473353065 实证：重连后 app 侧
+    "已打开 UDP -> 127.0.0.1:5004" + "合成 440.0Hz 正弦"日志齐全、UdpSender
+    无任何发送错误，PC 却 10s 收不到一个包（C15 udp=none）。这不是 app 缺陷
+    （真实 PC 客户端用未 connect 的 UDP socket，从任何源端口都能收），而是本
+    harness 的局限，所以重连前必须 restart() 换一个未 connect 的新监听。
     """
 
     MODE = "adb"
@@ -389,6 +400,7 @@ class AdbUdpTap:
         self.parser = FormatCParser()
         self.queue = queue.Queue()
         self.received = 0
+        self._pump_thread = None
         self._start_process()
 
     def _start_process(self):
@@ -411,7 +423,11 @@ class AdbUdpTap:
             if proc.poll() is None:
                 self.proc = proc
                 self.cmd = cmd
-                threading.Thread(target=self._pump, name="udp-tap", daemon=True).start()
+                # proc 以参数传入：restart() 换新进程后，旧线程仍读旧管道，
+                # 不会串到新会话的字节流上
+                self._pump_thread = threading.Thread(
+                    target=self._pump, args=(proc,), name="udp-tap", daemon=True)
+                self._pump_thread.start()
                 return
             proc.kill()
         raise EnvError(
@@ -419,10 +435,10 @@ class AdbUdpTap:
             "请确认系统镜像是标准 Android 镜像（含 toybox nc）。" % " / ".join(candidates)
         )
 
-    def _pump(self):
+    def _pump(self, proc):
         while True:
             try:
-                chunk = self.proc.stdout.read(65536)
+                chunk = proc.stdout.read(65536)
             except OSError:
                 return
             if not chunk:
@@ -445,6 +461,32 @@ class AdbUdpTap:
                 continue
             self.parser.feed(chunk)
 
+    def restart(self, attempts=4):
+        """换一个全新的设备内监听（重连会话专用；host tap 无此问题）。
+
+        原理见类文档字符串：toybox nc 的 connect-to-first-peer 语义会让旧监听
+        丢掉 app 第二会话（新 DatagramSocket、新源端口）的全部包。这里关旧起新，
+        并把 parser/queue 一起换掉，杜绝把上个会话的残字节喂给新会话。
+
+        调用时机：app 的 CONFIG 与 START 之间——那段时间 app 不发 UDP，
+        更换监听零丢包风险。旧 nc 退出到端口释放可能有几百 ms 延迟，
+        新监听起不来时自动重试。
+        """
+        self.close()
+        last_err = None
+        for _ in range(attempts):
+            # 换干净的解析器/队列：杜绝把上个会话的残字节喂给新会话
+            self.parser = FormatCParser()
+            self.queue = queue.Queue()
+            self.received = 0
+            try:
+                self._start_process()
+                return
+            except EnvError as e:
+                last_err = e
+                time.sleep(0.8)
+        raise last_err if last_err else EnvError("UDP 监听重启失败")
+
     def close(self):
         if self.proc is not None:
             try:
@@ -455,6 +497,13 @@ class AdbUdpTap:
                 self.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+            self.proc = None
+        # 等旧读取线程自然退出（管道 EOF）：否则 restart 后两个线程会同时
+        # 往 queue 里灌新旧会话的字节
+        t = self._pump_thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=3)
+        self._pump_thread = None
         # 兜底：确保设备侧 nc 也退出（覆盖两种命令形式的匹配）
         for pattern in ("nc -u -l -p %d" % self.media_port, "nc -ulp %d" % self.media_port):
             try:
@@ -911,6 +960,13 @@ def run_interop(args):
         r = client2.recv_frame(timeout=10)
         ok = ok and r is not None and r[0] == MSG_CONFIG and r[1] == bytes([0])
         detail.append("config=%s" % ("ok" if r and r[0] == MSG_CONFIG and r[1] == bytes([0]) else "bad"))
+        # app 每个会话新建 DatagramSocket（新源端口），旧 nc 已 connect 到上个
+        # 会话的源端口、收不到新会话的包（toybox netcat.c xconnect 语义；
+        # run 39473353065 实证 C15 udp=none）。在 START 之前换一个新监听：
+        # app 在 CONFIG→START 之间不发 UDP，此时更换零丢包风险。
+        if tap.MODE == "adb":
+            tap.restart()
+            results.info("C15：已更换 UDP 监听以适配新会话源端口（toybox nc connect 语义）")
         client2.send_frame(MSG_START)
         r = client2.recv_frame(timeout=10)
         ok = ok and r is not None and r[0] == MSG_START and r[1] == bytes([0])
