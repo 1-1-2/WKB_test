@@ -1,0 +1,62 @@
+/* res/app.rc — 图标、版本信息、UAC/DPI manifest、内置驱动包
+ *
+ * 用 x86_64-w64-mingw32-windres 编译成 COFF（build/app_res.o）后链入 exe。
+ * 全部字符串保持 ASCII：GNU windres 对非 ASCII 的处理依赖 --codepage，
+ * 为保证在任何构建环境下版本信息都不乱码，这里只用 ASCII（中文归属说明放在
+ * README 与 GUI 的驱动状态卡里）。
+ *
+ * 版本信息是杀软误报 mitigation 的一部分：无签名的 PE 若带完整发布者信息，
+ * SmartScreen/Defender 的声誉判定会明显好于「无信息的小众 exe」。
+ */
+#include <winresrc.h>
+
+#define VER_MAJOR 1
+#define VER_MINOR 1
+#define VER_PATCH 0
+#define VER_BUILD 0
+
+/* ------------------------------------------------------------------ 图标 */
+IDI_APP ICON "app.ico"
+1        ICON "app.ico"
+
+/* ------------------------------------------------- 内置驱动包（RT_RCDATA） */
+/* ⚠ 这一行曾经是 `101 RCDATA "drvpkg.bin"`，现已移除：应用本体**不再内置**
+ * 任何第三方驱动二进制（它们只随驱动安装器 womic-drvinst.exe 分发，见
+ * res/drvinst.rc）。src/drvpkg.c 仍被编译进应用（架构判定与 drvpkg_origin()
+ * 的展示要用），但它找不到 RT_RCDATA 资源时只会如实报「未内置驱动包」，
+ * 不会报错、不卡启动。--install-driver 也早已改为转发给安装器（drvbridge）。
+ * build.sh 的资源自检会**反向**断言：本 exe 的 .rsrc 里不许出现 MICLDRV1。 */
+
+/* ---------------------------------------------------------------- manifest */
+1 RT_MANIFEST "app.manifest"
+
+/* ----------------------------------------------------------- 版本信息 */
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    VER_MAJOR, VER_MINOR, VER_PATCH, VER_BUILD
+PRODUCTVERSION VER_MAJOR, VER_MINOR, VER_PATCH, VER_BUILD
+FILEFLAGSMASK  0x3fL
+FILEFLAGS      0x0L
+FILEOS         0x40004L      /* VOS_NT_WINDOWS32 */
+FILETYPE       0x1L          /* VFT_APP */
+FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"     /* lang-US, Unicode */
+        BEGIN
+            VALUE "CompanyName",      "MicLink open source project\0"
+            VALUE "FileDescription",  "WO Mic Link - use an Android phone as a PC microphone\0"
+            VALUE "FileVersion",      "1.1.0.0\0"
+            VALUE "InternalName",     "womic\0"
+            VALUE "LegalCopyright",   "Client (C) MicLink. Driver womic.sys (C) Wolicheng.\0"
+            VALUE "OriginalFilename", "womic.exe\0"
+            VALUE "ProductName",      "WO Mic Link\0"
+            VALUE "ProductVersion",   "1.1.0.0\0"
+            VALUE "Comments",         "Virtual microphone client. Driver (womic.sys 2.1.0.0 by Wolicheng, https://www.wolicheng.com/womic/ - unmodified, WHCP signed) is installed separately by womic-drvinst.exe.\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
