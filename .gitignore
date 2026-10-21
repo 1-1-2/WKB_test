@@ -66,6 +66,20 @@ obj/
 # （WDK x64 包单个 ~115MB，CI 每次还原，绝不入库）。
 packages/
 
+# ---- Windows 客户端 ----
+# 第三方已签名驱动（womic.sys / womic.inf / womic.cat，版权归 Wolicheng 所有）
+# 的二进制绝不入库：本仓库是公开仓库，再分发有法律风险（架构文档 R8）。
+# 主理人已拍板：exe 产物内置分发、源码库保持干净。这两个文件都是
+# client/tools/pack_driver.py 的生成物，干净检出时 build.sh 会自动生成
+# 空包（16 B, count=0）兜底；要内置驱动需自备官方驱动目录后重新打包，
+# 详见 client/README.md「构建与驱动包」。
+client/res/drvpkg.bin
+client/src/drvpkg_data.h
+# libopus 交叉编译产物（*.a 已被上面的 *.a 命中，但 include/ 头文件会漏进去）
+# 与 opus 源码构建树：都由 client/tools/build_opus.sh 现场重建，绝不入库。
+client/deps/
+_build/
+
 # ---- Python / 工具 ----
 __pycache__/
 *.pyc
