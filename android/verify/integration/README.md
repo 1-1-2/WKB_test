@@ -60,8 +60,14 @@ UDP 媒体流发往**设备自己的 loopback**——必须在模拟器内用
 `10.0.2.15:8125`）：此时 app 的 TCP 对端是 `10.0.2.2`，UDP 直接发到 host
 loopback，脚本在 host 侧用 UDP socket 回收即可。
 
-> nc 必须在 CONFIG/START 之前启动：app 的 UDP 是 connect 语义，监听不存在时
-> 会收到 ICMP port-unreachable 并把 socket 打坏。
+> **nc 的生命周期（两个实测教训）**：
+> 1. 必须在 CONFIG/START 之前启动：app 的 UDP socket 未 connect，虽然 Linux 不会
+>    把 ICMP port-unreachable 上报给发送方，但监听就绪再 START 更接近真实场景
+>    （真实 PC 客户端总是先占住媒体端口）。
+> 2. **重连会话必须换一个新监听**（脚本自动做，`AdbUdpTap.restart()`）：toybox
+>    `nc -u -l` 收到首个数据报后会 `xconnect()` 到该对端（netcat.c:229），之后
+>    内核只交付该对端的包；app 每个会话新建 DatagramSocket（新源端口），旧监听
+>    会丢掉第二会话的全部包（run 39473353065 实证 C15 udp=none）。
 
 ## 断言清单（C01–C15）
 
@@ -94,3 +100,13 @@ loopback，脚本在 host 侧用 UDP socket 回收即可。
 `:core:test` 证明"字节编对了"，本目录证明"app 在设备上真的把流推出来了"。
 两者互补，都不能替代对方。CI 中 `protocol-tests` 作业跑前者，
 `integration-test` 作业跑后者。
+
+## 验证状态
+
+| 层级 | 状态 | 证据 |
+|---|---|---|
+| `--self-test`（9 项，合成字节流） | 全绿 | 本机 `python3 pc_client.py --self-test` |
+| mock server 干跑（15/15） | 全绿 | 本机，`docs/VERIFICATION.md` A4c(2) |
+| **CI 模拟器真 app 闭环（C01–C15）** | **全绿 15/15** | run [39523580260](https://github.com/1-1-2/WKB_test/actions/runs/39523580260)（2026-10-21T00:58:36Z，commit `58ab0f0`，job 118975309559） |
+| 真机（物理手机）联调 | 待执行 | — |
+| 真实麦克风采集（非调试音模式） | 待执行 | — |

@@ -254,7 +254,10 @@ Kotlin 与 JNI 代码经过 `:core:test` 字节级验证 + 人工自审（import
 前台服务通知渠道、协议偏移）。**APK 组装已在 Linux 沙箱真实跑通**
 （AGP 9.1.0 + Gradle 9.3.1 + NDK 28.2.13676358 + CMake 3.22.1 + opus 1.5.2，
 产物含 `lib/x86_64/libmiclink_opus.so`），协议闭环由 CI 的 `integration-test`
-作业在模拟器上验证。
+作业在模拟器上验证。**模拟器闭环已全绿**：C01–C15 共 15 项断言全部通过
+（run [39523580260](https://github.com/1-1-2/WKB_test/actions/runs/39523580260)，
+2026-10-21，含 826 包 seq 连续、心跳跨 5s 看门狗、stop 的 type-102 怪癖、
+看门狗断链、断链重连完整会话）。
 
 **仍未验证**：真实手机（arm64）上的 `AudioRecord` 采集质量、前台服务在 ROM 上的
 保活表现、以及与本项目 `pc_client.py` 之外的真实官方客户端（WOMicClient.exe 6.3）
