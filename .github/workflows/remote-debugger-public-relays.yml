@@ -1,102 +1,81 @@
 # ============================================================================
 # remote-debugger-public-relays.yml
-# GitHub Actions 远程交互式调试工具验证（手动触发，不挂 push）
+# 远端交互式调试主机（长会话模式）
 #
-# 触发：workflow_dispatch only。双 job 各最长 12 分钟，挂 push 会白白吃掉
-# runner 配额，因此刻意不自动跑；要调试就显式 dispatch。
+# 定位：把 GitHub-hosted Runner 当作一台**可长时间在线的远端 Windows 电脑**。
+# 调用它的核心目的是补充本地没有的 Windows 运行资源（装驱动、构建安装包、
+# 跑面向 Windows 的验证），而不是为了"跑一次断开一次"。
+# 因此本 workflow 刻意做成长时间保持：会话不因空闲自动收，job 一直存活，
+# 调试方反复连/disconnect/reconnect 都在同一个环境里推进，
+# 只在环境损坏或确认不再需要时才显式取消。
 #
-# 日志可见性（本版核心改动）：Actions 只收集 Runner 自己启动的进程输出，
-# 而调试方经 SSH 打进 Upterm 会话的命令，stdout 走隧道回到调试方本机，
-# 天生绕开 Actions 日志收集器 —— 于是 job log 只剩"起会话/等会话/收尾"，
-# 会话里干过什么完全没有（实测 238 行日志中，9 分钟的会话段只有 2 行）。
-# 对策是三段留痕：
-#   1. 会话内命令统一由 scribe.sh 包装，命令文本+时间戳+输出+退出码实时
-#      追加写到 $RUNNER_TEMP/upterm-session/transcript.log（Runner 本地盘）；
-#   2. 步骤 4 用 Runner 进程 cat 该文件并脱敏输出 —— 这时输出属于 Runner，
-#      会被 Actions 收集，从而把会话全过程搬进 job log；同时写 STEP_SUMMARY；
-#   3. 步骤 5 把整份 transcript 上传为工件保留 7 天，供事后检索。
+# ---------------------------------------------------------------------------
+# 会话生命周期
+#   dispatch → 起 Upterm 会话（去掉 join-timeout，永不过期）
+#            → wait 步骤进入「心跳 + 实时日志跟随」循环
+#            → 调试方随时 SSH 进出多次
+#            → 时间到 / 手动 Cancel → report 步骤归档 → job 结束
 #
-# 目的：在 GitHub-hosted Runner 上实测 Upterm 公共中继
-# （uptermd.upterm.dev:22）的 SSH 交互式调试会话，采用"仓库变量公钥白名单"
-# 方案，不依赖任何 GitHub 账号档案公钥：
+# ---------------------------------------------------------------------------
+# 日志可见性
+#   Actions 只收集 Runner 自身进程的输出。调试方经 SSH 打进会话的命令，
+#   stdout 走隧道回到调试方本机，天然绕开 Actions 日志收集器。
+#   本 workflow 用两条腿解决：
+#     1. 会话内命令经 scribe.sh 包装 → 落盘 $RUNNER_TEMP/upterm-session/
+#        transcript.log（命令文本 + 时间戳 + 输出 + 退出码）；
+#     2. wait 步骤用 `tail -f` 跟随该文件 —— tail 是 Runner 进程，其输出会被
+#        Actions 收集，**于是会话内的操作可以近乎实时地出现在 job log 里**，
+#        不必等到 job 结束；report 步骤再全量 cat 一次兜底（含首尾）。
 #
-#   | # | 方案                                          | Runner          | 公共中继               |
-#   |---|-----------------------------------------------|-----------------|------------------------|
-#   | 1 | Upterm CLI host --authorized-keys（白名单文件） | ubuntu-latest   | uptermd.upterm.dev:22  |
-#   | 2 | Upterm CLI host --authorized-keys（白名单文件） | windows-latest  | uptermd.upterm.dev:22  |
+# ---------------------------------------------------------------------------
+# 安全：这是**公开仓库**
+#   job log 对任何人可读，所以连接串一律不进 job log，只写进需要 GitHub
+#   认证才能下载的工件（upterm-connect-info）。
+#   report 步骤对所有输出再做一遍脱敏（会话名/地址、私钥块、gh*_ token）。
+#   准入最终由「白名单私钥」保证：没有私钥，知道会话名也连不进来。
 #
-# 授权模型（本版核心）：
-#   - 仓库变量 UPTERM_DEBUG_PUBKEY 存入场公钥（ed25519）。工作流把它写入
-#     Runner 临时 authorized_keys 文件（chmod 600），通过 Upterm CLI 的
-#     `host --authorized-keys` 参数显式加载；
-#   - 不读取任何 GitHub 用户档案公钥：弃用 action-upterm 的
-#     limit-access-to-actor 自动取 key 机制（账号无注册公钥时它直接不起
-#     会话），也按用户要求弃用 WarpBuild action-debugger；
-#   - SSH 私钥由测试方在可信客户端持有，绝不上传 Runner、绝不进日志、
-#     绝不写入仓库；Runner 上只有公钥白名单；
-#   - 白名单之外的密钥连接会被 Upterm sshd 以 publickey 认证失败拒绝
-#     （实测记录见测试报告）。
-#
-# 版本固定：Upterm CLI 固定 v0.38.0（2026-10-13 发布，官方 release 产物
-# upterm_linux_amd64.tar.gz / upterm_windows_amd64.tar.gz），下载后用官方
-# checksums.txt 校验 SHA256；upload-artifact 固定 v7.0.2 commit SHA。
-# 不用浮动版本、不用未固定 SHA 的第三方 Action。
-#
-# 中继主机密钥：内置 Upterm 官方 etc/known_hosts/uptermd.upterm.dev 的两行
-# @cert-authority 固定值，步骤内用 ssh-keygen 复核其 SHA256 指纹
-# （SHA256:9ajV8JqMe6jJE/s3TYjb/9xw7T0pfJ2+gADiBIJWDPE，与 Upterm README
-# "Running Without a Terminal" 公布值一致），防止首次连接被中间人劫持。
-#
-# 连接信息实时获取（关键设计）：作业运行中，job/run 日志的 blob 要等作业
-# 结束才生成，无法实时读取；因此 start 步骤把连接命令写入
-# upterm-connect-info.txt 并立即上传为工件（upload-artifact v7），监控方
-# 通过 GET /actions/runs/{id}/artifacts 在运行中即可下载取得连接命令，
-# 赶在 --join-timeout 5m 窗口内完成 SSH 交互验证。
-# 工件下载需 GitHub 认证；公开仓库的步骤日志同样可见连接串，准入由
-# 白名单私钥 + 5 分钟 join 超时双重控制。
-#
-# 权限：最小化（contents: read），不引入 secrets。
-#
-# 超时：Job 12 分钟；start 步骤 5 分钟；wait 步骤 9 分钟；
-# --join-timeout 5m（无人加入 5 分钟自动收会话并让 Workflow 继续，不会
-# 无限挂起；加入者退出后会话立即结束，wait 步骤返回，Workflow 继续）。
-#
-# 会话生命周期：start 步骤 detached 起会话（daemon 化）→ 上传连接信息 →
-# wait 步骤 `upterm session wait` 阻塞；客户端 exit 后 hosted shell 退出、
-# 会话结束、Workflow 继续。EXIT/INT/TERM trap 保证脚本异常或被取消时也
-# 回收会话（Windows 取消时 trap 可能不执行，属已知限制，见 Upterm README）。
+# ---------------------------------------------------------------------------
+# 触发：workflow_dispatch only。绝不挂 push/schedule —— 一次 job 最长近 6
+# 小时，误触发会白白吃掉大量 runner 配额。
 # ============================================================================
 name: remote-debugger-public-relays
 
-# 触发方式：**仅手动**。不得挂 push/schedule —— 本 workflow 双 job 各 12 分钟，
-# 一旦挂 push，每次提交都会白白吃掉一台 Windows runner。调试要跑就显式
-# dispatch（Actions 页面 Run workflow，或 workflow_dispatch API）。
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: '目标运行器（默认 Windows —— 本项目缺的就是它）'
+        required: true
+        default: windows-latest
+        type: choice
+        options:
+          - windows-latest
+          - ubuntu-latest
+      duration_minutes:
+        description: '会话保持时长（分钟，上限 350；GitHub job 硬上限约 6 小时）'
+        required: true
+        default: '300'
+        # 必须是 string：GitHub 的 /dispatches REST 端点只接受字符串类型的 inputs，
+        # 声明成 number 会被 API 以 422 "Invalid value" 拒（实测踩过）。
+        # 数值语义在 workflow 内部自己解析与校验。
+        type: string
 
 permissions:
   contents: read
 
 jobs:
-  upterm-authorized-keys-test:
-    name: upterm / ${{ matrix.runner }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 12
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        # windows 排在前面：本项目真正要用的是 Windows 会话（装/验 Womic 驱动），
-        # max-parallel=1 下先跑 windows 能让调试方少等一个作业的排队时间。
-        include:
-          - runner: windows-latest
-          - runner: ubuntu-latest
+  long-lived-session:
+    name: long-session / ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner }}
+    # GitHub 对单个 job 的硬上限是 6 小时；留 10 分钟给收尾步骤，
+    # 避免跑满被硬杀导致 report 步骤来不及执行。
+    timeout-minutes: 355
 
     steps:
-      # ---- 1/3. 安装 Upterm + 起会话 + 输出连接信息 ----
-      - name: Install Upterm and start authorized-keys session
+      # ---- 1/4. 安装 Upterm + 起长期会话 ----
+      - name: Install Upterm and start long-lived session
         id: start
-        timeout-minutes: 5
+        timeout-minutes: 8
         shell: bash
         env:
           UPTERM_DEBUG_PUBKEY: ${{ vars.UPTERM_DEBUG_PUBKEY }}
@@ -105,11 +84,9 @@ jobs:
 
           UPTERM_VERSION=v0.38.0
           UPTERM_SERVER=ssh://uptermd.upterm.dev:22
-          JOIN_TIMEOUT=5m
-          # Upterm 官方 README 公布的中继主机密钥 SHA256 指纹
           EXPECTED_RELAY_FP="SHA256:9ajV8JqMe6jJE/s3TYjb/9xw7T0pfJ2+gADiBIJWDPE"
 
-          echo "===== [1/5] 安装 Upterm CLI ${UPTERM_VERSION}（固定版本 + 官方 checksums 校验）====="
+          echo "===== [1/5] 安装 Upterm CLI ${UPTERM_VERSION}（固定版本 + 官方 checksum 校验）====="
           work="$RUNNER_TEMP/upterm-bin"
           mkdir -p "$work"
           cd "$work"
@@ -118,15 +95,13 @@ jobs:
           else
             archive="upterm_linux_amd64.tar.gz"
           fi
-          curl -sSL --retry 3 --retry-delay 2 \
-            -o "$archive" \
+          curl -sSL --retry 3 --retry-delay 2 -o "$archive" \
             "https://github.com/owenthereal/upterm/releases/download/${UPTERM_VERSION}/${archive}"
-          curl -sSL --retry 3 --retry-delay 2 \
-            -o checksums.txt \
+          curl -sSL --retry 3 --retry-delay 2 -o checksums.txt \
             "https://github.com/owenthereal/upterm/releases/download/${UPTERM_VERSION}/checksums.txt"
           expected_sha=$(grep " ${archive}\$" checksums.txt | cut -d' ' -f1)
-          echo "    官方 SHA256: ${expected_sha}"
           actual_sha=$(node -e 'const fs=require("fs"),c=require("crypto");console.log(c.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' "$archive")
+          echo "    官方 SHA256: ${expected_sha}"
           echo "    实际 SHA256: ${actual_sha}"
           if [ "$actual_sha" != "$expected_sha" ]; then
             echo "::error::Upterm 产物校验和不符，终止"
@@ -156,18 +131,16 @@ jobs:
 
           echo "===== [3/5] 从仓库变量写公钥白名单（authorized_keys，chmod 600）====="
           if [ -z "${UPTERM_DEBUG_PUBKEY:-}" ]; then
-            echo "::error::仓库变量 UPTERM_DEBUG_PUBKEY 未设置——请在仓库 Settings → Secrets and variables → Actions → Variables 配置准入公钥"
+            echo "::error::仓库变量 UPTERM_DEBUG_PUBKEY 未设置"
             exit 1
           fi
           ak_file="$RUNNER_TEMP/upterm_authorized_keys"
           printf '%s\n' "$UPTERM_DEBUG_PUBKEY" > "$ak_file"
           chmod 600 "$ak_file"
-          echo "    白名单公钥: ${UPTERM_DEBUG_PUBKEY}"
           echo "    白名单指纹: $(ssh-keygen -lf "$ak_file" | cut -d' ' -f2)"
 
-          echo "===== [4/5] 启动 Upterm detached 会话（host --authorized-keys 显式加载白名单）====="
+          echo "===== [4/5] 启动 detached 长期会话（不设 join-timeout，不会因空闲自毁）====="
           if [ "$RUNNER_OS" = "Windows" ]; then
-            # upterm.exe 是原生 Windows 程序，路径参数需用 Windows 形式
             kh_arg=$(cygpath -w "$kh_file")
             ak_arg=$(cygpath -w "$ak_file")
             hosted_cmd=(-- bash -l)
@@ -181,32 +154,41 @@ jobs:
               --known-hosts "$kh_arg" \
               --authorized-keys "$ak_arg" \
               --server "$UPTERM_SERVER" \
-              --join-timeout "$JOIN_TIMEOUT" \
               "${hosted_cmd[@]}" > "$session_json"; then
-            echo "::error::upterm host 启动失败，输出如下："
-            cat "$session_json" || true
+            echo "::error::upterm host 启动失败"
             exit 1
           fi
-          echo "----- session json -----"
-          cat "$session_json"
           name=$(node -e 'const fs=require("fs");console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).name)' "$session_json")
           ssh_cmd=$(node -e 'const fs=require("fs");console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).sshCommand)' "$session_json")
+
+          # session json 含完整连接串，直接 cat 会泄露进公开 job log，
+          # 这里只取不含地址字段的部分打印。
+          echo "----- session json（已剔除连接串）-----"
+          node -e '
+            const fs=require("fs");
+            const o=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));
+            delete o.sshCommand; delete o.joinCommand; delete o.url;
+            console.log(JSON.stringify(o,null,2));' "$session_json"
+
           echo "------------------------------------------------------------"
-          echo "Upterm 会话已就绪（授权方式：authorized_keys 白名单文件）"
+          echo "长期会话已就绪（授权：authorized_keys 白名单）"
           echo "  会话名       : ${name}"
-          echo "  SSH 连接命令 : ${ssh_cmd}"
-          echo "  无人加入超时 : ${JOIN_TIMEOUT}（超时会话自动结束，Workflow 继续）"
-          echo "  登录要求     : 仅白名单公钥对应私钥可登录，其余密钥将被拒绝"
+          echo "  空闲策略     : 不会自动回收（未传 --join-timeout）"
+          echo "  计划保持     : ${{ inputs.duration_minutes }} 分钟"
+          echo "  连接命令     : 见工件 upterm-connect-info-${{ inputs.runner }}-${{ github.run_attempt }}（需 GitHub 认证下载）"
+          echo "  ⚠ 出于公开仓库考虑，连接串不写入 job log"
           echo "------------------------------------------------------------"
 
-          echo "===== [5/5] 输出连接信息（步骤输出 + PATH + 监控工件源文件）====="
+          echo "===== [5/5] 准备留痕目录 + 输出步骤产物 ====="
           {
-            echo "ssh_cmd=${ssh_cmd}"
             echo "session_name=${name}"
           } >> "$GITHUB_OUTPUT"
-          # 会话留痕目录：客户端（scribe.sh）把每条命令和输出追加写到这里，
-          # job 收尾时由 report 步骤 cat 回 job log。放在 $RUNNER_TEMP 下，
-          # 会话进程即使被杀也不影响 report 步骤读取。
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cygpath -w "$work" >> "$GITHUB_PATH"
+          else
+            printf '%s\n' "$work" >> "$GITHUB_PATH"
+          fi
+          # 转录目录：$RUNNER_TEMP 在本 job 内持久，会话进程被杀也不影响读取
           t_dir="${RUNNER_TEMP}/upterm-session"
           mkdir -p "$t_dir"
           {
@@ -215,64 +197,95 @@ jobs:
             echo "runner: ${RUNNER_OS}"
             echo "session_name: ${name}"
             echo "job/run: ${{ github.repository }}#${{ github.run_id }} attempt ${{ github.run_attempt }}"
+            echo "planned_duration_min: $(printf '%s' '${{ inputs.duration_minutes }}' | tr -cd '0-9')"
           } > "$t_dir/transcript.log"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            cygpath -w "$work" >> "$GITHUB_PATH"
-          else
-            printf '%s\n' "$work" >> "$GITHUB_PATH"
-          fi
+          # 连接串只落文件（下一步进需认证才能下载的工件）
           {
             echo "ssh_command: ${ssh_cmd}"
             echo "session_name: ${name}"
             echo "runner: ${RUNNER_OS}"
             echo "started_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > "$GITHUB_WORKSPACE/upterm-connect-info.txt"
-          echo "连接信息已写入 upterm-connect-info.txt（下一步上传为工件供运行中监控）"
 
-      # ---- 2/3. 上传连接信息工件（运行中可经 API 获取）----
-      # 工件名带 run_attempt：重跑作业时新旧工件不混淆，监控方只取本次尝试的。
-      - name: Upload connect info artifact (live monitoring)
+      # ---- 2/4. 连接信息工件（需 GitHub 认证才能下载）----
+      - name: Upload connect info artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: upterm-connect-info-${{ matrix.runner }}-${{ github.run_attempt }}
+          name: upterm-connect-info-${{ inputs.runner }}-${{ github.run_attempt }}
           path: upterm-connect-info.txt
           if-no-files-found: error
           retention-days: 1
 
-      # ---- 3/4. 等待会话结束（客户端 exit 后 Workflow 继续）----
-      - name: Wait for the debug session to end
+      # ---- 3/4. 长期保持：心跳 + transcript 实时跟随进 job log ----
+      #
+      # 这一步骤是整个长会话模式的核心。它做三件事：
+      #   a) tail -f transcript → 会话里每执行一条命令，输出近乎实时出现在 job log；
+      #   b) 每分钟一行 heartbeat → 证明这台远端 Windows 还活着（未僵尸）；
+      #   c) 探测会话是否消失 → 客户端主动 exit 或因故障断掉时及时收尾。
+      - name: Keep session alive and stream transcript
         id: wait
-        timeout-minutes: 9
+        timeout-minutes: 350
         shell: bash
+        # 用户输入一律走 env 传递，绝不 ${{ }} 直插 shell 命令行
+        env:
+          WM_DURATION: ${{ inputs.duration_minutes }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           name="${{ steps.start.outputs.session_name }}"
           if [ -z "$name" ]; then
-            echo "::error::未取到会话名（start 步骤是否失败？）"
+            echo "::error::未取到会话名（start 步骤失败？）"
             exit 1
           fi
-          echo "等待 Upterm 会话 ${name} 结束（客户端 exit 后本步骤结束，Workflow 继续）"
-          trap 'upterm session stop "$name" 2>/dev/null || true' EXIT
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
-          upterm session wait "$name" & wait $! || true
-          echo "----- 会话最终状态（session info）-----"
-          upterm session info "$name" -o json || true
-          echo "Upterm 会话已结束，Workflow 继续执行。"
+          t_dir="${RUNNER_TEMP}/upterm-session"
+          t_log="$t_dir/transcript.log"
 
-      # ---- 4/4. 会话过程回流 job log（关键：解决"中间过程零记录"）----
-      #
-      # 背景：Actions 只收集 Runner 自己启动的进程的输出。调试方经 SSH 打进
-      # Upterm 会话的命令，stdout 走隧道回到调试方本机，天生绕开 Actions 的
-      # 日志收集器 —— 于是 job log 里只剩"起会话 / 等会话 / 收尾"，
-      # 中间那 9 分钟干过什么一个字没有（实测：238 行日志中会话段仅 2 行）。
-      #
-      # 对策：会话内的命令统一由 scribe.sh 包装，把「命令文本 + 时间戳 +
-      # 输出 + 退出码」追加写到 $RUNNER_TEMP/upterm-session/transcript.log；
-      # 本步骤用 Runner 进程 cat 这个文件，输出即被 Actions 收集，
-      # 从而把会话内的全过程完整搬进 job log，并写 STEP_SUMMARY 便于速览。
+          redact() {
+            sed -E \
+              -e 's#ssh [A-Za-z0-9_-]+@[a-z0-9.-]+#ssh <SESSION-REDACTED>#g' \
+              -e 's#upterm join ssh://[^ "]*#upterm join <SESSION-REDACTED>#g' \
+              -e 's#-----BEGIN [A-Z ]*PRIVATE KEY-----.*#<PRIVATE-KEY-REDACTED>#g' \
+              -e 's#gh[pousr]_[A-Za-z0-9]{20,}#<TOKEN-REDACTED>#g'
+          }
+
+          # 实时跟随：tail 是 Runner 进程，输出被 Actions 收集
+          tail -n 0 -f "$t_log" 2>/dev/null | redact &
+          TAIL_PID=$!
+          trap 'kill $TAIL_PID 2>/dev/null || true' EXIT
+
+          # 校验并夹取范围：非数字或超上限一律回落到安全值
+          case "${WM_DURATION:-}" in
+            ''|*[!0-9]*) echo "::warning::duration_minutes 非数字（'${WM_DURATION:-空}'），回落 300"; DUR=300 ;;
+            *) DUR=$WM_DURATION ;;
+          esac
+          if [ "$DUR" -gt 350 ]; then
+            echo "::warning::duration_minutes=${DUR} 超过 350 上限，夹到 350"
+            DUR=350
+          fi
+          deadline=$(( $(date +%s) + DUR * 60 ))
+          echo "进入长会话保持期：目标 ${DUR} 分钟，会话 ${name}"
+          echo "（会话内命令的输出会经由 tail -f 实时进入本日志；每段延迟约 1 秒）"
+
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            sleep 60
+            if ! upterm session info "$name" -o json >/dev/null 2>&1; then
+              echo "[heartbeat][$(date -u +%Y-%m-%dT%H:%M:%SZ)] 会话已消失（客户端退出或中继回收），结束保持"
+              break
+            fi
+            n=$(wc -l < "$t_log" 2>/dev/null || echo 0)
+            left=$(( (deadline - $(date +%s)) / 60 ))
+            # 每 10 分钟打一次详细心跳，其余静默避免刷屏
+            if [ $(( (deadline - $(date +%s)) % 600 )) -lt 60 ]; then
+              echo "[heartbeat][$(date -u +%Y-%m-%dT%H:%M:%SZ)] alive transcript_lines=${n} remaining=${left}min"
+            fi
+          done
+
+          kill $TAIL_PID 2>/dev/null || true
+          trap 'upterm session stop "$name" 2>/dev/null || true' EXIT
+          upterm session stop "$name" 2>/dev/null || true
+          echo "保持期结束。"
+
+      # ---- 4/4. 会话过程全量归档（无论成败都不丢）----
       - name: Export session transcript into job log
-        id: report
         if: always()
         timeout-minutes: 5
         shell: bash
@@ -282,12 +295,12 @@ jobs:
           t_log="$t_dir/transcript.log"
           name="${{ steps.start.outputs.session_name }}"
 
-          # 脱敏：会话名与连接串等价于凭证，不进日志
           redact() {
             sed -E \
-              -e 's#ssh [A-Za-z0-9_-]+@uptermd\.upterm\.dev#ssh <SESSION-REDACTED>#g' \
+              -e 's#ssh [A-Za-z0-9_-]+@[a-z0-9.-]+#ssh <SESSION-REDACTED>#g' \
+              -e 's#upterm join ssh://[^ "]*#upterm join <SESSION-REDACTED>#g' \
               -e 's#-----BEGIN [A-Z ]*PRIVATE KEY-----.*#<PRIVATE-KEY-REDACTED>#g' \
-              -e 's#(gh[pousr]_[A-Za-z0-9]{20,})#<TOKEN-REDACTED>#g'
+              -e 's#gh[pousr]_[A-Za-z0-9]{20,}#<TOKEN-REDACTED>#g'
           }
 
           total=0
@@ -296,10 +309,10 @@ jobs:
           if [ "$total" -eq 0 ]; then
             echo "（无 transcript：会话未被连接，或客户端未启用 scribe.sh 留痕器）"
           elif [ "$total" -gt 1200 ]; then
-            echo "（留痕较长，输出头 700 行 + 尾 500 行）"
+            echo "（留痕较长，输出头 700 行 + 尾 500 行；完整版见 transcript artifact）"
             head -n 700 "$t_log" | redact
             echo ""
-            echo "…… 中间省略 $((total - 1200)) 行（完整版见 transcript artifact）……"
+            echo "…… 中间省略 $((total - 1200)) 行 ……"
             echo ""
             tail -n 500 "$t_log" | redact
           else
@@ -307,35 +320,30 @@ jobs:
           fi
           echo "===== [会话内全过程结束] ====="
 
-          # 阶段结论一并渲染到 Actions UI 顶部
           {
-            echo "## 远程调试会话摘要 — ${{ matrix.runner }}"
+            echo "## 远端调试会话摘要 — ${{ inputs.runner }}"
             echo ""
             echo "| 项 | 值 |"
             echo "|---|---|"
             echo "| 会话名 | \`${name}\` |"
-            echo "| Runner | ${{ matrix.runner }} |"
-            echo "| 等待步骤结论 | \`${{ steps.wait.conclusion }}\` |"
+            echo "| Runner | ${{ inputs.runner }} |"
+            echo "| 计划时长 | ${{ inputs.duration_minutes }} 分钟 |"
+            echo "| 保持步骤结论 | \`${{ steps.wait.conclusion }}\` |"
             echo "| 留痕行数 | ${total} |"
-            echo "| 起-止(UTC) | $(date -u +%Y-%m-%dT%H:%M:%SZ) |"
-            if [ -d "$t_dir" ]; then
-              echo ""
-              echo "<details><summary>会话产物清单</summary>"
-              echo ""
-              echo '```'
-              ls -la "$t_dir" 2>/dev/null || true
-              echo '```'
-              echo "</details>"
-            fi
+            echo ""
+            echo "<details><summary>会话产物清单</summary>"
+            echo ""
+            echo '```'
+            ls -la "$t_dir" 2>/dev/null || true
+            echo '```'
+            echo "</details>"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "transcript_lines=${total}" >> "$GITHUB_OUTPUT"
 
-      # ---- 会话过程留痕归档（保留 7 天，供事后检索）----
       - name: Upload session transcript artifact
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: session-transcript-${{ matrix.runner }}-${{ github.run_attempt }}
+          name: session-transcript-${{ inputs.runner }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/upterm-session/
           if-no-files-found: warn
           retention-days: 7
