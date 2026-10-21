@@ -1,6 +1,6 @@
 # ============================================================================
 # remote-debugger-public-relays.yml
-# GitHub Actions 远程交互式调试工具验证（仅本测试分支 push 触发）
+# GitHub Actions 远程交互式调试工具验证（手动触发 workflow_dispatch）
 #
 # 目的：在 GitHub-hosted Runner 上实测 Upterm 公共中继
 # （uptermd.upterm.dev:22）的 SSH 交互式调试会话，采用"仓库变量公钥白名单"
@@ -54,10 +54,15 @@
 # ============================================================================
 name: remote-debugger-public-relays
 
+# 触发方式：仅手动（workflow_dispatch）。
+# 原为 push 触发，导致每次推送都会起 ubuntu+windows 两个 9 分钟会话；
+# 需要调试时用 API 或网页手动 dispatch，避免无意义占用。
 on:
-  push:
-    branches:
-      - test/remote-debugger-public-relays
+  workflow_dispatch:
+    inputs:
+      note:
+        description: '本次调试目的（可留空）'
+        required: false
 
 permissions:
   contents: read
