@@ -1,0 +1,231 @@
+# ============================================================================
+# remote-debugger-public-relays.yml
+# GitHub Actions 远程交互式调试工具验证（仅本测试分支 push 触发）
+#
+# 目的：在 GitHub-hosted Runner 上实测 Upterm 公共中继
+# （uptermd.upterm.dev:22）的 SSH 交互式调试会话，采用"仓库变量公钥白名单"
+# 方案，不依赖任何 GitHub 账号档案公钥：
+#
+#   | # | 方案                                          | Runner          | 公共中继               |
+#   |---|-----------------------------------------------|-----------------|------------------------|
+#   | 1 | Upterm CLI host --authorized-keys（白名单文件） | ubuntu-latest   | uptermd.upterm.dev:22  |
+#   | 2 | Upterm CLI host --authorized-keys（白名单文件） | windows-latest  | uptermd.upterm.dev:22  |
+#
+# 授权模型（本版核心）：
+#   - 仓库变量 UPTERM_DEBUG_PUBKEY 存入场公钥（ed25519）。工作流把它写入
+#     Runner 临时 authorized_keys 文件（chmod 600），通过 Upterm CLI 的
+#     `host --authorized-keys` 参数显式加载；
+#   - 不读取任何 GitHub 用户档案公钥：弃用 action-upterm 的
+#     limit-access-to-actor 自动取 key 机制（账号无注册公钥时它直接不起
+#     会话），也按用户要求弃用 WarpBuild action-debugger；
+#   - SSH 私钥由测试方在可信客户端持有，绝不上传 Runner、绝不进日志、
+#     绝不写入仓库；Runner 上只有公钥白名单；
+#   - 白名单之外的密钥连接会被 Upterm sshd 以 publickey 认证失败拒绝
+#     （实测记录见测试报告）。
+#
+# 版本固定：Upterm CLI 固定 v0.38.0（2026-10-13 发布，官方 release 产物
+# upterm_linux_amd64.tar.gz / upterm_windows_amd64.tar.gz），下载后用官方
+# checksums.txt 校验 SHA256；upload-artifact 固定 v7.0.2 commit SHA。
+# 不用浮动版本、不用未固定 SHA 的第三方 Action。
+#
+# 中继主机密钥：内置 Upterm 官方 etc/known_hosts/uptermd.upterm.dev 的两行
+# @cert-authority 固定值，步骤内用 ssh-keygen 复核其 SHA256 指纹
+# （SHA256:9ajV8JqMe6jJE/s3TYjb/9xw7T0pfJ2+gADiBIJWDPE，与 Upterm README
+# "Running Without a Terminal" 公布值一致），防止首次连接被中间人劫持。
+#
+# 连接信息实时获取（关键设计）：作业运行中，job/run 日志的 blob 要等作业
+# 结束才生成，无法实时读取；因此 start 步骤把连接命令写入
+# upterm-connect-info.txt 并立即上传为工件（upload-artifact v7），监控方
+# 通过 GET /actions/runs/{id}/artifacts 在运行中即可下载取得连接命令，
+# 赶在 --join-timeout 5m 窗口内完成 SSH 交互验证。
+# 工件下载需 GitHub 认证；公开仓库的步骤日志同样可见连接串，准入由
+# 白名单私钥 + 5 分钟 join 超时双重控制。
+#
+# 权限：最小化（contents: read），不引入 secrets。
+#
+# 超时：Job 12 分钟；start 步骤 5 分钟；wait 步骤 9 分钟；
+# --join-timeout 5m（无人加入 5 分钟自动收会话并让 Workflow 继续，不会
+# 无限挂起；加入者退出后会话立即结束，wait 步骤返回，Workflow 继续）。
+#
+# 会话生命周期：start 步骤 detached 起会话（daemon 化）→ 上传连接信息 →
+# wait 步骤 `upterm session wait` 阻塞；客户端 exit 后 hosted shell 退出、
+# 会话结束、Workflow 继续。EXIT/INT/TERM trap 保证脚本异常或被取消时也
+# 回收会话（Windows 取消时 trap 可能不执行，属已知限制，见 Upterm README）。
+# ============================================================================
+name: remote-debugger-public-relays
+
+on:
+  push:
+    branches:
+      - test/remote-debugger-public-relays
+
+permissions:
+  contents: read
+
+jobs:
+  upterm-authorized-keys-test:
+    name: upterm / ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - runner: ubuntu-latest
+          - runner: windows-latest
+
+    steps:
+      # ---- 1/3. 安装 Upterm + 起会话 + 输出连接信息 ----
+      - name: Install Upterm and start authorized-keys session
+        id: start
+        timeout-minutes: 5
+        shell: bash
+        env:
+          UPTERM_DEBUG_PUBKEY: ${{ vars.UPTERM_DEBUG_PUBKEY }}
+        run: |
+          set -euo pipefail
+
+          UPTERM_VERSION=v0.38.0
+          UPTERM_SERVER=ssh://uptermd.upterm.dev:22
+          JOIN_TIMEOUT=5m
+          # Upterm 官方 README 公布的中继主机密钥 SHA256 指纹
+          EXPECTED_RELAY_FP="SHA256:9ajV8JqMe6jJE/s3TYjb/9xw7T0pfJ2+gADiBIJWDPE"
+
+          echo "===== [1/5] 安装 Upterm CLI ${UPTERM_VERSION}（固定版本 + 官方 checksums 校验）====="
+          work="$RUNNER_TEMP/upterm-bin"
+          mkdir -p "$work"
+          cd "$work"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            archive="upterm_windows_amd64.tar.gz"
+          else
+            archive="upterm_linux_amd64.tar.gz"
+          fi
+          curl -sSL --retry 3 --retry-delay 2 \
+            -o "$archive" \
+            "https://github.com/owenthereal/upterm/releases/download/${UPTERM_VERSION}/${archive}"
+          curl -sSL --retry 3 --retry-delay 2 \
+            -o checksums.txt \
+            "https://github.com/owenthereal/upterm/releases/download/${UPTERM_VERSION}/checksums.txt"
+          expected_sha=$(grep " ${archive}\$" checksums.txt | cut -d' ' -f1)
+          echo "    官方 SHA256: ${expected_sha}"
+          actual_sha=$(node -e 'const fs=require("fs"),c=require("crypto");console.log(c.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' "$archive")
+          echo "    实际 SHA256: ${actual_sha}"
+          if [ "$actual_sha" != "$expected_sha" ]; then
+            echo "::error::Upterm 产物校验和不符，终止"
+            exit 1
+          fi
+          tar xzf "$archive"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            export PATH="$(cygpath -u "$work"):$PATH"
+          else
+            export PATH="$work:$PATH"
+          fi
+          upterm version
+
+          echo "===== [2/5] 写入中继主机密钥固定值并复核指纹 ====="
+          kh_file="$RUNNER_TEMP/upterm_known_hosts"
+          cat > "$kh_file" <<'KH_EOF'
+          @cert-authority uptermd.upterm.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICiecex8Dq718eSe1CCLgLvDmI7AagvCtax7brPFWkh4
+          @cert-authority [uptermd.upterm.dev]:443 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICiecex8Dq718eSe1CCLgLvDmI7AagvCtax7brPFWkh4
+          KH_EOF
+          ca_key=$(grep -m1 '^@cert-authority uptermd.upterm.dev ' "$kh_file" | sed -E 's/^@cert-authority [^ ]+ ([^ ]+ [^ ]+).*/\1/')
+          relay_fp=$(printf '%s\n' "$ca_key" | ssh-keygen -lf - | cut -d' ' -f2)
+          echo "    中继主机密钥指纹: ${relay_fp}"
+          if [ "$relay_fp" != "$EXPECTED_RELAY_FP" ]; then
+            echo "::error::中继主机密钥指纹与官方公布值不符（${relay_fp}），终止以防首次连接被劫持"
+            exit 1
+          fi
+
+          echo "===== [3/5] 从仓库变量写公钥白名单（authorized_keys，chmod 600）====="
+          if [ -z "${UPTERM_DEBUG_PUBKEY:-}" ]; then
+            echo "::error::仓库变量 UPTERM_DEBUG_PUBKEY 未设置——请在仓库 Settings → Secrets and variables → Actions → Variables 配置准入公钥"
+            exit 1
+          fi
+          ak_file="$RUNNER_TEMP/upterm_authorized_keys"
+          printf '%s\n' "$UPTERM_DEBUG_PUBKEY" > "$ak_file"
+          chmod 600 "$ak_file"
+          echo "    白名单公钥: ${UPTERM_DEBUG_PUBKEY}"
+          echo "    白名单指纹: $(ssh-keygen -lf "$ak_file" | cut -d' ' -f2)"
+
+          echo "===== [4/5] 启动 Upterm detached 会话（host --authorized-keys 显式加载白名单）====="
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # upterm.exe 是原生 Windows 程序，路径参数需用 Windows 形式
+            kh_arg=$(cygpath -w "$kh_file")
+            ak_arg=$(cygpath -w "$ak_file")
+            hosted_cmd=(-- bash -l)
+          else
+            kh_arg="$kh_file"
+            ak_arg="$ak_file"
+            hosted_cmd=(-- bash)
+          fi
+          session_json="$RUNNER_TEMP/upterm_session.json"
+          if ! upterm host --detach --accept --output json \
+              --known-hosts "$kh_arg" \
+              --authorized-keys "$ak_arg" \
+              --server "$UPTERM_SERVER" \
+              --join-timeout "$JOIN_TIMEOUT" \
+              "${hosted_cmd[@]}" > "$session_json"; then
+            echo "::error::upterm host 启动失败，输出如下："
+            cat "$session_json" || true
+            exit 1
+          fi
+          echo "----- session json -----"
+          cat "$session_json"
+          name=$(node -e 'const fs=require("fs");console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).name)' "$session_json")
+          ssh_cmd=$(node -e 'const fs=require("fs");console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).sshCommand)' "$session_json")
+          echo "------------------------------------------------------------"
+          echo "Upterm 会话已就绪（授权方式：authorized_keys 白名单文件）"
+          echo "  会话名       : ${name}"
+          echo "  SSH 连接命令 : ${ssh_cmd}"
+          echo "  无人加入超时 : ${JOIN_TIMEOUT}（超时会话自动结束，Workflow 继续）"
+          echo "  登录要求     : 仅白名单公钥对应私钥可登录，其余密钥将被拒绝"
+          echo "------------------------------------------------------------"
+
+          echo "===== [5/5] 输出连接信息（步骤输出 + PATH + 监控工件源文件）====="
+          {
+            echo "ssh_cmd=${ssh_cmd}"
+            echo "session_name=${name}"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cygpath -w "$work" >> "$GITHUB_PATH"
+          else
+            printf '%s\n' "$work" >> "$GITHUB_PATH"
+          fi
+          {
+            echo "ssh_command: ${ssh_cmd}"
+            echo "session_name: ${name}"
+            echo "runner: ${RUNNER_OS}"
+            echo "started_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$GITHUB_WORKSPACE/upterm-connect-info.txt"
+          echo "连接信息已写入 upterm-connect-info.txt（下一步上传为工件供运行中监控）"
+
+      # ---- 2/3. 上传连接信息工件（运行中可经 API 获取）----
+      # 工件名带 run_attempt：重跑作业时新旧工件不混淆，监控方只取本次尝试的。
+      - name: Upload connect info artifact (live monitoring)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: upterm-connect-info-${{ matrix.runner }}-${{ github.run_attempt }}
+          path: upterm-connect-info.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      # ---- 3/3. 等待会话结束（客户端 exit 后 Workflow 继续）----
+      - name: Wait for the debug session to end
+        timeout-minutes: 9
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="${{ steps.start.outputs.session_name }}"
+          if [ -z "$name" ]; then
+            echo "::error::未取到会话名（start 步骤是否失败？）"
+            exit 1
+          fi
+          echo "等待 Upterm 会话 ${name} 结束（客户端 exit 后本步骤结束，Workflow 继续）"
+          trap 'upterm session stop "$name" 2>/dev/null || true' EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          upterm session wait "$name" & wait $! || true
+          echo "----- 会话最终状态（session info）-----"
+          upterm session info "$name" -o json || true
+          echo "Upterm 会话已结束，Workflow 继续执行。"
