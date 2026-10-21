@@ -1,9 +1,10 @@
 name: build-driver
 
+# 触发方式：仅手动（workflow_dispatch）。
+# 历史上这里是 push 触发（paths-ignore 只挡 *.md），导致每次推送任何非 md 文件
+# 都会跑一轮 WDK 编译（~200MB NuGet 还原 + 10 分钟），纯属浪费。
+# 驱动线已归档为"不采用"路线（改为复用官方已签名驱动），此处不再自动触发。
 on:
-  push:
-    paths-ignore:
-      - '**.md'
   workflow_dispatch:
     inputs:
       configuration:
