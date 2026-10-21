@@ -323,50 +323,23 @@ jobs:
             echo "| 收集诊断 | \`bash ../.github/scripts/collect-diagnostics.sh\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 关键：GitHub 没有"运行中作业的行级日志"API，单纯起 SSH 会话的话，连接信息
-      # 只在日志里，而日志要等作业结束才能下载——那就白等了。
-      # 所以这里自己起 tmate 并把连接串写成文件，用 artifact 发布：
-      # artifact 在作业**运行中**就能上传/下载，于是可以立刻拿到连接串并 ssh 进去。
-      - name: Start tmate session (publish connection via artifact)
-        timeout-minutes: 8
-        continue-on-error: true
-        run: |
-          set -u
-          mkdir -p /tmp/tmate
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends tmate
-          tmate -S /tmp/tmate/sock new-session -d
-          for i in $(seq 1 20); do
-            sleep 2
-            conn=$(tmate -S /tmp/tmate/sock display -p '#{tmate_ssh}' 2>/dev/null || true)
-            web=$(tmate -S /tmp/tmate/sock display -p '#{tmate_web}' 2>/dev/null || true)
-            ro=$(tmate -S /tmp/tmate/sock display -p '#{tmate_ssh_ro}' 2>/dev/null || true)
-            if [ -n "$conn" ]; then
-              echo "$conn" > /tmp/tmate/ssh.txt
-              echo "$ro"   > /tmp/tmate/ssh_ro.txt
-              echo "$web"  > /tmp/tmate/web.txt
-              echo "[tmate] ssh:  $conn"
-              echo "[tmate] ro:   $ro"
-              echo "[tmate] web:  $web"
-              break
-            fi
-            echo "[tmate] 等待连接串… ($i)"
-          done
-          # tmate 是守护进程，后续步骤与用户连接期间保持存活
-          ps -ef | grep -c "[t]mate" || true
-
-      - name: Upload tmate connection info (downloadable while job runs)
-        timeout-minutes: 5
-        continue-on-error: true
-        uses: actions/upload-artifact@v7
-        with:
-          name: ssh-connection
-          path: /tmp/tmate/
-          if-no-files-found: warn
-          retention-days: 1
-
-      # 保活：让作业停在可交互状态（若上面的 tmate 不可用，这个 action 是备选通道）
-      - name: Keep session alive (or fallback interactive session)
+      # SSH 交互通道：WarpBuilds/action-debugger（tmate 系，中继 gha.warp.build）。
+      #
+      # 授权方式：limit-access-to-actor=true 时只放行**触发者 GitHub 档案里
+      # 注册的 SSH 公钥**（https://github.com/settings/keys）。若档案里没有
+      # 公钥，本步骤直接报 "No public SSH keys registered with <actor>'s
+      # GitHub profile" 并失败——这不是 bug，去设置页加一把公钥即可
+      # （私钥留在自己机器上，连接时 ssh -i <私钥> <日志里的连接串>）。
+      #
+      # 已移除的旧通道：公共 tmate.io / nyc1.tmate.io——两站点 DNS 均已失效
+      # （沙箱与 runner 双侧实证：tmate 步骤 40s 拿不到连接串、artifact 为
+      # 空 zip），继续留着只会误导。action-debugger 的 gha.warp.build 可达
+      # （沙箱实测 tcp/22 OK）。
+      #
+      # 连接串位置：本步骤日志里会打印 ssh 命令（job 日志需作业结束后才能
+      # 下载，所以先手动触发本作业、等它打印连接串再连；会话最长保留到
+      # 本步骤的 timeout）。
+      - name: Interactive SSH session (action-debugger)
         uses: WarpBuilds/action-debugger@v1.3
         with:
           limit-access-to-actor: true

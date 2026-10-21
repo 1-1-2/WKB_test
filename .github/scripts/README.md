@@ -16,20 +16,26 @@
 
 ## 交互式调试（SSH 进 runner）：现状与前置条件
 
-已实测（`linux-debug` 作业，run 39470807984），两条路子都被环境挡住，记在这里
-避免重复踩：
+`linux-debug` 作业（手动触发）会 boot 模拟器、装好 app，然后用
+`WarpBuilds/action-debugger@v1.3` 开一个可交互的 SSH 会话（中继
+`gha.warp.build`，沙箱实测 tcp/22 可达）。
 
 | 通道 | 实测结果 | 说明 |
 |---|---|---|
-| 自建 `tmate`（apt 装，连接串经 artifact 发布） | ❌ 拿不到连接串 | `tmate.io` 公共服务器已停服（tmate 项目 2024 起停止维护），`tmate_ssh` 变量一直为空 |
-| `WarpBuilds/action-debugger@v1.3` | ❌ `No public SSH keys registered with 1-1-2's GitHub profile` | 开 `limit-access-to-actor: true` 时，它用**你的 GitHub 账号已注册的 SSH 公钥**做授权；账号没注册公钥就直接报错 |
+| 公共 `tmate.io` / `nyc1.tmate.io` | ❌ DNS 已失效 | 双侧实证：沙箱解析失败；runner 内 tmate 步骤 40s 拿不到连接串、artifact 为空 zip。**已从工作流移除**，别再走这条路 |
+| `WarpBuilds/action-debugger@v1.3` | ✅ 通道可用，但需一次性的用户操作 | `limit-access-to-actor: true` 时，它用**触发者 GitHub 账号已注册的 SSH 公钥**做授权；账号没注册公钥就直接报 `No public SSH keys registered with <actor>'s GitHub profile` |
 
-要让 SSH 调试可用，需要做的两件事：
-1. 在 GitHub 账号 **Settings → SSH and GPG keys** 添加至少一把公钥
-   （`action-debugger` 靠它判断"谁可以连"）；
-2. 连接串的获取：`action-debugger` 只在运行日志里打印，而 GitHub **没有运行中
-   作业的行级日志 API**，所以要先把连接串写到文件并用 artifact 发布（作业运行中
-   就能下载），或改用它写入 `$GITHUB_STEP_SUMMARY` 的部分（只有 UI 可见）。
+**一次性前置条件（只有用户本人能做）**：
+1. 生成密钥对（助手可代生成）：`ssh-keygen -t ed25519 -f womic_ci_debug -N ""`；
+2. 把**公钥**贴到 GitHub **Settings → SSH and GPG keys**（需登录账号，
+   API token 无权代改用户档案）；
+3. 手动触发 `android.yml`（`linux_debug=true`），等 `Interactive SSH session`
+   步骤在日志里打印连接串；
+4. 连接：`ssh -i <私钥路径> <日志里的连接串>`。会话最长保留到该步骤的
+   timeout（110 分钟）。
+
+> 安全提示：仓库是公开的，**不要**为了省事去掉 `limit-access-to-actor`——
+> 那样连接串本身就是凭证，任何拿到日志/artifact 的人都能进 runner。
 
 在那之前，调试靠"失败后读 artifact 里的 logcat / emulator.log / interop.out"——
 这一路已经能定位到心跳、看门狗、Opus、UDP 目标等具体问题（run 39470634964 实证）。
