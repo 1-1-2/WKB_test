@@ -26,6 +26,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
+      - name: Checkout (拿到 tools/womic-stage 全套脚本)
+        uses: actions/checkout@v4
+
       - name: Join tailnet via OAuth client
         uses: tailscale/github-action@v4
         with:
