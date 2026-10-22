@@ -3,6 +3,11 @@ name: tailscale-probe
 # 用途：验证 GitHub-hosted Windows runner 能否通过 Tailscale 加入 tailnet，
 # 并起一个可 SSH 的入口，供维护者从自己的设备直连取证。
 # 触发：仅 workflow_dispatch（不挂 push/schedule，避免误触发占用配额）。
+#
+# 认证方式：OAuth client（scopes=auth_keys, tags=tag:ci）
+#   - action 每次运行自动签发一把临时 auth key，节点标记 ephemeral + preapproved
+#   - job 结束自动 logout，协调服务器随即移除节点
+#   - 因此无需维护任何长期 auth key
 
 on:
   workflow_dispatch:
@@ -21,21 +26,29 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - name: Install and join Tailscale
+      - name: Join tailnet via OAuth client
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          version: latest
+
+      - name: Report tailnet IP
         shell: pwsh
-        env:
-          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $msi = Join-Path $env:RUNNER_TEMP 'tailscale-setup.exe'
-          Invoke-WebRequest 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' -OutFile $msi
-          Start-Process -FilePath $msi -ArgumentList '/quiet' -Wait
           $ts = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-          & $ts up --authkey="$env:TS_AUTHKEY" --hostname="gh-win-probe" --unattended
+          if (-not (Test-Path $ts)) {
+            $ts = Join-Path ${env:ProgramFiles(x86)} 'Tailscale\tailscale.exe'
+          }
+          if (-not (Test-Path $ts)) { throw "tailscale.exe not found" }
+          & $ts set --hostname gh-win-probe
           & $ts status
           $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+          if (-not $ip) { throw 'no tailnet IPv4 assigned' }
           Write-Host "TAILSCALE_IP=$ip"
-          "TAILSCALE_IP=$ip" | Out-File -FilePath $env:RUNNER_TEMP\ts_ip.txt -Encoding ascii
+          "TAILSCALE_IP=$ip" | Out-File -FilePath "$env:RUNNER_TEMP\ts_ip.txt" -Encoding ascii
 
       - name: Enable OpenSSH server
         shell: pwsh
