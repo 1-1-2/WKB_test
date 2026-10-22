@@ -379,6 +379,15 @@ jobs:
           trap 'kill $TAIL_PID 2>/dev/null || true' EXIT
 
           # ---- 恢复模式用的两个小工具 ----
+          # 会话存活探测：upterm session info 只读本地 sessiondir 记录，
+          # 会话已 ended 时退出码仍是 0（实测 v0.38.0），不能靠退出码判断；
+          # 必须解析 JSON 的 status 字段，ready 才算真存活。
+          session_alive() {
+            local st
+            st=$(upterm session info "$name" -o json 2>/dev/null | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);console.log(o.status||"")}catch(e){console.log("")}})' 2>/dev/null)
+            [ "$st" = "ready" ]
+          }
+
           # 等计划任务把活干完（只读轮询，不触发任何 PnP 动作）
           wait_stage_task() {
             if [ ! -f "$RUNNER_TEMP/state.jsonl" ]; then
@@ -495,7 +504,7 @@ jobs:
 
           while [ "$(date +%s)" -lt "$deadline" ]; do
             sleep 60
-            if upterm session info "$name" >/dev/null 2>&1; then
+            if session_alive; then
               n=$(wc -l < "$t_log" 2>/dev/null || echo 0)
               left=$(( (deadline - $(date +%s)) / 60 ))
               # 每 10 分钟打一次详细心跳，其余静默避免刷屏
@@ -510,7 +519,7 @@ jobs:
             gone=1
             for _ in 1 2 3; do
               sleep 20
-              if upterm session info "$name" >/dev/null 2>&1; then gone=0; break; fi
+              if session_alive; then gone=0; break; fi
             done
             if [ "$gone" -eq 0 ]; then
               echo "[heartbeat] 虚惊一场，会话仍在"
