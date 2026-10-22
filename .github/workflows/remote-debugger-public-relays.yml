@@ -1,6 +1,6 @@
 # ============================================================================
 # remote-debugger-public-relays.yml
-# 远端交互式调试主机（长会话模式）
+# 远端交互式调试主机（长会话模式 + 驱动安装闭环）
 #
 # 定位：把 GitHub-hosted Runner 当作一台**可长时间在线的远端 Windows 电脑**。
 # 调用它的核心目的是补充本地没有的 Windows 运行资源（装驱动、构建安装包、
@@ -11,11 +11,27 @@
 #
 # ---------------------------------------------------------------------------
 # 会话生命周期
-#   dispatch → 起 Upterm 会话（去掉 join-timeout，永不过期）
+#   dispatch → 装驱动并验证录音设备（Session 0 计划任务，先于会话）
+#            → 起 Upterm 会话（去掉 join-timeout，永不过期）
 #            → wait 步骤进入「心跳 + 实时日志跟随」循环
 #            → 调试方随时 SSH 进出多次
 #            → 时间到 / 手动 Cancel → report 步骤归档 → job 结束
 #
+# ---------------------------------------------------------------------------
+# 驱动安装闭环（本版新增）
+#   痛点：`devcon install` 触发 PnP 重配置，Windows 重建控制台（conhost），
+#         交互式 SSH PTY 当场死亡；而 job 本身还活着，却没有任何步骤知道
+#         "驱动装到哪一步了"，更没法在设备上线后把人接回去。
+#   解法（三层）：
+#     1) install-driver 步骤：把阶段脚本（仓库 tools/womic-stage/）落到
+#        $RUNNER_TEMP，部署并触发 SYSTEM/Session 0 计划任务 WomicStage，
+#        由它跑完 fetch→pick_devcon→install→verify_device→probe 全链，
+#        步骤本身只轮询 state.jsonl（只读），PnP 重建控制台杀不到它；
+#     2) wait 步骤恢复模式：心跳发现会话消失 → 等计划任务干完 → 只读验证
+#        录音设备 → 重新 host 一个新 Upterm 会话 → 用 Actions 运行时令牌
+#        把新连接串上传成新工件（需 GitHub 认证才能下载）→ 继续等待；
+#     3) 守护进程侧：连不上时先等"恢复工件"出现再重连，而不是急着 rerun
+#        job 换台新 VM 把装好的驱动丢掉。
 # ---------------------------------------------------------------------------
 # 日志可见性
 #   Actions 只收集 Runner 自身进程的输出。调试方经 SSH 打进会话的命令，
@@ -30,7 +46,7 @@
 # ---------------------------------------------------------------------------
 # 安全：这是**公开仓库**
 #   job log 对任何人可读，所以连接串一律不进 job log，只写进需要 GitHub
-#   认证才能下载的工件（upterm-connect-info）。
+#   认证才能下载的工件（upterm-connect-info-*）。
 #   report 步骤对所有输出再做一遍脱敏（会话名/地址、私钥块、gh*_ token）。
 #   准入最终由「白名单私钥」保证：没有私钥，知道会话名也连不进来。
 #
@@ -59,9 +75,22 @@ on:
         # 声明成 number 会被 API 以 422 "Invalid value" 拒（实测踩过）。
         # 数值语义在 workflow 内部自己解析与校验。
         type: string
+      install_driver:
+        description: '是否在会话启动前安装并验证 WOMic 驱动（默认是）'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 permissions:
   contents: read
+
+env:
+  UPTERM_VERSION: v0.38.0
+  UPTERM_SERVER: ssh://uptermd.upterm.dev:22
+  EXPECTED_RELAY_FP: "SHA256:9ajV8JqMe6jJE/s3TYjb/9xw7T0pfJ2+gADiBIJWDPE"
 
 jobs:
   long-lived-session:
@@ -72,9 +101,9 @@ jobs:
     timeout-minutes: 355
 
     steps:
-      # ---- 1/4. 安装 Upterm + 起长期会话 ----
-      - name: Install Upterm and start long-lived session
-        id: start
+      # ---- 1/7. 安装 Upterm + 写白名单 + 准备留痕目录（不起会话）----
+      - name: Install Upterm and prepare session material
+        id: prep
         timeout-minutes: 8
         shell: bash
         env:
@@ -82,11 +111,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          UPTERM_VERSION=v0.38.0
-          UPTERM_SERVER=ssh://uptermd.upterm.dev:22
-          EXPECTED_RELAY_FP="SHA256:9ajV8JqMe6jJE/s3TYjb/9xw7T0pfJ2+gADiBIJWDPE"
-
-          echo "===== [1/5] 安装 Upterm CLI ${UPTERM_VERSION}（固定版本 + 官方 checksum 校验）====="
           work="$RUNNER_TEMP/upterm-bin"
           mkdir -p "$work"
           cd "$work"
@@ -115,7 +139,7 @@ jobs:
           fi
           upterm version
 
-          echo "===== [2/5] 写入中继主机密钥固定值并复核指纹 ====="
+          echo "===== 写入中继主机密钥固定值并复核指纹 ====="
           kh_file="$RUNNER_TEMP/upterm_known_hosts"
           cat > "$kh_file" <<'KH_EOF'
           @cert-authority uptermd.upterm.dev ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICiecex8Dq718eSe1CCLgLvDmI7AagvCtax7brPFWkh4
@@ -129,7 +153,7 @@ jobs:
             exit 1
           fi
 
-          echo "===== [3/5] 从仓库变量写公钥白名单（authorized_keys，chmod 600）====="
+          echo "===== 从仓库变量写公钥白名单（authorized_keys，chmod 600）====="
           if [ -z "${UPTERM_DEBUG_PUBKEY:-}" ]; then
             echo "::error::仓库变量 UPTERM_DEBUG_PUBKEY 未设置"
             exit 1
@@ -139,22 +163,110 @@ jobs:
           chmod 600 "$ak_file"
           echo "    白名单指纹: $(ssh-keygen -lf "$ak_file" | cut -d' ' -f2)"
 
-          echo "===== [4/5] 启动 detached 长期会话（不设 join-timeout，不会因空闲自毁）====="
           if [ "$RUNNER_OS" = "Windows" ]; then
-            kh_arg=$(cygpath -w "$kh_file")
-            ak_arg=$(cygpath -w "$ak_file")
-            hosted_cmd=(-- bash -l)
+            cygpath -w "$work" >> "$GITHUB_PATH"
           else
-            kh_arg="$kh_file"
-            ak_arg="$ak_file"
-            hosted_cmd=(-- bash)
+            printf '%s\n' "$work" >> "$GITHUB_PATH"
           fi
+          # 转录目录：$RUNNER_TEMP 在本 job 内持久，会话进程被杀也不影响读取
+          t_dir="${RUNNER_TEMP}/upterm-session"
+          mkdir -p "$t_dir"
+          {
+            echo "##### transcript 开始 #####"
+            echo "started_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "runner: ${RUNNER_OS}"
+            echo "job/run: ${{ github.repository }}#${{ github.run_id }} attempt ${{ github.run_attempt }}"
+            echo "planned_duration_min: $(printf '%s' '${{ inputs.duration_minutes }}' | tr -cd '0-9')"
+          } > "$t_dir/transcript.log"
+          echo "会话材料就绪（upterm + known_hosts + authorized_keys + transcript 目录）"
+
+      # ---- 2/7. 装驱动并验证录音设备（先于会话，杀不到任何会话）----
+      #
+      # 为什么放在起会话之前：驱动安装必然触发 PnP 重配置 → conhost 重建 →
+      # 交互式 PTY 死亡。让安装先跑完（经 Session 0 计划任务），等设备验证
+      # 有结论了再起会话，交互 shell 一上线就是"驱动已就绪"的环境。
+      # 即便安装途中会话已起（daemon 抢跑）导致会话死亡，也有 wait 步骤的
+      # 恢复模式兜底（见 5/7）。
+      - name: Install WOMic driver and verify recording device
+        id: driver
+        if: inputs.install_driver == 'true'
+        continue-on-error: true
+        timeout-minutes: 25
+        shell: bash
+        env:
+          WM_INSTALL: ${{ inputs.install_driver }}
+        run: |
+          set -uo pipefail
+          export WOMIC_WORK="$RUNNER_TEMP"
+          source "$GITHUB_WORKSPACE/tools/womic-stage/wm-stage-lib.sh"
+
+          STAGE_DIR="$GITHUB_WORKSPACE/tools/womic-stage"
+          if [ ! -f "$STAGE_DIR/agent_stage.py" ]; then
+            echo "::error::仓库缺少 tools/womic-stage/agent_stage.py（分支不同步？）"
+            exit 1
+          fi
+          # 阶段脚本落到 $RUNNER_TEMP（= D:\a\_temp），与守护进程经 SSH 上传的
+          # 位置一致；计划任务与 daemon 后续触发都复用同一套文件。
+          cp "$STAGE_DIR"/*.py "$RUNNER_TEMP/" 2>/dev/null || true
+
+          echo "===== 环境探测 ====="
+          hostname
+          python --version 2>&1 || python3 --version 2>&1
+          for p in "/c/Program Files/7-Zip/7z.exe" "/c/Program Files (x86)/7-Zip/7z.exe"; do
+            [ -x "$p" ] && echo "7z found: $p"
+          done
+          command -v 7z >/dev/null 2>&1 && echo "7z in PATH" || echo "7z NOT in PATH（bundle 内有驱动则无碍）"
+          ls -la "$RUNNER_TEMP/driver" 2>/dev/null || echo "（$RUNNER_TEMP/driver 不存在，将下载官方安装包）"
+
+          echo "===== 部署并触发 Session 0 计划任务 WomicStage ====="
+          (cd "$RUNNER_TEMP" && WOMIC_WORK="$RUNNER_TEMP" python deploy_task.py) 2>&1 | tail -20
+
+          echo "===== 轮询阶段推进（最长 22 分钟）====="
+          deadline_i=$(( $(date +%s) + 22*60 ))
+          while [ "$(date +%s)" -lt "$deadline_i" ]; do
+            echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $(stage_table) age=$(state_age_seconds)s"
+            p=$(stage_status probe); i=$(stage_status install)
+            if [ "$p" = "ok" ] || [ "$p" = "fail" ]; then
+              echo "探针阶段已有结论（${p}），结束等待"
+              break
+            fi
+            if [ "$i" = "fail" ]; then
+              echo "安装阶段失败，结束等待（保留现场供调试）"
+              break
+            fi
+            # 任务已停且状态 3 分钟无更新 → 它不会自己推进了
+            if ! task_running; then
+              age=$(state_age_seconds)
+              if [ "$age" -ge 180 ]; then
+                echo "计划任务已停止且状态 ${age}s 未更新，结束等待"
+                break
+              fi
+            fi
+            sleep 30
+          done
+          echo "===== 阶段终态：$(stage_table) ====="
+          {
+            echo "driver_install_result: $(stage_table)"
+            echo "driver_install_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$RUNNER_TEMP/upterm-session/transcript.log"
+
+      # ---- 3/7. 起长期会话（不设 join-timeout，不会因空闲自毁）----
+      - name: Start long-lived session
+        id: start
+        timeout-minutes: 8
+        shell: bash
+        env:
+          UPTERM_DEBUG_PUBKEY: ${{ vars.UPTERM_DEBUG_PUBKEY }}
+        run: |
+          set -euo pipefail
+          kh_arg=$(cygpath -w "$RUNNER_TEMP/upterm_known_hosts")
+          ak_arg=$(cygpath -w "$RUNNER_TEMP/upterm_authorized_keys")
           session_json="$RUNNER_TEMP/upterm_session.json"
           if ! upterm host --detach --accept --output json \
               --known-hosts "$kh_arg" \
               --authorized-keys "$ak_arg" \
               --server "$UPTERM_SERVER" \
-              "${hosted_cmd[@]}" > "$session_json"; then
+              -- bash -l > "$session_json"; then
             echo "::error::upterm host 启动失败"
             exit 1
           fi
@@ -179,26 +291,9 @@ jobs:
           echo "  ⚠ 出于公开仓库考虑，连接串不写入 job log"
           echo "------------------------------------------------------------"
 
-          echo "===== [5/5] 准备留痕目录 + 输出步骤产物 ====="
           {
             echo "session_name=${name}"
           } >> "$GITHUB_OUTPUT"
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            cygpath -w "$work" >> "$GITHUB_PATH"
-          else
-            printf '%s\n' "$work" >> "$GITHUB_PATH"
-          fi
-          # 转录目录：$RUNNER_TEMP 在本 job 内持久，会话进程被杀也不影响读取
-          t_dir="${RUNNER_TEMP}/upterm-session"
-          mkdir -p "$t_dir"
-          {
-            echo "##### transcript 开始 #####"
-            echo "started_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "runner: ${RUNNER_OS}"
-            echo "session_name: ${name}"
-            echo "job/run: ${{ github.repository }}#${{ github.run_id }} attempt ${{ github.run_attempt }}"
-            echo "planned_duration_min: $(printf '%s' '${{ inputs.duration_minutes }}' | tr -cd '0-9')"
-          } > "$t_dir/transcript.log"
           # 连接串只落文件（下一步进需认证才能下载的工件）
           {
             echo "ssh_command: ${ssh_cmd}"
@@ -207,7 +302,7 @@ jobs:
             echo "started_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > "$GITHUB_WORKSPACE/upterm-connect-info.txt"
 
-      # ---- 2/4. 连接信息工件（需 GitHub 认证才能下载）----
+      # ---- 4/7. 连接信息工件（需 GitHub 认证才能下载）----
       - name: Upload connect info artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -216,21 +311,26 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-      # ---- 3/4. 长期保持：心跳 + transcript 实时跟随进 job log ----
+      # ---- 5/7. 长期保持：心跳 + transcript 实时跟随 + 会话恢复模式 ----
       #
-      # 这一步骤是整个长会话模式的核心。它做三件事：
+      # 这一步骤是整个长会话模式的核心。它做四件事：
       #   a) tail -f transcript → 会话里每执行一条命令，输出近乎实时出现在 job log；
       #   b) 每分钟一行 heartbeat → 证明这台远端 Windows 还活着（未僵尸）；
-      #   c) 探测会话是否消失 → 客户端主动 exit 或因故障断掉时及时收尾。
-      - name: Keep session alive and stream transcript
+      #   c) 探测会话是否消失 → 客户端主动 exit 或因 PnP 重建控制台断掉时，
+      #      **不直接收工**，进入恢复模式；
+      #   d) 恢复模式：等 Session 0 计划任务把驱动安装/验证干完 → 只读验证
+      #      录音设备 → 重新 host 一个新会话 → 新连接串经 Actions 运行时令牌
+      #      上传成新工件 → 回到 (a) 继续陪伴新会话。
+      - name: Keep session alive, stream transcript, recover on death
         id: wait
         timeout-minutes: 350
         shell: bash
-        # 用户输入一律走 env 传递，绝不 ${{ }} 直插 shell 命令行
         env:
           WM_DURATION: ${{ inputs.duration_minutes }}
         run: |
           set -uo pipefail
+          export WOMIC_WORK="$RUNNER_TEMP"
+          source "$GITHUB_WORKSPACE/tools/womic-stage/wm-stage-lib.sh"
           name="${{ steps.start.outputs.session_name }}"
           if [ -z "$name" ]; then
             echo "::error::未取到会话名（start 步骤失败？）"
@@ -252,6 +352,106 @@ jobs:
           TAIL_PID=$!
           trap 'kill $TAIL_PID 2>/dev/null || true' EXIT
 
+          # ---- 恢复模式用的两个小工具 ----
+          # 等计划任务把活干完（只读轮询，不触发任何 PnP 动作）
+          wait_stage_task() {
+            if [ ! -f "$RUNNER_TEMP/state.jsonl" ]; then
+              echo "（无 state.jsonl：阶段任务未部署过，无需等待）"
+              return 0
+            fi
+            local deadline_w=$(( $(date +%s) + 20*60 ))
+            echo "等待 Session 0 计划任务完成（最长 20 分钟）…"
+            while [ "$(date +%s)" -lt "$deadline_w" ]; do
+              local p i v
+              p=$(stage_status probe); i=$(stage_status install); v=$(stage_status verify_device)
+              echo "  [$(date -u +%Y-%m-%dT%H:%M:%SZ)] install=${i} verify_device=${v} probe=${p}"
+              if [ "$p" = "ok" ] || [ "$p" = "fail" ]; then echo "  探针已有结论（${p}）"; return 0; fi
+              if [ "$i" = "fail" ]; then echo "  安装已失败"; return 0; fi
+              if ! task_running; then
+                if [ "$v" = "ok" ] || [ "$v" = "fail" ]; then echo "  任务结束且验证已有结论"; return 0; fi
+                echo "  计划任务已结束（验证未跑），跳出等待自行验证"
+                return 0
+              fi
+              sleep 30
+            done
+            echo "  等待超时（20 分钟），继续恢复流程"
+          }
+
+          # 只读验证录音设备（SetupAPI + CIM，不触发 PnP 重配置）
+          ensure_device_verified() {
+            local i v
+            i=$(stage_status install); v=$(stage_status verify_device)
+            if [ "$i" != "ok" ]; then
+              echo "安装阶段未成功（${i}），跳过设备验证"
+              return 0
+            fi
+            if [ "$v" = "ok" ]; then
+              echo "录音设备已验证（state.jsonl 已有结论）"
+              return 0
+            fi
+            echo "自行执行只读设备验证…"
+            (cd "$RUNNER_TEMP" && WOMIC_WORK="$RUNNER_TEMP" python agent_stage.py --stage verify_device) 2>&1 | tail -30
+          }
+
+          # 重新 host 一个会话；成功时设置 RECOVERED_NAME / RECOVERED_SSH
+          rehost_session() {
+            local kh_arg ak_arg sj
+            sj="$RUNNER_TEMP/upterm_session_recovered_${RECOVERY_DONE}.json"
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              kh_arg=$(cygpath -w "$RUNNER_TEMP/upterm_known_hosts")
+              ak_arg=$(cygpath -w "$RUNNER_TEMP/upterm_authorized_keys")
+              upterm host --detach --accept --output json \
+                --known-hosts "$kh_arg" --authorized-keys "$ak_arg" \
+                --server "$UPTERM_SERVER" -- bash -l > "$sj" || return 1
+            else
+              upterm host --detach --accept --output json \
+                --known-hosts "$RUNNER_TEMP/upterm_known_hosts" \
+                --authorized-keys "$RUNNER_TEMP/upterm_authorized_keys" \
+                --server "$UPTERM_SERVER" -- bash > "$sj" || return 1
+            fi
+            RECOVERED_NAME=$(node -e 'const fs=require("fs");console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).name)' "$sj")
+            RECOVERED_SSH=$(node -e 'const fs=require("fs");console.log(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).sshCommand)' "$sj")
+            printf 'ssh_command: %s\nsession_name: %s\nrunner: %s\nrecovered_utc: %s\n' \
+              "$RECOVERED_SSH" "$RECOVERED_NAME" "$RUNNER_OS" \
+              "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              > "$GITHUB_WORKSPACE/upterm-connect-info-recovered.txt"
+            return 0
+          }
+
+          # 用 Actions 运行时令牌直接上传工件（等价于 upload-artifact 动作，
+          # 但可在步骤内部调用；工件仍需 GitHub 认证才能下载）
+          upload_connect_info_twirp() {
+            local art base resp upload_url size f
+            art="upterm-connect-info-recovered-$(date +%H%M%S)"
+            f="$GITHUB_WORKSPACE/upterm-connect-info-recovered.txt"
+            [ -s "$f" ] || { echo "::warning::无恢复连接串文件可传"; return 1; }
+            base="${ACTIONS_RUNTIME_URL%/}"
+            resp=$(curl -sS -X POST "${base}/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact" \
+              -H "Authorization: Bearer ${ACTIONS_RUNTIME_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"name\":\"${art}\",\"version\":4}" 2>&1) || true
+            upload_url=$(printf '%s' "$resp" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const o=JSON.parse(s);console.log(o.signedUploadUrl||"")}catch(e){console.log("")}})')
+            if [ -z "$upload_url" ]; then
+              echo "::warning::CreateArtifact 未返回上传地址：${resp:0:200}"
+              return 1
+            fi
+            size=$(wc -c < "$f" | tr -d ' ')
+            if ! curl -sS -X PUT "$upload_url" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary @"$f" >/dev/null 2>&1; then
+              echo "::warning::连接串 PUT 上传失败"
+              return 1
+            fi
+            if ! curl -sS -X POST "${base}/twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact" \
+                -H "Authorization: Bearer ${ACTIONS_RUNTIME_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "{\"name\":\"${art}\",\"size\":${size}}" >/dev/null 2>&1; then
+              echo "::warning::FinalizeArtifact 失败"
+              return 1
+            fi
+            echo "恢复会话连接串已上传为工件 ${art}（${size}B，需 GitHub 认证下载）"
+          }
+
           # 校验并夹取范围：非数字或超上限一律回落到安全值
           case "${WM_DURATION:-}" in
             ''|*[!0-9]*) echo "::warning::duration_minutes 非数字（'${WM_DURATION:-空}'），回落 300"; DUR=300 ;;
@@ -262,20 +462,73 @@ jobs:
             DUR=350
           fi
           deadline=$(( $(date +%s) + DUR * 60 ))
+          RECOVERY_MAX=3
+          RECOVERY_DONE=0
           echo "进入长会话保持期：目标 ${DUR} 分钟，会话 ${name}"
           echo "（会话内命令的输出会经由 tail -f 实时进入本日志；每段延迟约 1 秒）"
 
           while [ "$(date +%s)" -lt "$deadline" ]; do
             sleep 60
-            if ! upterm session info "$name" -o json >/dev/null 2>&1; then
-              echo "[heartbeat][$(date -u +%Y-%m-%dT%H:%M:%SZ)] 会话已消失（客户端退出或中继回收），结束保持"
+            if upterm session info "$name" >/dev/null 2>&1; then
+              n=$(wc -l < "$t_log" 2>/dev/null || echo 0)
+              left=$(( (deadline - $(date +%s)) / 60 ))
+              # 每 10 分钟打一次详细心跳，其余静默避免刷屏
+              if [ $(( (deadline - $(date +%s)) % 600 )) -lt 60 ]; then
+                echo "[heartbeat][$(date -u +%Y-%m-%dT%H:%M:%SZ)] alive transcript_lines=${n} remaining=${left}min"
+              fi
+              continue
+            fi
+
+            # ---- 会话消失：先确认不是瞬时抖动（连查 3 次）----
+            echo "[heartbeat][$(date -u +%Y-%m-%dT%H:%M:%SZ)] 会话 ${name} 探测失败，复核中…"
+            gone=1
+            for _ in 1 2 3; do
+              sleep 20
+              if upterm session info "$name" >/dev/null 2>&1; then gone=0; break; fi
+            done
+            if [ "$gone" -eq 0 ]; then
+              echo "[heartbeat] 虚惊一场，会话仍在"
+              continue
+            fi
+
+            if [ "$RECOVERY_DONE" -ge "$RECOVERY_MAX" ]; then
+              echo "[heartbeat] 会话确认消失，恢复次数已用尽（${RECOVERY_MAX}），结束保持"
               break
             fi
-            n=$(wc -l < "$t_log" 2>/dev/null || echo 0)
-            left=$(( (deadline - $(date +%s)) / 60 ))
-            # 每 10 分钟打一次详细心跳，其余静默避免刷屏
-            if [ $(( (deadline - $(date +%s)) % 600 )) -lt 60 ]; then
-              echo "[heartbeat][$(date -u +%Y-%m-%dT%H:%M:%SZ)] alive transcript_lines=${n} remaining=${left}min"
+            if [ $(( deadline - $(date +%s) )) -lt 600 ]; then
+              echo "[heartbeat] 会话确认消失，但剩余不足 10 分钟，不做恢复"
+              break
+            fi
+
+            RECOVERY_DONE=$((RECOVERY_DONE+1))
+            echo "======================================================"
+            echo "===== 会话消失，进入恢复模式（第 ${RECOVERY_DONE}/${RECOVERY_MAX} 次） ====="
+            echo "     可能原因：装驱动触发 PnP 重配置重建了控制台"
+            echo "======================================================"
+            {
+              echo ""
+              echo "##### 恢复事件 $(date -u +%Y-%m-%dT%H:%M:%SZ) #####"
+              echo "session_lost: ${name}"
+            } >> "$t_log"
+
+            # 1) 等 Session 0 计划任务把安装/验证干完
+            wait_stage_task
+            # 2) 只读验证录音设备
+            ensure_device_verified
+            # 3) 重新 host 会话
+            if rehost_session; then
+              echo "新会话已就绪：${RECOVERED_NAME}"
+              # 4) 新连接串进工件（需认证下载），守护进程据此重连
+              upload_connect_info_twirp || true
+              name="$RECOVERED_NAME"
+              {
+                echo "session_recovered: ${name}"
+                echo "recovered_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              } >> "$t_log"
+              echo "恢复完成，继续陪伴新会话 ${name}"
+            else
+              echo "::warning::重新 host 失败，下个心跳周期再试"
+              sleep 60
             fi
           done
 
@@ -284,13 +537,17 @@ jobs:
           upterm session stop "$name" 2>/dev/null || true
           echo "保持期结束。"
 
-      # ---- 4/4. 会话过程全量归档（无论成败都不丢）----
+      # ---- 6/7. 会话过程 + 驱动安装结果全量归档（无论成败都不丢）----
       - name: Export session transcript into job log
         if: always()
         timeout-minutes: 5
         shell: bash
+        env:
+          WM_INSTALL: ${{ inputs.install_driver }}
         run: |
           set -uo pipefail
+          export WOMIC_WORK="$RUNNER_TEMP"
+          source "$GITHUB_WORKSPACE/tools/womic-stage/wm-stage-lib.sh"
           t_dir="${RUNNER_TEMP}/upterm-session"
           t_log="$t_dir/transcript.log"
           name="${{ steps.start.outputs.session_name }}"
@@ -320,6 +577,20 @@ jobs:
           fi
           echo "===== [会话内全过程结束] ====="
 
+          # 驱动安装阶段结论（若有）
+          if [ "${WM_INSTALL}" = "true" ]; then
+            echo ""
+            echo "===== [驱动安装阶段] $(stage_table) ====="
+            if [ -f "$RUNNER_TEMP/stage.log" ]; then
+              echo "----- stage.log 尾部 40 行 -----"
+              tail -n 40 "$RUNNER_TEMP/stage.log" | redact
+            fi
+            if [ -f "$RUNNER_TEMP/state.jsonl" ]; then
+              echo "----- state.jsonl -----"
+              cat "$RUNNER_TEMP/state.jsonl" | redact
+            fi
+          fi
+
           {
             echo "## 远端调试会话摘要 — ${{ inputs.runner }}"
             echo ""
@@ -329,6 +600,8 @@ jobs:
             echo "| Runner | ${{ inputs.runner }} |"
             echo "| 计划时长 | ${{ inputs.duration_minutes }} 分钟 |"
             echo "| 保持步骤结论 | \`${{ steps.wait.conclusion }}\` |"
+            echo "| 装驱动步骤结论 | \`${{ steps.driver.conclusion }}\` |"
+            echo "| 驱动阶段状态 | \`$(stage_table)\` |"
             echo "| 留痕行数 | ${total} |"
             echo ""
             echo "<details><summary>会话产物清单</summary>"
