@@ -89,7 +89,10 @@ permissions:
 
 env:
   UPTERM_VERSION: v0.38.0
-  UPTERM_SERVER: ssh://uptermd.upterm.dev:22
+  # 中继走 443/wss：实测 ssh://…:22 直连对 GitHub runner 与本地都不稳定
+  # （handshake failed: EOF 频发，run 39713983364 的会话自死+rehost 失败
+  # 均源于此）；wss 复用同一 CA 证书体系，5/5 稳定。
+  UPTERM_SERVER: wss://uptermd.upterm.dev
   EXPECTED_RELAY_FP: "SHA256:9ajV8JqMe6jJE/s3TYjb/9xw7T0pfJ2+gADiBIJWDPE"
 
 jobs:
