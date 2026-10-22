@@ -120,10 +120,16 @@ VT_LPWSTR = 31
 
 # ------------------------------------------------------------------ COM 基础设施
 def vtable(obj, index: int, restype, *argtypes):
-    """取 COM 对象 vtable 第 index 个方法并包成可调用（首参 self=接口指针）。"""
+    """取 COM 对象 vtable 第 index 个方法并包成可调用（首参 self=接口指针）。
+
+    注意：POINTER(c_void_p) 的下标操作要作用在**指针对象**上；
+    `.contents` 是解引用（取第 0 个值），对它下标会 TypeError。
+    """
     vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.c_void_p)).contents.value
-    fn = ctypes.cast(vtbl, ctypes.POINTER(ctypes.c_void_p)).contents[index]
-    return ctypes.CFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(fn)
+    if not vtbl:
+        raise RuntimeError("接口指针为空，无法取 vtable")
+    fn_addr = ctypes.cast(vtbl, ctypes.POINTER(ctypes.c_void_p))[index]
+    return ctypes.CFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(fn_addr)
 
 
 def enum_capture_endpoints(enum):
