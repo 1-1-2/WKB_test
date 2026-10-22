@@ -101,6 +101,13 @@ jobs:
     timeout-minutes: 355
 
     steps:
+      # ---- 0/8. 检出仓库（install-driver 等步骤需要 tools/womic-stage/ 脚本）----
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 1
+
       # ---- 1/7. 安装 Upterm + 写白名单 + 准备留痕目录（不起会话）----
       - name: Install Upterm and prepare session material
         id: prep
