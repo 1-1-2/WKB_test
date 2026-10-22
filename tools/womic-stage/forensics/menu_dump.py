@@ -8,6 +8,7 @@
 import ctypes
 import ctypes.wintypes as wt
 import sys
+import time
 
 u32 = ctypes.WinDLL("user32", use_last_error=True)
 u32.GetMenu.argtypes = [wt.HWND]
@@ -39,6 +40,9 @@ u32.GetDlgItem.restype = wt.HWND
 u32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
 u32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
 u32.mouse_event.argtypes = [wt.DWORD, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_void_p]
+u32.SetForegroundWindow.argtypes = [wt.HWND]
+u32.SendInput.restype = wt.UINT
+import time as _t2
 
 MF_BYPOSITION = 0x400
 MF_BYCOMMAND = 0
@@ -163,6 +167,53 @@ def click(cid):
     print(f"clicked {cid}")
 
 
+PUL = ctypes.Structure
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wt.WORD), ("wScan", wt.WORD), ("dwFlags", wt.DWORD),
+                ("time", wt.DWORD), ("dwExtraInfo", ctypes.c_void_p)]
+class INPUT(ctypes.Structure):
+    class _U(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT), ("pad", ctypes.c_ubyte * 32)]
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wt.DWORD), ("u", _U)]
+
+
+def send_char(ch):
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_UNICODE = 0x0004
+    KEYEVENTF_KEYUP = 0x0002
+    def mk(scan, flags):
+        i = INPUT()
+        i.type = INPUT_KEYBOARD
+        i.ki = KEYBDINPUT(0, ord(scan), flags, 0, None)
+        return i
+    down = mk(ch, KEYEVENTF_UNICODE)
+    up = mk(ch, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+    arr = (INPUT * 2)(down, up)
+    u32.SendInput.argtypes = [wt.UINT, ctypes.c_void_p, ctypes.c_int]
+    u32.SendInput(2, arr, ctypes.sizeof(INPUT))
+
+
+def type_text(text):
+    for ch in text:
+        send_char(ch)
+        time.sleep(0.01)
+    print(f"typed {text!r}")
+
+
+def press_enter():
+    VK_RETURN = 0x0D
+    INPUT_KEYBOARD = 1
+    i1, i2 = INPUT(), INPUT()
+    i1.type = i2.type = INPUT_KEYBOARD
+    i1.ki = KEYBDINPUT(VK_RETURN, 0, 0, 0, None)
+    i2.ki = KEYBDINPUT(VK_RETURN, 0, 2, 0, None)
+    arr = (INPUT * 2)(i1, i2)
+    u32.SendInput.argtypes = [wt.UINT, ctypes.c_void_p, ctypes.c_int]
+    u32.SendInput(2, arr, ctypes.sizeof(INPUT))
+    print("pressed ENTER")
+
+
 def clickat(cid):
     """真实鼠标点击控件中心（GetWindowRect + SendInput）。"""
     import time as _t
@@ -187,6 +238,16 @@ def clickat(cid):
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "type":
+        dlg = find_connect_dialog()
+        if dlg:
+            u32.SetForegroundWindow(dlg)
+            time.sleep(0.3)
+        type_text(sys.argv[2])
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == "enter":
+        press_enter()
+        return
     if len(sys.argv) > 1 and sys.argv[1] == "clickat":
         err = u32.FindWindowW("#32770", "Connection error")
         if err:
