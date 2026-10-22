@@ -344,8 +344,10 @@ def main():
               f"handshake={stats.get('handshake')}")
 
     ok = all(c["ok"] for c in results["checks"])
+    results["ok"] = ok          # 供 agent_stage._parse_conclusion 机器读取
     print(json.dumps(results, ensure_ascii=False, indent=2))
-    print(f"\n===== 结论: {'PASS' if ok else 'FAIL'} =====")
+    print(f"\nRESULT={'PASS' if ok else 'FAIL'}")
+    print(f"===== 结论: {'PASS' if ok else 'FAIL'} =====")
     return 0 if ok else 1
 
 

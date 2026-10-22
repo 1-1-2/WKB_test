@@ -423,8 +423,10 @@ def main():
         write_wav(wav_path, bytes(_pcm), summary)
         print(f"  已保存 {wav_path}")
 
+    results["ok"] = ok
     print(json.dumps(results, ensure_ascii=False, indent=2))
-    print(f"\n===== 结论: {'PASS' if ok else 'FAIL'} =====")
+    print(f"\nRESULT={'PASS' if ok else 'FAIL'}")
+    print(f"===== 结论: {'PASS' if ok else 'FAIL'} =====")
     return 0 if ok else 1
 
 
