@@ -94,6 +94,9 @@ def write_bat(path: Path, py: str, args: str, log: str) -> None:
     lines = [
         "@echo off",
         "chcp 65001 >nul 2>&1",
+        # stdout 重定向到文件时 Windows 用 ANSI 代码页（cp1252），中文日志会崩；
+        # 强制 Python 按 UTF-8 输出（agent_stage.py 里也有兜底 reconfigure）。
+        "set PYTHONIOENCODING=utf-8",
         f'cd /d "{BASE}"',
         f'echo [%DATE% %TIME%] === stage run {args} === >> "{log}"',
         f'"{py}" "{BASE / "agent_stage.py"}" {args} >> "{log}" 2>&1',

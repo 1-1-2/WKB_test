@@ -287,7 +287,24 @@ IMPL = {
 
 
 # ----------------------------------------------------------------- 主流程
+def force_utf8_output() -> None:
+    """把 stdout/stderr 固定成 UTF-8。
+
+    计划任务里 Python 的 stdout 被重定向到文件时，Windows 不用控制台代码页，
+    而是用 locale 的 ANSI 代码页（GitHub runner 上是 cp1252）。中文日志会抛
+    UnicodeEncodeError 让整个阶段崩掉——实测 fetch 阶段解压成功后正死在
+    `log(f"driver 目录: ...")` 这一行，state.jsonl 里留下三条 fetch=start
+    却永远拿不到结论。bat 里也设置了 PYTHONIOENCODING=utf-8，双保险。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 —— 老版本 Python 或非常规流就放弃
+            pass
+
+
 def main() -> int:
+    force_utf8_output()
     ap = argparse.ArgumentParser()
     ap.add_argument("--auto", action="store_true")
     ap.add_argument("--stage")
