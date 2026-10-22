@@ -382,6 +382,13 @@ jobs:
           trap 'kill $TAIL_PID 2>/dev/null || true' EXIT
 
           # ---- 恢复模式用的两个小工具 ----
+          # 诊断：确认 Actions 运行时变量是否注入本步骤（run 39716127855
+          # 实测 ACTIONS_RUNTIME_URL 在 wait 步骤未定义，set -u 直接杀 bash）
+          if [ -n "${ACTIONS_RUNTIME_URL:-}" ]; then
+            echo "[diag] ACTIONS_RUNTIME_URL 已注入"
+          else
+            echo "[diag] ACTIONS_RUNTIME_URL 未注入——twirp 直传路线不可用，走 GITHUB_ENV+工件步骤"
+          fi
           # 会话存活探测：upterm session info 只读本地 sessiondir 记录，
           # 会话已 ended 时退出码仍是 0（实测 v0.38.0），不能靠退出码判断；
           # 必须解析 JSON 的 status 字段，ready 才算真存活。
@@ -457,9 +464,16 @@ jobs:
           }
 
           # 用 Actions 运行时令牌直接上传工件（等价于 upload-artifact 动作，
-          # 但可在步骤内部调用；工件仍需 GitHub 认证才能下载）
+          # 但可在步骤内部调用；工件仍需 GitHub 认证才能下载）。
+          # 注意 run 39716127855 实测：ACTIONS_RUNTIME_URL 在长时 wait 步骤
+          # 可能未注入，set -u 下直接杀 bash——先判空，缺变量就走
+          # GITHUB_ENV + 后续 upload-artifact 步骤的路线（见恢复成功分支）。
           upload_connect_info_twirp() {
             local art base resp upload_url size f
+            if [ -z "${ACTIONS_RUNTIME_URL:-}" ] || [ -z "${ACTIONS_RUNTIME_TOKEN:-}" ]; then
+              echo "::warning::ACTIONS_RUNTIME_URL/TOKEN 未注入，跳过 twirp 直传（改走工件步骤）"
+              return 1
+            fi
             art="upterm-connect-info-recovered-$(date +%H%M%S)"
             f="$WS/upterm-connect-info-recovered.txt"
             [ -s "$f" ] || { echo "::warning::无恢复连接串文件可传"; return 1; }
@@ -556,8 +570,13 @@ jobs:
             # 3) 重新 host 会话
             if rehost_session; then
               echo "新会话已就绪：${RECOVERED_NAME}"
-              # 4) 新连接串进工件（需认证下载），守护进程据此重连
+              # 4) 新连接串进工件（需认证下载），守护进程据此重连。
+              #    双路线：a) twirp 直传（运行时变量可用时）；
+              #            b) GITHUB_ENV 传文件路径，由后续 upload-artifact
+              #               步骤上传（run 39716127855 实测 wait 步骤里
+              #               ACTIONS_RUNTIME_URL 未注入，set -u 会杀 bash）。
               upload_connect_info_twirp || true
+              echo "RECOVERED_CONNECT_FILE=$WS/upterm-connect-info-recovered.txt" >> "$GITHUB_ENV"
               name="$RECOVERED_NAME"
               {
                 echo "session_recovered: ${name}"
@@ -574,6 +593,19 @@ jobs:
           trap 'upterm session stop "$name" 2>/dev/null || true' EXIT
           upterm session stop "$name" 2>/dev/null || true
           echo "保持期结束。"
+
+      # ---- 5.5/7. 恢复会话连接串工件（wait 步骤恢复成功时经 GITHUB_ENV 传入路径）----
+      # twirp 直传路线在长时 wait 步骤里因 ACTIONS_RUNTIME_URL 可能未注入而
+      # 失效（run 39716127855），这里用标准 upload-artifact 动作兜底。
+      # 连接串只进需 GitHub 认证才能下载的工件，不进公开 job log。
+      - name: Upload recovered connect info artifact
+        if: ${{ always() && env.RECOVERED_CONNECT_FILE != '' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: upterm-connect-info-recovered-${{ github.run_attempt }}
+          path: upterm-connect-info-recovered.txt
+          if-no-files-found: warn
+          retention-days: 1
 
       # ---- 6/7. 会话过程 + 驱动安装结果全量归档（无论成败都不丢）----
       - name: Export session transcript into job log
