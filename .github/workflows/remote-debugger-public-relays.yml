@@ -198,9 +198,16 @@ jobs:
         run: |
           set -uo pipefail
           export WOMIC_WORK="$RUNNER_TEMP"
-          source "$GITHUB_WORKSPACE/tools/womic-stage/wm-stage-lib.sh"
+          # Windows Runner 上 $GITHUB_WORKSPACE 是 D:\a\... 反斜杠路径；
+          # bash 内建（source/重定向）不做 MSYS 路径转换，必须先转 POSIX 形式
+          if command -v cygpath >/dev/null 2>&1; then
+            WS="$(cygpath -u "$GITHUB_WORKSPACE")"
+          else
+            WS="$GITHUB_WORKSPACE"
+          fi
+          source "$WS/tools/womic-stage/wm-stage-lib.sh"
 
-          STAGE_DIR="$GITHUB_WORKSPACE/tools/womic-stage"
+          STAGE_DIR="$WS/tools/womic-stage"
           if [ ! -f "$STAGE_DIR/agent_stage.py" ]; then
             echo "::error::仓库缺少 tools/womic-stage/agent_stage.py（分支不同步？）"
             exit 1
@@ -259,6 +266,12 @@ jobs:
           UPTERM_DEBUG_PUBKEY: ${{ vars.UPTERM_DEBUG_PUBKEY }}
         run: |
           set -euo pipefail
+          # Windows Runner 上 $GITHUB_WORKSPACE 是反斜杠路径，先转 POSIX 形式
+          if command -v cygpath >/dev/null 2>&1; then
+            WS="$(cygpath -u "$GITHUB_WORKSPACE")"
+          else
+            WS="$GITHUB_WORKSPACE"
+          fi
           kh_arg=$(cygpath -w "$RUNNER_TEMP/upterm_known_hosts")
           ak_arg=$(cygpath -w "$RUNNER_TEMP/upterm_authorized_keys")
           session_json="$RUNNER_TEMP/upterm_session.json"
@@ -300,7 +313,7 @@ jobs:
             echo "session_name: ${name}"
             echo "runner: ${RUNNER_OS}"
             echo "started_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          } > "$GITHUB_WORKSPACE/upterm-connect-info.txt"
+          } > "$WS/upterm-connect-info.txt"
 
       # ---- 4/7. 连接信息工件（需 GitHub 认证才能下载）----
       - name: Upload connect info artifact
@@ -330,7 +343,13 @@ jobs:
         run: |
           set -uo pipefail
           export WOMIC_WORK="$RUNNER_TEMP"
-          source "$GITHUB_WORKSPACE/tools/womic-stage/wm-stage-lib.sh"
+          # Windows Runner 上 $GITHUB_WORKSPACE 是反斜杠路径，先转 POSIX 形式
+          if command -v cygpath >/dev/null 2>&1; then
+            WS="$(cygpath -u "$GITHUB_WORKSPACE")"
+          else
+            WS="$GITHUB_WORKSPACE"
+          fi
+          source "$WS/tools/womic-stage/wm-stage-lib.sh"
           name="${{ steps.start.outputs.session_name }}"
           if [ -z "$name" ]; then
             echo "::error::未取到会话名（start 步骤失败？）"
@@ -414,7 +433,7 @@ jobs:
             printf 'ssh_command: %s\nsession_name: %s\nrunner: %s\nrecovered_utc: %s\n' \
               "$RECOVERED_SSH" "$RECOVERED_NAME" "$RUNNER_OS" \
               "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-              > "$GITHUB_WORKSPACE/upterm-connect-info-recovered.txt"
+              > "$WS/upterm-connect-info-recovered.txt"
             return 0
           }
 
@@ -423,7 +442,7 @@ jobs:
           upload_connect_info_twirp() {
             local art base resp upload_url size f
             art="upterm-connect-info-recovered-$(date +%H%M%S)"
-            f="$GITHUB_WORKSPACE/upterm-connect-info-recovered.txt"
+            f="$WS/upterm-connect-info-recovered.txt"
             [ -s "$f" ] || { echo "::warning::无恢复连接串文件可传"; return 1; }
             base="${ACTIONS_RUNTIME_URL%/}"
             resp=$(curl -sS -X POST "${base}/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact" \
@@ -547,7 +566,13 @@ jobs:
         run: |
           set -uo pipefail
           export WOMIC_WORK="$RUNNER_TEMP"
-          source "$GITHUB_WORKSPACE/tools/womic-stage/wm-stage-lib.sh"
+          # Windows Runner 上 $GITHUB_WORKSPACE 是反斜杠路径，先转 POSIX 形式
+          if command -v cygpath >/dev/null 2>&1; then
+            WS="$(cygpath -u "$GITHUB_WORKSPACE")"
+          else
+            WS="$GITHUB_WORKSPACE"
+          fi
+          source "$WS/tools/womic-stage/wm-stage-lib.sh"
           t_dir="${RUNNER_TEMP}/upterm-session"
           t_log="$t_dir/transcript.log"
           name="${{ steps.start.outputs.session_name }}"
