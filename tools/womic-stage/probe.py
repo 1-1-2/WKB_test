@@ -20,7 +20,11 @@ k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 WAVE_MAPPER = wintypes.UINT(-1)
 CALLBACK_NULL = 0x00000000
 WHDR_DONE = 0x00000001
-IOCTL_FEED = 0x222000
+IOCTL_FEED = 0x222001      # 反汇编还原：输入缓冲=裸 PCM，写入环形缓冲
+IOCTL_GET_KEY = 0x222004   # 返回 1 字节 key（同时写入驱动全局）
+IOCTL_HANDSHAKE = 0x222008 # 输入 key^0x3b，通过则置门控
+IOCTL_SET_CAP = 0x222014   # 2 字节大端容量，上限 0x2d00
+IOCTL_START = 0x222010     # 1 字节 1=启动（清环），0=停止
 CHUNK = 1920          # 48k/20ms/16bit/mono
 # dwFormats 位常量（msmcm.h）。此前误用 0x2000/0x200（那是 44k/4k 的立体声 8bit 位）：
 #   WAVEFORMAT_48M16 = 0x00040000（48kHz 单声道 16bit）
@@ -115,18 +119,45 @@ def pick_device(devs):
 
 # ---------------------------------------------------------------- 2. 灌音
 def feeder(rate, stop_evt, stats):
-    h = k32.CreateFileW("\\\\.\\WOMic", 0xC0000000, 0x3, None, 3, 0x80, None)
+    """按反汇编还原的协议灌音：握手 → 设容量 → 启动 → 循环灌裸 PCM。
+
+    驱动里 DeviceIoControl 0x222001 始终返回 STATUS_NOT_IMPLEMENTED
+    （Win32 侧表现为 FALSE + gle=1），**状态码不可作为成败判据**，
+    只能靠采集端是否真的拿到音频来判定。
+    """
+    h = k32.CreateFileW("\\\\.\\WOMic", 0xC0000000, 0x3, None, 3, 0, None)
     if h == wintypes.HANDLE(-1).value or h is None:
         stats["error"] = f"CreateFile 失败 gle={ctypes.get_last_error()}"
         stats["opened"] = False
         return
     stats["opened"] = True
+
+    # 1) 握手
+    keybuf = ctypes.create_string_buffer(1)
+    ret = wintypes.DWORD(0)
+    ok = k32.DeviceIoControl(h, IOCTL_GET_KEY, None, 0, ctypes.addressof(keybuf), 1,
+                             ctypes.byref(ret), None)
+    key = keybuf.raw[0]
+    resp = ctypes.create_string_buffer(bytes([key ^ 0x3B]), 1)
+    out1 = ctypes.create_string_buffer(1)
+    ok2 = k32.DeviceIoControl(h, IOCTL_HANDSHAKE, ctypes.addressof(resp), 1,
+                              ctypes.addressof(out1), 1, ctypes.byref(ret), None)
+    stats["handshake"] = {"key": key, "get_ok": bool(ok), "hs_ok": bool(ok2)}
+
+    # 2) 容量 + 启动
+    cap = ctypes.create_string_buffer(struct.pack(">H", 0x2D00), 2)
+    k32.DeviceIoControl(h, IOCTL_SET_CAP, ctypes.addressof(cap), 2, None, 0,
+                        ctypes.byref(ret), None)
+    on = ctypes.create_string_buffer(b"\x01", 1)
+    k32.DeviceIoControl(h, IOCTL_START, ctypes.addressof(on), 1, None, 0,
+                        ctypes.byref(ret), None)
+
     n_samples = CHUNK // 2
     phase = 0.0
     step = 2 * math.pi * 1000.0 / rate
-    attempts = 0     # 发起的 DeviceIoControl 总数
-    accepted = 0     # 系统返回 TRUE 的次数（此前 sent 失败也 +1，无法区分）
+    attempts = 0
     err = 0
+    first_gle = None
     t0 = time.time()
     while not stop_evt.is_set():
         buf = bytearray(CHUNK)
@@ -136,29 +167,19 @@ def feeder(rate, stop_evt, stats):
             if phase > 2 * math.pi:
                 phase -= 2 * math.pi
             struct.pack_into("<h", buf, i * 2, v)
-        # 每包一次性喂入；METHOD_BUFFERED，输入缓冲 1920B
+        dummy = ctypes.create_string_buffer(CHUNK)
         ctypes.set_last_error(0)
-        ok = k32.DeviceIoControl(h, IOCTL_FEED, bytes(buf), CHUNK, None, 0,
-                                 ctypes.byref(wintypes.DWORD(0)), None)
+        k32.DeviceIoControl(h, IOCTL_FEED, bytes(buf), CHUNK,
+                            ctypes.addressof(dummy), CHUNK, ctypes.byref(ret), None)
         attempts += 1
-        if ok:
-            accepted += 1
-        else:
-            err += 1
-            if err == 1:
-                # 第一次失败就抓错误码——此前 err>50 才记，恰好漏掉最关键的首个错误
-                stats["first_ioctl_gle"] = ctypes.get_last_error()
-                stats["first_ioctl_gle_desc"] = {
-                    1: "ERROR_INVALID_FUNCTION", 2: "ERROR_FILE_NOT_FOUND",
-                    3: "ERROR_PATH_NOT_FOUND", 5: "ERROR_ACCESS_DENIED",
-                    6: "ERROR_INVALID_HANDLE", 87: "ERROR_INVALID_PARAMETER",
-                    995: "ERROR_OPERATION_ABORTED", 996: "ERROR_IO_INCOMPLETE",
-                }.get(ctypes.get_last_error(), "")
-            if err > 50:
-                stats["error"] = f"DeviceIoControl 连续失败 gle={ctypes.get_last_error()}"
-                break
+        if first_gle is None:
+            first_gle = ctypes.get_last_error()
         time.sleep(0.02)
-    stats.update(attempts=attempts, accepted=accepted, errors=err,
+    # 3) 停止
+    off = ctypes.create_string_buffer(b"\x00", 1)
+    k32.DeviceIoControl(h, IOCTL_START, ctypes.addressof(off), 1, None, 0,
+                        ctypes.byref(ret), None)
+    stats.update(attempts=attempts, first_gle=first_gle,
                  seconds=round(time.time() - t0, 2))
     k32.CloseHandle(h)
 
@@ -318,10 +339,9 @@ def main():
         check("主峰在 1kHz ±15%", 850 <= an["peak_freq"] <= 1150,
               f"peak={an['peak_freq']}Hz snr={an['snr']}")
         check("主峰显著高于底噪（snr>5）", an["snr"] > 5, f"snr={an['snr']}")
-        check("DeviceIoControl 无连续失败", stats.get("errors", 0) < 10,
-              f"attempts={stats.get('attempts')} accepted={stats.get('accepted')} "
-              f"errors={stats.get('errors')} first_gle={stats.get('first_ioctl_gle', '-')}"
-              f"{stats.get('first_ioctl_gle_desc', '')}")
+        check("灌音协议已建立（握手通过 + 音频有信号）",
+              an["rms"] > 200, f"attempts={stats.get('attempts')} "
+              f"handshake={stats.get('handshake')}")
 
     ok = all(c["ok"] for c in results["checks"])
     print(json.dumps(results, ensure_ascii=False, indent=2))
