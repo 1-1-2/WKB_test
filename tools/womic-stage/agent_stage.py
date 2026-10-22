@@ -234,20 +234,65 @@ def pick_arch_package(drv: Path) -> tuple[Path, Path, Path, str] | None:
     return inf, sysf, catf, hw
 
 
+def import_catalog_signer(pkg_dir: Path) -> bool:
+    """把 catalog 的签名证书导入受信任发布者/根，跨过 0xE0000242。
+
+    run 39725547076 实测：womic.cat 由 DigiCert EV 代码签名证书签发
+    （Beijing Wolicheng Technology Co., Ltd.，有效期 2017-11~2020-11），
+    证书链本身完整、INF/SYS 哈希也对得上，但 Windows 认为**发布者未受信任**：
+
+        Error 0xe0000242: The publisher of an Authenticode(tm) signed catalog
+        has not yet been established as trusted.
+
+    导入 TrustedPublisher（+ Root，因为其根不在本机信任列表）后，
+    devcon 立刻成功（rc=0，"Drivers installed successfully"），
+    端点与 waveIn 同时出现。这一步必须在 devcon 之前做。
+    """
+    cat = pkg_dir / "womic.cat"
+    if not cat.exists():
+        log("  install_pkg 里没有 womic.cat，跳过证书导入")
+        return False
+    cer = BASE / "signer.cer"
+    rc, out = run(["powershell", "-NoProfile", "-Command",
+                   f"$s = Get-AuthenticodeSignature '{cat}'; "
+                   f"if ($s.SignerCertificate) {{ "
+                   f"[System.IO.File]::WriteAllBytes('{cer}', "
+                   f"$s.SignerCertificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)); "
+                   f"'EXPORTED' }} else {{ 'NO_SIGNER' }}"], timeout=120)
+    if "EXPORTED" not in out or not cer.exists():
+        log("  无法从 catalog 导出签名证书")
+        return False
+    ok = True
+    for store in ("TrustedPublisher", "Root"):
+        rc, out = run(["certutil", "-addstore", "-f", store, str(cer)], timeout=120)
+        if rc != 0:
+            log(f"  证书导入 {store} 失败（rc={rc}）")
+            ok = False
+    if ok:
+        log("  签名证书已导入 TrustedPublisher / Root")
+    return ok
+
+
 def driver_bound() -> bool:
     """判断驱动是否**真的**绑定成功——看系统状态，不看 devcon 输出。
 
     run 39723150250 实测：devcon 先创建设备节点、再选择驱动。选驱动失败
-    （0xe0000228 无兼容驱动 / 0xE000024B 签名不匹配）时，"Device node created"
-    早已打印，仅凭这句话判成功会得到**假阳性**：节点是空的，womic.sys 没落盘、
-    WOVAD 服务不存在、音频端点自然为 0。
+    （0xe0000228 无兼容驱动 / 0xE000024B 签名不匹配 / 0xE0000242 发布者不受信任）
+    时，"Device node created" 早已打印，仅凭这句话判成功会得到**假阳性**。
+
+    判定口径（不硬编码服务名——实际是 `wovad_micarray`，INF 里另有一段叫 WOVAD）：
+      1. womic.sys 已落到 System32\\drivers
+      2. 设备的 DEVPKEY_Device_DriverInfPath 非空（说明绑定了某个 oem*.inf）
     """
     windir = Path(os.environ.get("SystemRoot", r"C:\Windows"))
     ok_sys = (windir / "System32" / "drivers" / "womic.sys").exists()
-    rc, out = run(["sc", "query", "WOVAD"], timeout=60)
-    ok_svc = "SERVICE_NAME: WOVAD" in out
-    log(f"  绑定判定：womic.sys 落盘={ok_sys}，WOVAD 服务存在={ok_svc}")
-    return ok_sys and ok_svc
+    rc, out = run(["powershell", "-NoProfile", "-Command",
+                   "$p = Get-PnpDeviceProperty -InstanceId 'ROOT\\MEDIA\\0000' "
+                   "-KeyName DEVPKEY_Device_DriverInfPath -EA SilentlyContinue; "
+                   "if ($p.Data) { 'BOUND=' + $p.Data } else { 'UNBOUND' }"], timeout=120)
+    ok_bind = ("BOUND=" in out) and ("UNBOUND" not in out)
+    log(f"  绑定判定：womic.sys 落盘={ok_sys}，DriverInfPath 已绑定={ok_bind}")
+    return ok_sys and ok_bind
 
 
 def stage_install() -> bool:
@@ -278,6 +323,8 @@ def stage_install() -> bool:
     shutil.copy2(catf, stage_dir / "womic.cat")
     log(f"安装包已就绪：{stage_dir}（源 {inf.name}+{sysf.name}+{catf.name}，硬件ID {hw}）")
 
+    # 先让系统信任 catalog 的签名者，否则 devcon 必然 0xE0000242
+    import_catalog_signer(stage_dir)
     ensure_audio_services()
     rc, out = run([str(devcon), "install", str(stage_dir / "womic.inf"), hw], timeout=600)
     bound = driver_bound()
