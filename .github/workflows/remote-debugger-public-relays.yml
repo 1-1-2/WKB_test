@@ -520,7 +520,8 @@ jobs:
           echo "（会话内命令的输出会经由 tail -f 实时进入本日志；每段延迟约 1 秒）"
 
           while [ "$(date +%s)" -lt "$deadline" ]; do
-            sleep 60
+            # 先探测、后睡眠：会话在两次心跳之间死掉时，最多等一个周期就能发现，
+            # 而不是「先 sleep 60 再查」那样必然多付一个周期。
             if session_alive; then
               n=$(wc -l < "$t_log" 2>/dev/null || echo 0)
               left=$(( (deadline - $(date +%s)) / 60 ))
@@ -528,6 +529,7 @@ jobs:
               if [ $(( (deadline - $(date +%s)) % 600 )) -lt 60 ]; then
                 echo "[heartbeat][$(date -u +%Y-%m-%dT%H:%M:%SZ)] alive transcript_lines=${n} remaining=${left}min"
               fi
+              sleep 60
               continue
             fi
 
@@ -540,6 +542,7 @@ jobs:
             done
             if [ "$gone" -eq 0 ]; then
               echo "[heartbeat] 虚惊一场，会话仍在"
+              sleep 60
               continue
             fi
 

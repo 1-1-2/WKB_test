@@ -180,25 +180,110 @@ def stage_pick_devcon() -> bool:
     return True
 
 
+def pick_arch_package(drv: Path) -> tuple[Path, Path, Path, str] | None:
+    """从多架构混杂的驱动目录里挑出适配本机 (x64) 的一套，返回 (inf, sys, cat, 硬件ID)。
+
+    官方安装包内每个架构是**一套同结构文件**：womic.inf / womic.sys / womic.cat。
+    7z 的 `-aou` 会把同名文件重命名成 womic_1.inf / womic_2.inf……，
+    但 **catalog 内的成员名始终是原始的 `womic.inf` / `womic.sys`**。
+    因此直接安装改名后的 womic_4.inf 会签名失败（run 39723150250 实测）：
+
+        sig: Driver package INF file hash is not present in catalog file.
+             Filename = womic_4.inf, Error = 0xE000024B
+
+    正确做法：按架构挑一套，**成套改回原名**放到独立目录再安装。
+    同时优先选 models 硬件 ID 为 `*WOMic` 的那套（与 root 枚举出的设备 ID 一致）。
+    """
+    def decode_inf(p: Path) -> str:
+        raw = p.read_bytes()
+        for enc in ("utf-16-le", "utf-8", "cp1252"):
+            try:
+                return raw.decode(enc, errors="strict")
+            except Exception:  # noqa: BLE001
+                continue
+        return raw.decode("utf-16-le", errors="replace")
+
+    cands: list[tuple[int, Path, Path, Path, str]] = []
+    for inf in sorted(drv.glob("womic*.inf")):
+        stem = inf.stem
+        txt = decode_inf(inf)
+        up = txt.upper()
+        if "NTAMD64" not in up:          # 只要 64 位的
+            continue
+        if "*WOMIC" in up:
+            hw, rank = "*WOMic", 0        # 与设备 HardwareIds 完全一致，最优
+        elif "ROOT\\WOMIC" in up:
+            hw, rank = r"Root\WOMic", 1
+        else:
+            continue
+        sysf = drv / f"{stem}.sys"
+        catf = drv / f"{stem}.cat"
+        if not (sysf.exists() and catf.exists()):
+            log(f"  跳过 {inf.name}：缺配套 {sysf.name}/{catf.name}")
+            continue
+        m, size = pe_machine(sysf)
+        if m != 0x8664:                  # .sys 必须是 x64
+            log(f"  跳过 {inf.name}：{sysf.name} 不是 x64（machine={hex(m)}）")
+            continue
+        log(f"  可用套件 {inf.name} + {sysf.name}({size}B,x64) + {catf.name}，硬件ID={hw}")
+        cands.append((rank, inf, sysf, catf, hw))
+    if not cands:
+        return None
+    cands.sort(key=lambda t: t[0])
+    _, inf, sysf, catf, hw = cands[0]
+    return inf, sysf, catf, hw
+
+
+def driver_bound() -> bool:
+    """判断驱动是否**真的**绑定成功——看系统状态，不看 devcon 输出。
+
+    run 39723150250 实测：devcon 先创建设备节点、再选择驱动。选驱动失败
+    （0xe0000228 无兼容驱动 / 0xE000024B 签名不匹配）时，"Device node created"
+    早已打印，仅凭这句话判成功会得到**假阳性**：节点是空的，womic.sys 没落盘、
+    WOVAD 服务不存在、音频端点自然为 0。
+    """
+    windir = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    ok_sys = (windir / "System32" / "drivers" / "womic.sys").exists()
+    rc, out = run(["sc", "query", "WOVAD"], timeout=60)
+    ok_svc = "SERVICE_NAME: WOVAD" in out
+    log(f"  绑定判定：womic.sys 落盘={ok_sys}，WOVAD 服务存在={ok_svc}")
+    return ok_sys and ok_svc
+
+
 def stage_install() -> bool:
     """安装驱动。这一步会重建控制台 —— 由计划任务在 Session 0 执行，故不受影响。"""
     drv = BUNDLED_DRIVER if (BUNDLED_DRIVER / "womic.inf").exists() else BASE / "extract" / "driver"
-    inf = drv / "womic.inf"
-    if not inf.exists():
+    if not (drv / "womic.inf").exists():
         log("womic.inf 不存在")
         return False
     devcon = drv / "devcon_x64.exe"
     if not devcon.exists():
         log("devcon_x64.exe 不存在（先跑 pick_devcon）")
         return False
-    # GitHub runner 是虚拟机，音频服务可能未运行；虚拟声卡端点依赖它。
+
+    picked = pick_arch_package(drv)
+    if not picked:
+        log("没有找到适配 x64 且带配套 cat 的驱动套件")
+        record("install", "fail", reason="no-amd64-package")
+        return False
+    inf, sysf, catf, hw = picked
+
+    # 成套改回原名，否则 catalog 成员名对不上 → 0xE000024B
+    stage_dir = BASE / "install_pkg"
+    if stage_dir.exists():
+        shutil.rmtree(stage_dir, ignore_errors=True)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(inf, stage_dir / "womic.inf")
+    shutil.copy2(sysf, stage_dir / "womic.sys")
+    shutil.copy2(catf, stage_dir / "womic.cat")
+    log(f"安装包已就绪：{stage_dir}（源 {inf.name}+{sysf.name}+{catf.name}，硬件ID {hw}）")
+
     ensure_audio_services()
-    rc, out = run([str(devcon), "install", str(inf), "*WOMic"], timeout=600)
-    # devcon 在"装好了但需要重启"时返回 1；以设备状态为准，不单看返回码
-    ok_marker = ("Device node created" in out) or ("Drivers installed successfully" in out)
-    record("install", "ok" if ok_marker else "fail", rc=rc,
+    rc, out = run([str(devcon), "install", str(stage_dir / "womic.inf"), hw], timeout=600)
+    bound = driver_bound()
+    record("install", "ok" if bound else "fail", rc=rc, hw=hw, pkg=inf.name, bound=bound,
            tail="\n".join(out.strip().splitlines()[-6:]))
-    return ok_marker
+    return bound
 
 
 def ensure_audio_services() -> None:
@@ -248,8 +333,11 @@ def stage_verify_device() -> bool:
         log(f"  Win32_SoundDevice 查询失败: {e}")
     for d in sound:
         log(f"  声音设备: {d['name']} [{d['status']}]")
-    ok = bool(info)     # 存在即说明节点已注册；能否出声由 probe 阶段裁决
-    record("verify_device", "ok" if ok else "fail", devices=info, sound_devices=sound)
+    ok = bool(info) and driver_bound()
+    if info and not ok:
+        log("  设备节点存在但驱动未绑定（womic.sys 未落盘或 WOVAD 服务缺失），判定失败")
+    record("verify_device", "ok" if ok else "fail", devices=info, sound_devices=sound,
+           driver_bound=ok)
     return ok
 
 
