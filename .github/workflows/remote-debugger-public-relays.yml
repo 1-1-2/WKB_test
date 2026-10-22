@@ -577,6 +577,13 @@ jobs:
               #               ACTIONS_RUNTIME_URL 未注入，set -u 会杀 bash）。
               upload_connect_info_twirp || true
               echo "RECOVERED_CONNECT_FILE=$WS/upterm-connect-info-recovered.txt" >> "$GITHUB_ENV"
+              # 恢复工件由后续 upload-artifact 步骤上传，而该步骤要等本步骤
+              # 结束才执行——run 39718089223 实测：保持期 90 分钟不结束，
+              # 工件迟迟不出现，守护进程 15 分钟等待超时。
+              # 恢复成功后再陪伴 5 分钟即收尾，让工件及时上传（守护进程
+              # 经工件重连同一 VM；job 结束也不会 stop 这个新会话）。
+              deadline=$(( $(date +%s) + 5*60 ))
+              echo "[heartbeat] 恢复成功，保持期缩短为 5 分钟（等待工件上传）"
               name="$RECOVERED_NAME"
               {
                 echo "session_recovered: ${name}"
@@ -590,9 +597,16 @@ jobs:
           done
 
           kill $TAIL_PID 2>/dev/null || true
-          trap 'upterm session stop "$name" 2>/dev/null || true' EXIT
-          upterm session stop "$name" 2>/dev/null || true
-          echo "保持期结束。"
+          if [ "$RECOVERY_DONE" -gt 0 ]; then
+            # 发生过恢复：新会话是交付物（守护进程/调试还要用），不能 stop。
+            # 清掉 EXIT trap，避免收尾时把新会话带走。
+            trap - EXIT
+            echo "保持期结束（新会话 ${name} 已保留未停止）。"
+          else
+            trap 'upterm session stop "$name" 2>/dev/null || true' EXIT
+            upterm session stop "$name" 2>/dev/null || true
+            echo "保持期结束。"
+          fi
 
       # ---- 5.5/7. 恢复会话连接串工件（wait 步骤恢复成功时经 GITHUB_ENV 传入路径）----
       # twirp 直传路线在长时 wait 步骤里因 ACTIONS_RUNTIME_URL 可能未注入而
