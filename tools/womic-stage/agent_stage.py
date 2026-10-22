@@ -192,8 +192,18 @@ def pick_arch_package(drv: Path) -> tuple[Path, Path, Path, str] | None:
              Filename = womic_4.inf, Error = 0xE000024B
 
     正确做法：按架构挑一套，**成套改回原名**放到独立目录再安装。
-    同时优先选 models 硬件 ID 为 `*WOMic` 的那套（与 root 枚举出的设备 ID 一致）。
+
+    套件选择（外部评审 2025-10 指正后调整）：
+    官方包里有两种 x64 套件——
+      * womic_1.inf：NTamd64 + Root\\WOMic，DriverVer 01/13/2022, 2.1.0.0（官方现行版本）
+      * womic_4.inf：NTamd64 + *WOMic（新版，无 DriverVer 行）
+    `*WOMic` 只是软件创建设备节点时自选的硬件 ID，并非实体硬件的不可变身份；
+    优先选它等于把自己锁在旧套件上。现改为**优先 2022 官方套件（Root\\WOMic）**，
+    并用它的声明 ID 建节点，INF 不改一字、不重新签名。可用 WOMIC_PKG 环境变量
+    覆盖（=new 时优先 *WOMic 套件，用于 A/B 对照）。
     """
+    prefer_new = os.environ.get("WOMIC_PKG", "").lower() == "new"
+
     def decode_inf(p: Path) -> str:
         raw = p.read_bytes()
         for enc in ("utf-16-le", "utf-8", "cp1252"):
@@ -210,10 +220,10 @@ def pick_arch_package(drv: Path) -> tuple[Path, Path, Path, str] | None:
         up = txt.upper()
         if "NTAMD64" not in up:          # 只要 64 位的
             continue
-        if "*WOMIC" in up:
-            hw, rank = "*WOMic", 0        # 与设备 HardwareIds 完全一致，最优
-        elif "ROOT\\WOMIC" in up:
-            hw, rank = r"Root\WOMic", 1
+        if "ROOT\\WOMIC" in up:
+            hw, rank = r"Root\WOMic", (1 if prefer_new else 0)
+        elif "*WOMIC" in up:
+            hw, rank = "*WOMic", (0 if prefer_new else 1)
         else:
             continue
         sysf = drv / f"{stem}.sys"
@@ -225,7 +235,14 @@ def pick_arch_package(drv: Path) -> tuple[Path, Path, Path, str] | None:
         if m != 0x8664:                  # .sys 必须是 x64
             log(f"  跳过 {inf.name}：{sysf.name} 不是 x64（machine={hex(m)}）")
             continue
-        log(f"  可用套件 {inf.name} + {sysf.name}({size}B,x64) + {catf.name}，硬件ID={hw}")
+        # 提取 DriverVer 便于存证（2022 套件有，新版没有）
+        ver = ""
+        for line in txt.splitlines():
+            if line.strip().lower().startswith("driverver"):
+                ver = line.strip()
+                break
+        log(f"  可用套件 {inf.name} + {sysf.name}({size}B,x64) + {catf.name}，"
+            f"硬件ID={hw} {ver}")
         cands.append((rank, inf, sysf, catf, hw))
     if not cands:
         return None
@@ -280,18 +297,41 @@ def driver_bound() -> bool:
     （0xe0000228 无兼容驱动 / 0xE000024B 签名不匹配 / 0xE0000242 发布者不受信任）
     时，"Device node created" 早已打印，仅凭这句话判成功会得到**假阳性**。
 
-    判定口径（不硬编码服务名——实际是 `wovad_micarray`，INF 里另有一段叫 WOVAD）：
+    判定口径（外部评审指正后动态枚举，不再固定 ROOT\\MEDIA\\0000——
+    重装、增加设备或更换驱动后实际实例可能不是 0000）：
       1. womic.sys 已落到 System32\\drivers
-      2. 设备的 DEVPKEY_Device_DriverInfPath 非空（说明绑定了某个 oem*.inf）
+      2. 枚举所有 WOMic 设备实例，任一实例的 DEVPKEY_Device_DriverInfPath
+         非空（说明绑定了某个 oem*.inf）即算绑定，同时记录实例路径存证
     """
     windir = Path(os.environ.get("SystemRoot", r"C:\Windows"))
     ok_sys = (windir / "System32" / "drivers" / "womic.sys").exists()
-    rc, out = run(["powershell", "-NoProfile", "-Command",
-                   "$p = Get-PnpDeviceProperty -InstanceId 'ROOT\\MEDIA\\0000' "
-                   "-KeyName DEVPKEY_Device_DriverInfPath -EA SilentlyContinue; "
-                   "if ($p.Data) { 'BOUND=' + $p.Data } else { 'UNBOUND' }"], timeout=120)
-    ok_bind = ("BOUND=" in out) and ("UNBOUND" not in out)
-    log(f"  绑定判定：womic.sys 落盘={ok_sys}，DriverInfPath 已绑定={ok_bind}")
+    bound: list[str] = []
+    unbound: list[str] = []
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        import mkdev  # noqa: PLC0415
+        for d in mkdev.list_devices("WOMic"):
+            inst = d.get("instance_id", "?")
+            rc, out = run(["powershell", "-NoProfile", "-Command",
+                           f"$p = Get-PnpDeviceProperty -InstanceId '{inst}' "
+                           "-KeyName DEVPKEY_Device_DriverInfPath -EA SilentlyContinue; "
+                           "if ($p.Data) { 'BOUND=' + $p.Data } else { 'UNBOUND' }"],
+                          timeout=120)
+            if "BOUND=" in out and "UNBOUND" not in out:
+                bound.append(f"{inst}={out.split('BOUND=')[-1].split()[0]}")
+            else:
+                unbound.append(inst)
+    except Exception as e:  # noqa: BLE001
+        log(f"  动态枚举设备失败，退回固定实例检查: {e}")
+        rc, out = run(["powershell", "-NoProfile", "-Command",
+                       "$p = Get-PnpDeviceProperty -InstanceId 'ROOT\\MEDIA\\0000' "
+                       "-KeyName DEVPKEY_Device_DriverInfPath -EA SilentlyContinue; "
+                       "if ($p.Data) { 'BOUND=' + $p.Data } else { 'UNBOUND' }"], timeout=120)
+        if "BOUND=" in out:
+            bound.append("ROOT\\MEDIA\\0000(fallback)")
+    ok_bind = bool(bound)
+    log(f"  绑定判定：womic.sys 落盘={ok_sys}，已绑定实例={bound or '无'}，"
+        f"未绑定实例={unbound or '无'}")
     return ok_sys and ok_bind
 
 
@@ -388,14 +428,8 @@ def stage_verify_device() -> bool:
     return ok
 
 
-def stage_probe() -> bool:
-    """IOCTL 0x222000 灌正弦波，再从虚拟麦克风录回来判频。"""
-    probe = BASE / "probe.py"
-    if not probe.exists():
-        log("probe.py 不存在")
-        return False
-    rc, out = run([sys.executable, str(probe), "--seconds", "3", "--out", "out"], timeout=300)
-    # probe.py 输出：若干 check 行 + 末段 JSON + "===== 结论: PASS|FAIL ====="
+def _parse_conclusion(out: str) -> tuple[bool, dict]:
+    """从探针输出取 (是否 PASS, JSON 摘要)。"""
     detail: dict = {}
     m = re.search(r"\n(\{.*\})\s*\n", out, re.S)
     if m:
@@ -404,12 +438,55 @@ def stage_probe() -> bool:
         except json.JSONDecodeError:
             detail = {}
     passed = ("结论: PASS" in out) or (detail.get("ok") is True)
-    if rc == 0 and "结论" not in out:
-        passed = passed or False
-    record("probe", "ok" if passed else "fail", rc=rc,
-           peak=detail.get("detail", {}).get("analysis", {}).get("peak_freq"),
-           checks=len(detail.get("checks", [])))
-    return passed
+    return passed, detail
+
+
+def stage_probe() -> bool:
+    """两段式探针（外部评审方案：先解耦采集链路，再测灌音协议）：
+      1. probe_wasapi.py —— 纯 WASAPI 独立采集（不 feeder、不开 \\\\.\\WOMic），
+         每步存 HRESULT，判读采集链路本身是否成立；
+      2. probe.py —— IOCTL 0x222000 灌正弦波 + waveIn 录音对照。
+    两段结论都记入 state.jsonl；判定以两段整体为准。"""
+    ok_all = True
+    summary: dict = {}
+
+    wasapi = BASE / "probe_wasapi.py"
+    if wasapi.exists():
+        rc, out = run([sys.executable, str(wasapi), "--seconds", "5",
+                       "--out", "wasapi_out"], timeout=300)
+        passed, detail = _parse_conclusion(out)
+        summary["wasapi"] = {
+            "rc": rc, "pass": passed,
+            "capture": detail.get("detail", {}).get("capture"),
+            "mix_format": detail.get("detail", {}).get("mix_format"),
+            "endpoint_id": detail.get("detail", {}).get("endpoint_id"),
+            "steps": detail.get("steps", []),
+        }
+        log(f"WASAPI 独立采集 -> {'PASS' if passed else 'FAIL'}")
+    else:
+        summary["wasapi"] = {"missing": True}
+        log("probe_wasapi.py 不存在，跳过 WASAPI 独立测试")
+
+    probe = BASE / "probe.py"
+    if not probe.exists():
+        log("probe.py 不存在")
+        record("probe", "fail", reason="probe.py-missing", summary=summary)
+        return False
+    rc, out = run([sys.executable, str(probe), "--seconds", "3", "--out", "out"],
+                  timeout=300)
+    passed, detail = _parse_conclusion(out)
+    summary["ioctl"] = {
+        "rc": rc, "pass": passed,
+        "feeder": detail.get("detail", {}).get("feeder"),
+        "env": detail.get("detail", {}).get("env"),
+        "analysis": detail.get("detail", {}).get("analysis"),
+        "checks": detail.get("checks", []),
+    }
+    log(f"IOCTL 灌音对照 -> {'PASS' if passed else 'FAIL'}")
+    ok_all = bool(summary["wasapi"].get("pass")) and passed
+
+    record("probe", "ok" if ok_all else "fail", summary=summary)
+    return ok_all
 
 
 IMPL = {
@@ -469,7 +546,19 @@ def main() -> int:
         return 0 if ok else 1
 
     # --auto：从第一个未完成阶段起依次推进
-    record("auto", "start", pid=os.getpid(), session0=(os.getpid() != 0))
+    # 真实会话号（此前 session0=(pid!=0) 是无效判断——pid 恒非 0）
+    sess = None
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        k32 = ctypes.WinDLL("kernel32")
+        sid = wt.DWORD(0)
+        if k32.ProcessIdToSessionId(k32.GetCurrentProcessId(), ctypes.byref(sid)):
+            sess = sid.value
+    except Exception:  # noqa: BLE001
+        pass
+    record("auto", "start", pid=os.getpid(), session=sess,
+           user=os.environ.get("USERNAME", ""))
     for s in STAGES:
         if done(s):
             log(f"跳过已完成阶段: {s}")

@@ -11,6 +11,7 @@
 退出码：0 全过；1 有失败（stdout 末尾打印 JSON 摘要）
 """
 import argparse, ctypes, json, math, os, struct, sys, threading, time, wave
+from pathlib import Path
 from ctypes import wintypes
 
 winmm = ctypes.WinDLL("winmm")
@@ -21,6 +22,11 @@ CALLBACK_NULL = 0x00000000
 WHDR_DONE = 0x00000001
 IOCTL_FEED = 0x222000
 CHUNK = 1920          # 48k/20ms/16bit/mono
+# dwFormats 位常量（msmcm.h）。此前误用 0x2000/0x200（那是 44k/4k 的立体声 8bit 位）：
+#   WAVEFORMAT_48M16 = 0x00040000（48kHz 单声道 16bit）
+#   WAVEFORMAT_44M16 = 0x00004000（44.1kHz 单声道 16bit）
+WAVE_FORMAT_48M16 = 0x00040000
+WAVE_FORMAT_44M16 = 0x00004000
 
 
 class WAVEFORMATEX(ctypes.Structure):
@@ -62,6 +68,17 @@ k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ct
 k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
                                 ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
 k32.CloseHandle.argtypes = [wintypes.HANDLE]
+k32.GetCurrentProcessId.restype = wintypes.DWORD
+k32.ProcessIdToSessionId.restype = wintypes.BOOL
+k32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+
+
+def current_session_id():
+    """真实终端会话号。此前写错成 (os.getpid() != 0)——那是恒真的进程号判断。"""
+    sid = wintypes.DWORD(0)
+    if k32.ProcessIdToSessionId(k32.GetCurrentProcessId(), ctypes.byref(sid)):
+        return sid.value
+    return None
 
 results = {"checks": [], "devices": [], "detail": {}}
 
@@ -107,7 +124,8 @@ def feeder(rate, stop_evt, stats):
     n_samples = CHUNK // 2
     phase = 0.0
     step = 2 * math.pi * 1000.0 / rate
-    sent = 0
+    attempts = 0     # 发起的 DeviceIoControl 总数
+    accepted = 0     # 系统返回 TRUE 的次数（此前 sent 失败也 +1，无法区分）
     err = 0
     t0 = time.time()
     while not stop_evt.is_set():
@@ -119,16 +137,29 @@ def feeder(rate, stop_evt, stats):
                 phase -= 2 * math.pi
             struct.pack_into("<h", buf, i * 2, v)
         # 每包一次性喂入；METHOD_BUFFERED，输入缓冲 1920B
+        ctypes.set_last_error(0)
         ok = k32.DeviceIoControl(h, IOCTL_FEED, bytes(buf), CHUNK, None, 0,
                                  ctypes.byref(wintypes.DWORD(0)), None)
-        if not ok:
+        attempts += 1
+        if ok:
+            accepted += 1
+        else:
             err += 1
+            if err == 1:
+                # 第一次失败就抓错误码——此前 err>50 才记，恰好漏掉最关键的首个错误
+                stats["first_ioctl_gle"] = ctypes.get_last_error()
+                stats["first_ioctl_gle_desc"] = {
+                    1: "ERROR_INVALID_FUNCTION", 2: "ERROR_FILE_NOT_FOUND",
+                    3: "ERROR_PATH_NOT_FOUND", 5: "ERROR_ACCESS_DENIED",
+                    6: "ERROR_INVALID_HANDLE", 87: "ERROR_INVALID_PARAMETER",
+                    995: "ERROR_OPERATION_ABORTED", 996: "ERROR_IO_INCOMPLETE",
+                }.get(ctypes.get_last_error(), "")
             if err > 50:
                 stats["error"] = f"DeviceIoControl 连续失败 gle={ctypes.get_last_error()}"
                 break
-        sent += 1
         time.sleep(0.02)
-    stats.update(sent=sent, errors=err, seconds=round(time.time() - t0, 2))
+    stats.update(attempts=attempts, accepted=accepted, errors=err,
+                 seconds=round(time.time() - t0, 2))
     k32.CloseHandle(h)
 
 
@@ -191,7 +222,41 @@ def analyze(raw, rate):
             "noise_floor": round(floor, 1), "snr": round(snr, 1)}
 
 
+def driver_versions():
+    """扫 C:\\Windows\\INF\\oem*.inf，找出与 womic 相关的 DriverVer（INF 可能是 UTF-16）。"""
+    windir = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    out = []
+    try:
+        for p in sorted((windir / "INF").glob("oem*.inf")):
+            raw = p.read_bytes()
+            txt = None
+            for enc in ("utf-16-le", "utf-8", "cp1252"):
+                try:
+                    txt = raw.decode(enc)
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+            if not txt or "womic" not in txt.lower():
+                continue
+            ver = ""
+            for line in txt.splitlines():
+                if line.lower().startswith("driverver"):
+                    ver = line.strip()
+                    break
+            out.append({"inf": p.name, "driverver": ver})
+    except OSError:
+        pass
+    return out
+
+
 def main():
+    # Windows 上 stdout 被重定向到文件时默认用 ANSI 代码页（cp1252），
+    # 本脚本大量中文 print 会直接 UnicodeEncodeError 崩掉（agent_stage.py 踩过同一个坑）。
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--seconds", type=int, default=3)
     ap.add_argument("--rate", type=int, default=48000)
@@ -199,13 +264,23 @@ def main():
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
 
+    # 环境存证：真实会话号 / 账号 / 驱动版本（此前 session0=(pid!=0) 是无效判断）
+    results["detail"]["env"] = {
+        "pid": os.getpid(),
+        "session_id": current_session_id(),
+        "user": os.environ.get("USERNAME", ""),
+        "probe_version": "2-wasapi-split",
+        "driver_versions": driver_versions(),
+    }
+    print(f"  env: {json.dumps(results['detail']['env'], ensure_ascii=False)}")
+
     devs = enum_devices()
     dev = pick_device(devs)
     if not check("设备列表中存在 WO Mic 设备", dev is not None, dev or "未找到"):
         print(json.dumps(results, ensure_ascii=False, indent=2))
         return 1
     rate = a.rate
-    fmt_bit = 0x2000 if rate == 48000 else 0x200
+    fmt_bit = WAVE_FORMAT_48M16 if rate == 48000 else WAVE_FORMAT_44M16
     if not (int(dev["formats"], 16) & fmt_bit):
         print(f"  设备未声明 {rate}Hz 单声道 16bit（formats={dev['formats']}），改用 44100")
         rate = 44100
@@ -243,7 +318,10 @@ def main():
         check("主峰在 1kHz ±15%", 850 <= an["peak_freq"] <= 1150,
               f"peak={an['peak_freq']}Hz snr={an['snr']}")
         check("主峰显著高于底噪（snr>5）", an["snr"] > 5, f"snr={an['snr']}")
-        check("DeviceIoControl 无连续失败", stats.get("errors", 0) < 10, f"errors={stats.get('errors')}")
+        check("DeviceIoControl 无连续失败", stats.get("errors", 0) < 10,
+              f"attempts={stats.get('attempts')} accepted={stats.get('accepted')} "
+              f"errors={stats.get('errors')} first_gle={stats.get('first_ioctl_gle', '-')}"
+              f"{stats.get('first_ioctl_gle_desc', '')}")
 
     ok = all(c["ok"] for c in results["checks"])
     print(json.dumps(results, ensure_ascii=False, indent=2))
