@@ -97,6 +97,44 @@ def current_session_id():
     return None
 
 
+def current_user():
+    """从进程令牌取账号（DOMAIN\\user），不读环境变量。
+
+    为什么：Start-Process -Credential 用 CreateProcessWithLogonW 建进程，
+    环境块默认继承调用方，USERNAME 仍是父进程的值（2026-10-23 run
+    39974289009 的 g2 实证：实际以标准用户令牌运行，env 却显示
+    runneradmin）。GetUserNameW 读令牌，才是真实身份。
+    """
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        size = wintypes.DWORD(256)
+        if ctypes.windll.advapi32.GetUserNameW(buf, ctypes.byref(size)):
+            return buf.value
+    except Exception:  # noqa: BLE001
+        pass
+    return os.environ.get("USERNAME", "")
+
+
+def finish(res, out_dir, ok):
+    """统一收尾：JSON 落盘 + 机器可读 RESULT 行，所有退出路径共用。
+
+    历史教训：早期版本在"设备缺失/打不开/录音失败"分支只打 JSON 就
+    return 1，没有 RESULT= 行，CI 侧 Get-ProbeVerdict 只能判成 ERROR
+    （2026-10-23 run 39974289009 的 g2 实证），把明确的 FAIL 误分类。
+    """
+    res["ok"] = bool(ok)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump(res, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+    print(f"\nRESULT={'PASS' if ok else 'FAIL'}")
+    print(f"===== 结论: {'PASS' if ok else 'FAIL'} =====")
+    return 0 if ok else 1
+
+
 results = {"checks": [], "devices": [], "detail": {}}
 
 
@@ -302,7 +340,7 @@ def main():
     results["detail"]["env"] = {
         "pid": os.getpid(),
         "session_id": current_session_id(),
-        "user": os.environ.get("USERNAME", ""),
+        "user": current_user(),
         "elevated": ctypes.windll.shell32.IsUserAnAdmin() != 0
         if hasattr(ctypes, "windll") else None,
         "probe_version": "e2e-vendored-1",
@@ -313,8 +351,7 @@ def main():
     devs = enum_devices()
     dev = pick_device(devs)
     if not check("设备列表中存在 WO Mic 设备", dev is not None, dev or "未找到"):
-        print(json.dumps(results, ensure_ascii=False, indent=2))
-        return 1
+        return finish(results, a.out, False)
     rate = a.rate
     fmt_bit = WAVE_FORMAT_48M16 if rate == 48000 else WAVE_FORMAT_44M16
     if not (int(dev["formats"], 16) & fmt_bit):
@@ -328,16 +365,14 @@ def main():
     time.sleep(1.0)
     if not check("\\\\.\\WOMic 可打开", stats.get("opened"), stats.get("error", "")):
         stop.set(); th.join(timeout=5)
-        print(json.dumps(results, ensure_ascii=False, indent=2))
-        return 1
+        return finish(results, a.out, False)
 
     raw, err = record(dev["index"], rate, a.seconds)
     stop.set(); th.join(timeout=10)
     results["detail"]["feeder"] = stats
     results["detail"]["rate"] = rate
     if not check("waveIn 录音成功", raw is not None and len(raw) > 0, err or f"{len(raw or b'')} bytes"):
-        print(json.dumps(results, ensure_ascii=False, indent=2))
-        return 1
+        return finish(results, a.out, False)
 
     wav_path = os.path.join(a.out, "capture.wav")
     with wave.open(wav_path, "wb") as w:
@@ -359,14 +394,7 @@ def main():
               f"handshake={stats.get('handshake')}")
 
     ok = all(c["ok"] for c in results["checks"])
-    results["ok"] = ok          # 供 CI 机器读取
-    # JSON 摘要落盘（CI 直接收进 artifact，不必从 stdout 里再抠）
-    with open(os.path.join(a.out, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-    print(json.dumps(results, ensure_ascii=False, indent=2))
-    print(f"\nRESULT={'PASS' if ok else 'FAIL'}")
-    print(f"===== 结论: {'PASS' if ok else 'FAIL'} =====")
-    return 0 if ok else 1
+    return finish(results, a.out, ok)
 
 
 if __name__ == "__main__":
