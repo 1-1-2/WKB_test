@@ -141,8 +141,6 @@ typedef struct {
     int      gain;            /* 本地增益 0..200 (%) */
     uint64_t frames;          /* 收到帧数 */
     uint64_t bytes;           /* 收到字节 */
-    int      media_port;      /* 102 里上报的 UDP 媒体端口（0 = 尚未绑定） */
-    int      media_fixed;     /* 1 = --media-port 指定；0 = 系统随机分配 */
     uint32_t lost;            /* 序号缺口估算 */
     uint32_t last_seq;
     float    level;           /* 0..1 平滑电平 */
@@ -165,10 +163,6 @@ void eng_stop(void);
 void eng_snapshot(EngineStats *out);   /* 线程安全快照 */
 int  eng_device_available(void);       /* 不再独立开句柄：返回 devio_is_open() */
 void eng_set_monitor(int on);          /* 本地监听（预留，当前无 waveOut 实现） */
-/* 媒体（UDP）端口：0 = 由系统随机分配（默认，向后兼容）；1..65535 = 固定端口。
- * 跨网络/过防火墙时必须固定，否则手机端无从放行。必须在 eng_start 之前调用。 */
-int  eng_set_media_port(int port);
-int  eng_media_port(void);
 void eng_set_feed_mode(int mode);      /* DEV_FEED_IOCTL（默认）/ DEV_FEED_WRITE */
 
 /* 日志回调：引擎线程调用，UI 通过 PostMessage 转投 */
@@ -188,7 +182,6 @@ void singleinst_shutdown(void);
 typedef struct {
     const wchar_t *host_pos;  /* --host 的原始（宽字符）值 */
     int         port;         /* --port，默认 8125 */
-    int         media_port;   /* --media-port，0 = 随机分配（默认） */
     int         rate;         /* --rate 48000/16000/8000 → rate_idx 2/1/0 */
     int         rate_idx;
     int         buffer_ms;    /* --buffer 26|60|120 */
@@ -217,7 +210,6 @@ typedef struct {
 #define CLI_EXIT_DEVINST   4
 
 int  cli_parse(CliArgs *a, int argc, wchar_t **argv);
-const char *cli_parse_error(void);    /* cli_parse 返回 0 时的具体原因（不是 NULL） */
 void cli_attach_console(void);        /* -mwindows 下的输出方案 */
 void cli_detach_console(void);
 int  cli_run(CliArgs *a);             /* 返回 1 表示需要退出进程（code 见 cli_exit_code） */
@@ -234,7 +226,7 @@ typedef struct { char text[LOG_LEN]; wchar_t ts[12]; int kind; } LogLine;
 
 typedef struct {
     HWND  hwnd;
-    HWND  edit_host, edit_port, edit_media;
+    HWND  edit_host, edit_port;
     HBRUSH br_card;
     UINT  dpi;
     int   w, h;                /* 客户区逻辑尺寸 */

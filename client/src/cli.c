@@ -10,7 +10,6 @@
 #include "cli.h"
 #include "drvinst.h"
 #include "drvpkg.h"
-#include "drvbridge.h"      /* --install-driver / --uninstall-driver 转发给安装器 */
 #include "devio.h"
 #include "opusdec.h"
 #include "singleinst.h"
@@ -22,18 +21,12 @@
 static int g_exit_code = CLI_EXIT_OK;
 static int g_has_console;
 
-/* cli_parse 失败时的具体原因（给用户看的，不是「参数错误」四个字） */
-static const char *g_parse_err = "未知参数";
-
 int cli_exit_code(void) { return g_exit_code; }
-
-const char *cli_parse_error(void) { return g_parse_err ? g_parse_err : "未知参数"; }
 
 void cli_set_defaults(CliArgs *a)
 {
     memset(a, 0, sizeof(*a));
     a->port = 8125;
-    a->media_port = 0;      /* 0 = 媒体端口由系统随机分配（默认行为） */
     a->rate = 48000;
     a->rate_idx = 2;
     a->buffer_ms = 60;
@@ -47,7 +40,7 @@ const char *cli_help_text(void)
     "WO Mic Link " APP_VERSION " — 把 Android 手机麦克风变成 Windows 虚拟麦克风\n"
     "\n"
     "用法:\n"
-    "  womic.exe [--host <IP|主机名>] [--port <1..65535>] [--media-port <1..65535>]\n"
+    "  womic.exe [--host <IP|主机名>] [--port <1..65535>]\n"
     "            [--rate 48000|16000|8000] [--buffer 26|60|120] [--gain 0..200]\n"
     "            [--connect] [--no-gui] [--status]\n"
     "            [--install-driver] [--uninstall-driver] [--driver-pack <dir>]\n"
@@ -56,12 +49,7 @@ const char *cli_help_text(void)
     "\n"
     "选项:\n"
     "  --host <IP>            手机在局域网里的地址；--connect 时必填\n"
-    "  --port <n>             TCP 控制端口，默认 8125\n"
-    "  --media-port <n>       UDP 媒体端口，默认由本机随机分配。\n"
-    "                         跨网段/过防火墙时必须指定：手机端要把音频发到\n"
-    "                         「本机 IP : 这个端口」，随机端口无法预先放行。\n"
-    "                         取值 1..65535；0 与负数非法（要随机就不写本选项）。\n"
-    "                         端口被占用时不回退，直接报错退出（详见退出码 2）\n"
+    "  --port <n>             TCP 控制端口，默认 8125（媒体端口由本机随机分配）\n"
     "  --rate 48000|16000|8000\n"
     "                         向手机请求的采样率，默认 48000。\n"
     "                         无论协商到多少，灌给驱动的一律是 48000（驱动不重采样）\n"
@@ -71,9 +59,8 @@ const char *cli_help_text(void)
     "  --connect              启动后立刻连接（需要 --host）\n"
     "  --no-gui               配合 --connect：不显示窗口，跑完退出（脚本/CI 用）\n"
     "  --status               打印架构、驱动状态、INF 路径、版本、解码器来源后退出\n"
-    "  --install-driver       安装/修复虚拟麦克风驱动：转发给同目录的\n"
-    "                         womic-drvinst.exe（自动申请一次 UAC 提权）\n"
-    "  --uninstall-driver     卸载虚拟麦克风驱动（同样转发给安装器）\n"
+    "  --install-driver       安装/修复虚拟麦克风驱动（自动申请一次 UAC 提权）\n"
+    "  --uninstall-driver     卸载虚拟麦克风驱动（同样自动提权）\n"
     "  --driver-pack <dir>    用指定目录里的驱动三件套代替内置包\n"
     "                         （需要 womic.inf / womic.sys / womic.cat，或 womic_1.* / womic_2.*）\n"
     "  --theme dark|light     界面主题（--dark / --light 同义）\n"
@@ -82,33 +69,23 @@ const char *cli_help_text(void)
     "\n"
     "退出码:\n"
     "  0  成功\n"
-    "  1  参数错误（含 --media-port 取值非法：非数字 / 0 / 负数 / >65535）\n"
-    "  2  连接失败（含 --media-port 指定的端口被占用，错误串里带 WSA 错误码）\n"
+    "  1  参数错误\n"
+    "  2  连接失败\n"
     "  3  驱动不可用（--status 检测到驱动未就绪时也返回 3）\n"
     "  4  驱动安装/卸载失败\n"
     "\n"
     "示例:\n"
     "  womic.exe --host 192.168.1.20 --connect\n"
     "  womic.exe --host 192.168.1.20 --rate 16000 --buffer 26 --gain 130 --connect\n"
-    "  womic.exe --host 192.168.1.20 --media-port 5004 --connect   # 固定媒体端口\n"
     "  womic.exe --status\n"
     "  womic.exe --install-driver\n"
     "  womic.exe --driver-pack D:\\drivers\\womic2022 --install-driver\n"
     "  womic.exe --host 192.168.1.20 --connect --no-gui        # CI 冒烟\n"
     "\n"
-    "驱动安装的分工：\n"
-    "  驱动的安装/卸载不在本 exe 里 —— 它们由同目录的 womic-drvinst.exe 负责。\n"
-    "  --install-driver / --uninstall-driver 只是转发：找到它、带上同样的参数\n"
-    "  拉起来、把它的退出码带回来。找不到就明确提示，不会假装成功。\n"
-    "  凡是用官方安装器装过驱动的机器，直接拿本 exe 就能用，不需要那个安装器。\n"
-    "  安装器自身也可单独使用：womic-drvinst.exe /install | /uninstall | /status\n"
-    "\n"
     "驱动归属:\n"
-    "  womic.sys / womic.inf / womic.cat 版权归 " DRV_OWNER " 所有，\n"
+    "  内置的 womic.sys / womic.inf / womic.cat 版权归 " DRV_OWNER " 所有，\n"
     "  版本 " DRV_VERSION "，来源 " DRV_SOURCE_URL "。\n"
     "  本项目原样再分发：未修改、未重新签名，仅复用其已签名的虚拟声卡功能。\n"
-    "  ⚠ 这些第三方二进制**不在本 exe 里**，只随 womic-drvinst.exe 分发；\n"
-    "    本 exe 不含任何第三方二进制，下面的「驱动包来源」也会如实显示未内置。\n"
     "\n"
     "被杀软误报时的处理:\n"
     "  1. 右键 womic.exe → 属性 → 勾选「解除锁定」（若有）\n"
@@ -204,23 +181,8 @@ int cli_parse(CliArgs *a, int argc, wchar_t **argv)
             a->host_pos = argv[++i]; continue;
         }
         if (!_wcsicmp(s, L"port")) {
-            if (!need_value(argc, argv, i)) { g_parse_err = "--port 缺少取值"; return 0; }
-            if (!parse_int(argv[++i], &a->port)) { g_parse_err = "--port 需要十进制端口号"; return 0; }
-            continue;
-        }
-        if (!_wcsicmp(s, L"media-port") || !_wcsicmp(s, L"mediaport")) {
-            int v;
-            if (!need_value(argc, argv, i)) { g_parse_err = "--media-port 缺少取值"; return 0; }
-            ++i;
-            if (!parse_int(argv[i], &v)) {
-                g_parse_err = "--media-port 需要十进制端口号（非数字）";
-                return 0;
-            }
-            if (v < 1 || v > 65535) {
-                g_parse_err = "--media-port 取值须在 1..65535（0/负数非法；要随机分配就不写本选项）";
-                return 0;
-            }
-            a->media_port = v;
+            if (!need_value(argc, argv, i)) return 0;
+            if (!parse_int(argv[++i], &a->port)) return 0;
             continue;
         }
         if (!_wcsicmp(s, L"rate")) {
@@ -272,10 +234,29 @@ int cli_parse(CliArgs *a, int argc, wchar_t **argv)
             else return 0;
             continue;
         }
-        g_parse_err = "未知参数";
         return 0;                            /* 未知参数 */
     }
     return 1;
+}
+
+/* --------------------------------------------------------- 提权重启自身 */
+/* runas 启动的子进程工作目录可能在 System32，所以一律用 GetModuleFileNameW
+ * 定位自身，绝不用相对路径。 */
+static int relaunch_elevated(const CliArgs *a)
+{
+    wchar_t self[MAX_PATH], params[512];
+    HINSTANCE r;
+    GetModuleFileNameW(NULL, self, MAX_PATH);
+    if (a->install)   _snwprintf(params, 512, L"\"%s\" --install-driver", self);
+    else              _snwprintf(params, 512, L"\"%s\" --uninstall-driver", self);
+    if (a->driver_pack) {
+        wchar_t tmp[640];
+        _snwprintf(tmp, 640, L"%s --driver-pack \"%s\"", params, a->driver_pack);
+        wcsncpy(params, tmp, 512);
+        params[511] = 0;
+    }
+    r = ShellExecuteW(NULL, L"runas", self, params, NULL, SW_SHOWNORMAL);
+    return (int)(size_t)r > 32;
 }
 
 /* --------------------------------------------------------------- 执行 */
@@ -309,7 +290,7 @@ static int do_status(const CliArgs *a)
     _snprintf(buf, sizeof(buf), "  INF 路径    : %s\n", tmp[0] ? tmp : "(无)");
     out(buf);
     WideCharToMultiByte(CP_UTF8, 0, st.version, -1, tmp, sizeof(tmp), NULL, NULL);
-    _snprintf(buf, sizeof(buf), "  驱动版本    : %s\n", tmp[0] ? tmp : DRV_VERSION);
+    _snprintf(buf, sizeof(buf), "  驱动版本    : %s\n", tmp[0] ? tmp : DRV_VERSION " (内置包)");
     out(buf);
     WideCharToMultiByte(CP_UTF8, 0, st.provider, -1, tmp, sizeof(tmp), NULL, NULL);
     _snprintf(buf, sizeof(buf), "  驱动提供者  : %s\n", tmp[0] ? tmp : "-");
@@ -328,54 +309,50 @@ static int do_status(const CliArgs *a)
     return 1;
 }
 
-/* ---------------------------------------------------- 驱动操作：转发给安装器 */
-/* 安装逻辑有且只有一份：在 womic-drvinst.exe 里（UI 的「安装/卸载驱动」按钮
- * 走的也是同一条路，见 main.c 的 request_driver_op）。这里只负责找到它、
- * 带上同样的参数拉起、把退出码翻译成帮助里那张退出码表的语义（0 成功 / 4 失败）。
- * 找不到就明确提示，绝不假装成功。 */
 static int do_driver_op(const CliArgs *a)
 {
-    wchar_t inst[MAX_PATH];
-    int code = -1;
-    DrvOp op = a->install ? DRVOP_INSTALL : DRVOP_UNINSTALL;
+    int ok;
+    wchar_t log[4096];
+    char tmp[512];
 
     cli_ensure_console(1);
+    if (a->driver_pack) drv_set_external_pack(a->driver_pack);
 
-    if (!drvbridge_find(inst, MAX_PATH)) {
-        out(a->install ? "无法安装驱动：" : "无法卸载驱动：");
-        out(drvbridge_last_error());
-        out("\n");
-        out("  说明：驱动的安装/卸载已拆到独立的 womic-drvinst.exe（只有它携带第三方驱动包）。\n");
-        out("  请把 womic-drvinst.exe 与本 exe 放在同一目录后重试；\n");
-        out("  若本机已用官方安装器装过驱动，则无需任何安装操作，直接用本 exe 即可。\n");
-        g_exit_code = CLI_EXIT_DEVINST;
-        return 1;
-    }
-
-    out(a->install ? "正在调用 womic-drvinst.exe 安装驱动…\n"
-                   : "正在调用 womic-drvinst.exe 卸载驱动…\n");
-    if (!drvbridge_run(op, a->driver_pack, &code)) {
-        out(a->install ? "驱动安装失败：" : "驱动卸载失败：");
-        out(drvbridge_last_error());
-        out("\n");
-        g_exit_code = CLI_EXIT_DEVINST;
-        return 1;
-    }
-    if (code == CLI_EXIT_OK) {
-        out(a->install ? "驱动安装完成。\n" : "驱动卸载完成。\n");
+    if (!drv_is_elevated()) {
+        /* 未提权：弹一次 UAC 重启自身，父进程退出（结果由子进程打印） */
+        out(a->install ? "正在申请管理员权限以安装驱动…\n" : "正在申请管理员权限以卸载驱动…\n");
+        if (!relaunch_elevated(a)) {
+            out("提权失败或被取消。请以管理员身份运行，或手动执行：\n");
+            out("  womic.exe --install-driver\n");
+            g_exit_code = CLI_EXIT_DEVINST;
+            return 1;
+        }
         g_exit_code = CLI_EXIT_OK;
         return 1;
     }
-    {
-        char line[160];
-        _snprintf(line, sizeof(line),
-                  "%s详见上方安装器输出（退出码 %d）\n",
-                  a->install ? "驱动安装失败：" : "驱动卸载失败：", code);
+
+    ok = a->install ? drv_install() : drv_uninstall();
+    WideCharToMultiByte(CP_UTF8, 0, drv_last_error_w(), -1, tmp, sizeof(tmp), NULL, NULL);
+    tmp[sizeof(tmp) - 1] = 0;
+    if (ok) {
+        char line[640];
+        _snprintf(line, sizeof(line), "%s\n", tmp);
+        out(a->install ? "驱动安装完成：" : "驱动卸载完成：");
         out(line);
+        g_exit_code = CLI_EXIT_OK;
+    } else {
+        char line[640];
+        _snprintf(line, sizeof(line), "%s\n", tmp);
+        out(a->install ? "驱动安装失败：" : "驱动卸载失败：");
+        out(line);
+        if (drv_grab_devlog(log, 4096)) {
+            WideCharToMultiByte(CP_UTF8, 0, log, -1, tmp, sizeof(tmp), NULL, NULL);
+            out("---- setupapi.dev.log（尾部）----\n");
+            out(tmp);
+            out("\n");
+        }
+        g_exit_code = CLI_EXIT_DEVINST;
     }
-    if (code == CLI_EXIT_DEVUNAVA)
-        out("  驱动仍未就绪；可重试一次，或右键 womic-drvinst.exe → 以管理员身份运行。\n");
-    g_exit_code = CLI_EXIT_DEVINST;
     return 1;
 }
 
@@ -416,14 +393,6 @@ int cli_run(CliArgs *a)
         WideCharToMultiByte(CP_UTF8, 0, a->host_pos, -1, host, sizeof(host), NULL, NULL);
         if (a->driver_pack) drv_set_external_pack(a->driver_pack);
         drv_detect(&g_ui.drv, 1);
-        if (a->media_port > 0) {
-            char line[128];
-            eng_set_media_port(a->media_port);
-            _snprintf(line, sizeof(line), "媒体端口固定为 UDP %d\n", a->media_port);
-            out(line);
-        } else {
-            eng_set_media_port(0);
-        }
         if (!eng_start(host, a->port, a->rate_idx, a->buffer_ms, a->gain)) {
             out("引擎启动失败\n");
             g_exit_code = CLI_EXIT_CONNECT;
@@ -440,11 +409,10 @@ int cli_run(CliArgs *a)
             char line[256];
             _snprintf(line, sizeof(line),
                       "OK  帧=%llu 字节=%llu 注入=%llu 电平=%.3f dB=%.1f "
-                      "解码=%s 设备=%s 媒体端口=%d(%s)\n",
+                      "解码=%s 设备=%s\n",
                       (unsigned long long)st.frames, (unsigned long long)st.bytes,
                       (unsigned long long)st.injected, (double)st.level,
-                      (double)st.db, st.opus_src, st.device_ok ? "就绪" : "未就绪",
-                      st.media_port, st.media_fixed ? "固定" : "随机");
+                      (double)st.db, st.opus_src, st.device_ok ? "就绪" : "未就绪");
             out(line);
             g_exit_code = CLI_EXIT_OK;
         } else {
@@ -463,12 +431,6 @@ int cli_run(CliArgs *a)
 void cli_apply_to_ui(const CliArgs *a)
 {
     if (a->host_pos) SetWindowTextW(g_ui.edit_host, a->host_pos);
-    if (a->media_port > 0 && g_ui.edit_media) {
-        wchar_t buf[16];
-        _snwprintf(buf, 16, L"%d", a->media_port);
-        buf[15] = 0;
-        SetWindowTextW(g_ui.edit_media, buf);
-    }
     if (a->rate_idx != 2 || a->rate != 48000) g_ui.seg_rate = (a->rate_idx == 2 ? 0 : a->rate_idx == 1 ? 1 : 2);
     if (a->buffer_ms == 26) g_ui.buf_idx = 0;
     else if (a->buffer_ms == 120) g_ui.buf_idx = 2;
