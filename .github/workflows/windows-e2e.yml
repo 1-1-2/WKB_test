@@ -17,20 +17,33 @@ name: windows-e2e
 on:
   workflow_dispatch:
     inputs:
-      # 调试窗口（分钟，0=不开）：在指定阶段把 tailnet + SSH 拉起来，
-      # 等待人（或 Agent）连进去交互排查。见 .github/actions/tailnet-debug。
+      # 调试窗口：勾选即在该阶段把 tailnet + SSH 拉起来，等人（或 Agent）
+      # 连进去交互排查；时长由 debug_minutes 统一控制。
+      # 实现见 .github/actions/tailnet-debug。
+      debug_minutes:
+        description: '调试窗口时长（分钟，对所有勾选的插点生效）'
+        required: false
+        default: '15'
+      debug_before_a:
+        description: 'a 之前（产物已下载、未跑任何真实步骤）开调试窗口'
+        required: false
+        type: boolean
+        default: false
       debug_before_d:
-        description: 'd1（装驱动）之前开调试窗口，分钟数，0=不开'
+        description: 'd1（装驱动）之前开调试窗口'
         required: false
-        default: '0'
+        type: boolean
+        default: false
       debug_before_g:
-        description: 'g（2×2 权限矩阵）之前开调试窗口，分钟数，0=不开'
+        description: 'g（2×2 权限矩阵）之前开调试窗口'
         required: false
-        default: '0'
+        type: boolean
+        default: false
       debug_after_g:
-        description: 'g 之后（h 之前）开调试窗口，分钟数，0=不开'
+        description: 'g 之后（h 之前）开调试窗口'
         required: false
-        default: '0'
+        type: boolean
+        default: false
   push:
     paths:
       - 'client/**'
@@ -231,7 +244,7 @@ jobs:
     runs-on: windows-latest
     # 正常 ~3min（驱动安装 + 灌音 + 2×2 裁决 + GUI）；30min 硬上限。
     # 调试窗口会拉长作业：任一插点启用时放宽到 150 分钟。
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && (inputs.debug_before_d != '0' || inputs.debug_before_g != '0' || inputs.debug_after_g != '0') && 150 || 30 }}
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && (inputs.debug_before_a || inputs.debug_before_d || inputs.debug_before_g || inputs.debug_after_g) && 150 || 30 }}
     defaults:
       run:
         shell: pwsh
@@ -264,6 +277,26 @@ jobs:
           # 显式退出码 0：pwsh 部分版本会把脚本末尾残留的 $LASTEXITCODE
           # 传播为进程退出码（Round 2 实测踩坑），成功路径一律显式声明。
           exit 0
+
+      # ---------------------------------------------------------------
+      # debug. 可选调试窗口（workflow_dispatch 输入 minutes>0 时启用）。
+      # 四个插点：
+      #   debug_before_a（产物刚下载、任何真实步骤未跑——接近干净房间）
+      #   debug_before_d（装驱动前）/ debug_before_g（矩阵前）/
+      #   debug_after_g（矩阵后）
+      # 与"独立调试 workflow"的本质区别：这里是"真流程跑到一半"的环境，
+      # 产物、驱动、用户、探针目录都是真实上下文；窗口关闭后流程继续。
+      # ---------------------------------------------------------------
+      - name: debug. a 前调试窗口（可选）
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_before_a }}
+        uses: ./.github/actions/tailnet-debug
+        with:
+          minutes: ${{ inputs.debug_minutes }}
+          label: before-a
+          tags: 'tag:ci'
+          oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
+          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
 
       # ---------------------------------------------------------------
       # a. 内置驱动包 inflate 字节级自检：9 个文件（3 架构 × inf/sys/cat）
@@ -381,17 +414,17 @@ jobs:
       # ---------------------------------------------------------------
       # debug. 可选调试窗口（workflow_dispatch 输入 minutes>0 时启用）：
       #   在真实流程的指定阶段把 tailnet + OpenSSH 拉起来，等人 SSH 进来
-      #   交互排查，到点自动关闭、节点注销。三个插点：
+      #   交互排查，到点自动关闭、节点注销。插点：
       #     debug_before_d（装驱动前）/ debug_before_g（矩阵前）/
-      #     debug_after_g（矩阵后）
+      #     debug_after_g（矩阵后）；debug_before_a 见 a 步之前。
       #   与一次性调试 workflow 的区别：这里是"真流程跑到一半"的环境，
       #   产物、驱动、用户、探针目录都是真实上下文，不是复刻。
       # ---------------------------------------------------------------
       - name: debug. d1 前调试窗口（可选）
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_before_d != '' && inputs.debug_before_d != '0' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_before_d }}
         uses: ./.github/actions/tailnet-debug
         with:
-          minutes: ${{ inputs.debug_before_d }}
+          minutes: ${{ inputs.debug_minutes }}
           label: before-d
           tags: 'tag:ci'
           oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
@@ -715,10 +748,10 @@ jobs:
       #      复制到 $dir 后自包含可跑。
       # ---------------------------------------------------------------
       - name: debug. g 前调试窗口（可选）
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_before_g != '' && inputs.debug_before_g != '0' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_before_g }}
         uses: ./.github/actions/tailnet-debug
         with:
-          minutes: ${{ inputs.debug_before_g }}
+          minutes: ${{ inputs.debug_minutes }}
           label: before-g
           tags: 'tag:ci'
           oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
@@ -1051,10 +1084,10 @@ jobs:
       #    的形态也要在真机上验一次）。主窗口标题可选打印作参考。
       # ---------------------------------------------------------------
       - name: debug. g 后调试窗口（可选）
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_after_g != '' && inputs.debug_after_g != '0' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_after_g }}
         uses: ./.github/actions/tailnet-debug
         with:
-          minutes: ${{ inputs.debug_after_g }}
+          minutes: ${{ inputs.debug_minutes }}
           label: after-g
           tags: 'tag:ci'
           oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
