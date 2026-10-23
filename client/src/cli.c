@@ -10,6 +10,7 @@
 #include "cli.h"
 #include "drvinst.h"
 #include "drvpkg.h"
+#include "drvbridge.h"      /* --install-driver / --uninstall-driver 转发给安装器 */
 #include "devio.h"
 #include "opusdec.h"
 #include "singleinst.h"
@@ -59,8 +60,9 @@ const char *cli_help_text(void)
     "  --connect              启动后立刻连接（需要 --host）\n"
     "  --no-gui               配合 --connect：不显示窗口，跑完退出（脚本/CI 用）\n"
     "  --status               打印架构、驱动状态、INF 路径、版本、解码器来源后退出\n"
-    "  --install-driver       安装/修复虚拟麦克风驱动（自动申请一次 UAC 提权）\n"
-    "  --uninstall-driver     卸载虚拟麦克风驱动（同样自动提权）\n"
+    "  --install-driver       安装/修复虚拟麦克风驱动：转发给同目录的\n"
+    "                         womic-drvinst.exe（自动申请一次 UAC 提权）\n"
+    "  --uninstall-driver     卸载虚拟麦克风驱动（同样转发给安装器）\n"
     "  --driver-pack <dir>    用指定目录里的驱动三件套代替内置包\n"
     "                         （需要 womic.inf / womic.sys / womic.cat，或 womic_1.* / womic_2.*）\n"
     "  --theme dark|light     界面主题（--dark / --light 同义）\n"
@@ -82,10 +84,19 @@ const char *cli_help_text(void)
     "  womic.exe --driver-pack D:\\drivers\\womic2022 --install-driver\n"
     "  womic.exe --host 192.168.1.20 --connect --no-gui        # CI 冒烟\n"
     "\n"
+    "驱动安装的分工：\n"
+    "  驱动的安装/卸载不在本 exe 里 —— 它们由同目录的 womic-drvinst.exe 负责。\n"
+    "  --install-driver / --uninstall-driver 只是转发：找到它、带上同样的参数\n"
+    "  拉起来、把它的退出码带回来。找不到就明确提示，不会假装成功。\n"
+    "  凡是用官方安装器装过驱动的机器，直接拿本 exe 就能用，不需要那个安装器。\n"
+    "  安装器自身也可单独使用：womic-drvinst.exe /install | /uninstall | /status\n"
+    "\n"
     "驱动归属:\n"
-    "  内置的 womic.sys / womic.inf / womic.cat 版权归 " DRV_OWNER " 所有，\n"
+    "  womic.sys / womic.inf / womic.cat 版权归 " DRV_OWNER " 所有，\n"
     "  版本 " DRV_VERSION "，来源 " DRV_SOURCE_URL "。\n"
     "  本项目原样再分发：未修改、未重新签名，仅复用其已签名的虚拟声卡功能。\n"
+    "  ⚠ 这些第三方二进制**不在本 exe 里**，只随 womic-drvinst.exe 分发；\n"
+    "    本 exe 不含任何第三方二进制，下面的「驱动包来源」也会如实显示未内置。\n"
     "\n"
     "被杀软误报时的处理:\n"
     "  1. 右键 womic.exe → 属性 → 勾选「解除锁定」（若有）\n"
@@ -239,26 +250,6 @@ int cli_parse(CliArgs *a, int argc, wchar_t **argv)
     return 1;
 }
 
-/* --------------------------------------------------------- 提权重启自身 */
-/* runas 启动的子进程工作目录可能在 System32，所以一律用 GetModuleFileNameW
- * 定位自身，绝不用相对路径。 */
-static int relaunch_elevated(const CliArgs *a)
-{
-    wchar_t self[MAX_PATH], params[512];
-    HINSTANCE r;
-    GetModuleFileNameW(NULL, self, MAX_PATH);
-    if (a->install)   _snwprintf(params, 512, L"\"%s\" --install-driver", self);
-    else              _snwprintf(params, 512, L"\"%s\" --uninstall-driver", self);
-    if (a->driver_pack) {
-        wchar_t tmp[640];
-        _snwprintf(tmp, 640, L"%s --driver-pack \"%s\"", params, a->driver_pack);
-        wcsncpy(params, tmp, 512);
-        params[511] = 0;
-    }
-    r = ShellExecuteW(NULL, L"runas", self, params, NULL, SW_SHOWNORMAL);
-    return (int)(size_t)r > 32;
-}
-
 /* --------------------------------------------------------------- 执行 */
 static const char *state_name(DrvState s)
 {
@@ -290,7 +281,7 @@ static int do_status(const CliArgs *a)
     _snprintf(buf, sizeof(buf), "  INF 路径    : %s\n", tmp[0] ? tmp : "(无)");
     out(buf);
     WideCharToMultiByte(CP_UTF8, 0, st.version, -1, tmp, sizeof(tmp), NULL, NULL);
-    _snprintf(buf, sizeof(buf), "  驱动版本    : %s\n", tmp[0] ? tmp : DRV_VERSION " (内置包)");
+    _snprintf(buf, sizeof(buf), "  驱动版本    : %s\n", tmp[0] ? tmp : DRV_VERSION);
     out(buf);
     WideCharToMultiByte(CP_UTF8, 0, st.provider, -1, tmp, sizeof(tmp), NULL, NULL);
     _snprintf(buf, sizeof(buf), "  驱动提供者  : %s\n", tmp[0] ? tmp : "-");
@@ -309,50 +300,54 @@ static int do_status(const CliArgs *a)
     return 1;
 }
 
+/* ---------------------------------------------------- 驱动操作：转发给安装器 */
+/* 安装逻辑有且只有一份：在 womic-drvinst.exe 里（UI 的「安装/卸载驱动」按钮
+ * 走的也是同一条路，见 main.c 的 request_driver_op）。这里只负责找到它、
+ * 带上同样的参数拉起、把退出码翻译成帮助里那张退出码表的语义（0 成功 / 4 失败）。
+ * 找不到就明确提示，绝不假装成功。 */
 static int do_driver_op(const CliArgs *a)
 {
-    int ok;
-    wchar_t log[4096];
-    char tmp[512];
+    wchar_t inst[MAX_PATH];
+    int code = -1;
+    DrvOp op = a->install ? DRVOP_INSTALL : DRVOP_UNINSTALL;
 
     cli_ensure_console(1);
-    if (a->driver_pack) drv_set_external_pack(a->driver_pack);
 
-    if (!drv_is_elevated()) {
-        /* 未提权：弹一次 UAC 重启自身，父进程退出（结果由子进程打印） */
-        out(a->install ? "正在申请管理员权限以安装驱动…\n" : "正在申请管理员权限以卸载驱动…\n");
-        if (!relaunch_elevated(a)) {
-            out("提权失败或被取消。请以管理员身份运行，或手动执行：\n");
-            out("  womic.exe --install-driver\n");
-            g_exit_code = CLI_EXIT_DEVINST;
-            return 1;
-        }
-        g_exit_code = CLI_EXIT_OK;
+    if (!drvbridge_find(inst, MAX_PATH)) {
+        out(a->install ? "无法安装驱动：" : "无法卸载驱动：");
+        out(drvbridge_last_error());
+        out("\n");
+        out("  说明：驱动的安装/卸载已拆到独立的 womic-drvinst.exe（只有它携带第三方驱动包）。\n");
+        out("  请把 womic-drvinst.exe 与本 exe 放在同一目录后重试；\n");
+        out("  若本机已用官方安装器装过驱动，则无需任何安装操作，直接用本 exe 即可。\n");
+        g_exit_code = CLI_EXIT_DEVINST;
         return 1;
     }
 
-    ok = a->install ? drv_install() : drv_uninstall();
-    WideCharToMultiByte(CP_UTF8, 0, drv_last_error_w(), -1, tmp, sizeof(tmp), NULL, NULL);
-    tmp[sizeof(tmp) - 1] = 0;
-    if (ok) {
-        char line[640];
-        _snprintf(line, sizeof(line), "%s\n", tmp);
-        out(a->install ? "驱动安装完成：" : "驱动卸载完成：");
-        out(line);
-        g_exit_code = CLI_EXIT_OK;
-    } else {
-        char line[640];
-        _snprintf(line, sizeof(line), "%s\n", tmp);
+    out(a->install ? "正在调用 womic-drvinst.exe 安装驱动…\n"
+                   : "正在调用 womic-drvinst.exe 卸载驱动…\n");
+    if (!drvbridge_run(op, a->driver_pack, &code)) {
         out(a->install ? "驱动安装失败：" : "驱动卸载失败：");
-        out(line);
-        if (drv_grab_devlog(log, 4096)) {
-            WideCharToMultiByte(CP_UTF8, 0, log, -1, tmp, sizeof(tmp), NULL, NULL);
-            out("---- setupapi.dev.log（尾部）----\n");
-            out(tmp);
-            out("\n");
-        }
+        out(drvbridge_last_error());
+        out("\n");
         g_exit_code = CLI_EXIT_DEVINST;
+        return 1;
     }
+    if (code == CLI_EXIT_OK) {
+        out(a->install ? "驱动安装完成。\n" : "驱动卸载完成。\n");
+        g_exit_code = CLI_EXIT_OK;
+        return 1;
+    }
+    {
+        char line[160];
+        _snprintf(line, sizeof(line),
+                  "%s详见上方安装器输出（退出码 %d）\n",
+                  a->install ? "驱动安装失败：" : "驱动卸载失败：", code);
+        out(line);
+    }
+    if (code == CLI_EXIT_DEVUNAVA)
+        out("  驱动仍未就绪；可重试一次，或右键 womic-drvinst.exe → 以管理员身份运行。\n");
+    g_exit_code = CLI_EXIT_DEVINST;
     return 1;
 }
 
