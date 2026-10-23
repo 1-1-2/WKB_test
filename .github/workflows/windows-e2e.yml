@@ -16,21 +16,6 @@ name: windows-e2e
 # 触发范围：客户端源码/工具/本 workflow 变更即验证；其余情况手动触发。
 on:
   workflow_dispatch:
-    inputs:
-      # 调试窗口（分钟，0=不开）：在指定阶段把 tailnet + SSH 拉起来，
-      # 等待人（或 Agent）连进去交互排查。见 .github/actions/tailnet-debug。
-      debug_before_d:
-        description: 'd1（装驱动）之前开调试窗口，分钟数，0=不开'
-        required: false
-        default: '0'
-      debug_before_g:
-        description: 'g（2×2 权限矩阵）之前开调试窗口，分钟数，0=不开'
-        required: false
-        default: '0'
-      debug_after_g:
-        description: 'g 之后（h 之前）开调试窗口，分钟数，0=不开'
-        required: false
-        default: '0'
   push:
     paths:
       - 'client/**'
@@ -46,9 +31,9 @@ jobs:
   build:
     name: 交叉构建（Linux → Windows x64）
     runs-on: ubuntu-latest
-    # 正常 2-5min（2026-10-23 实测：apt 顺利时整轮 ~2.5min）。
-    # 15min 是硬上限：apt 卡死时整个 job 15 分钟内必死，不再无限等。
-    timeout-minutes: 15
+    # 装工具链 ~1min + 下载安装包 ~10s + 编 libopus ~6min + 编 exe ~1min；
+    # 30min 是宽松上限，正常 10min 内。
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -58,62 +43,29 @@ jobs:
       # ---------------------------------------------------------------
       - name: 安装交叉编译工具链
         shell: bash
-        # Round 3 教训：apt 瞬时挂起会把整个 build job 拖到超时，白烧一轮
-        # windows 计费。2026-10-23 又踩一次：apt-get update 静默卡死 16 分钟
-        # （-qq 无输出，只能看到步骤不结束），最终被人工取消。
-        # 加固三层：
-        #   1) 每个 apt 调用套 timeout 硬上限（update 120s / install 240s），
-        #      卡住就杀，绝不拖死作业；
-        #   2) 强制 IPv4（runner 的 IPv6 常是黑洞，apt 会先试 v6 干等）；
-        #   3) 每步打进度标记，日志能直接看出卡在 update 还是 install。
+        # Round 3 教训：apt 瞬时挂起（archive.ubuntu.com 无响应）会把整个
+        # build job 拖到 30 分钟超时取消，白烧一轮 windows 计费。加固：
+        # 缩短单次超时 + 失败自动重试，三次不过才判失败。
         run: |
-          echo 'Acquire::http::Timeout "20";' | sudo tee /etc/apt/apt.conf.d/99timeout >/dev/null
-          echo 'Acquire::https::Timeout "20";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
-          echo 'Acquire::Retries "2";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
-          echo 'Acquire::ForceIPv4 "true";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
-          # 预检：archive.ubuntu.com 5s 探活，三次都失败就立刻退出。
-          # run 39975789030 教训：同一时刻另一台 runner 28s 过，这台在 apt
-          # 上静默挂 7m40s（-qq 无输出，只能看到步骤不结束）。预检把
-          # "网络不通"从 10 分钟缩到 15 秒。
-          net_ok=""
-          for i in 1 2 3; do
-            if curl -fsS -m 5 -o /dev/null http://archive.ubuntu.com/ubuntu/; then net_ok=1; break; fi
-            echo "::warning::archive.ubuntu.com 第 $i 次探活失败（5s 超时）"
-            sleep 3
-          done
-          if [ -z "$net_ok" ]; then
-            echo "::error::archive.ubuntu.com 15s 内不可达——runner 网络问题，快速失败（换一台重跑即可）"
-            exit 1
-          fi
+          echo 'Acquire::http::Timeout "30";' | sudo tee /etc/apt/apt.conf.d/99timeout >/dev/null
+          echo 'Acquire::https::Timeout "30";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
+          echo 'Acquire::Retries "3";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
           ok=""
-          # timeout -k：TERM 后 10s 再 KILL。apt 有时卡在 D 状态不响应 TERM，
-          # 只给 TERM 的 timeout 会一直等下去（本轮 7m40s 的另一种解释）。
           for i in 1 2 3; do
-            echo "===== apt 尝试 $i/3：update ====="
-            if timeout -k 10 120 sudo apt-get update -qq; then
-              echo "===== apt 尝试 $i/3：install gcc-mingw-w64-x86-64 ====="
-              if timeout -k 10 240 sudo apt-get install -y -qq gcc-mingw-w64-x86-64; then
-                ok=1; break
-              fi
-              echo "::warning::apt 第 $i 次 install 失败/超时"
-            else
-              echo "::warning::apt 第 $i 次 update 失败/超时（exit=$?）"
+            if sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64; then
+              ok=1; break
             fi
-            sleep 10
+            echo "::warning::apt 第 $i 次失败，30s 后重试"
+            sleep 30
           done
-          if [ -z "$ok" ]; then
-            echo "::error::apt 三次重试均失败"
-            echo "连通性探针（archive.ubuntu.com）："
-            curl -sS -m 5 -o /dev/null -w 'HTTP %{http_code} in %{time_total}s\n' http://archive.ubuntu.com/ubuntu/ || true
-            exit 1
-          fi
+          if [ -z "$ok" ]; then echo "::error::apt 三次重试均失败"; exit 1; fi
           x86_64-w64-mingw32-gcc --version | head -1
           x86_64-w64-mingw32-objdump --version | head -1
           if ! command -v 7z >/dev/null 2>&1; then
-            # p7zip-full（老 7z）优先，装不上再试新 7zip 包；同样带硬超时
+            # p7zip-full（老 7z）优先，装不上再试新 7zip 包；同样带重试
             for i in 1 2 3; do
-              if timeout -k 10 180 sudo apt-get install -y -qq p7zip-full || timeout -k 10 180 sudo apt-get install -y -qq 7zip; then break; fi
-              echo "::warning::7z 安装第 $i 次失败，10s 后重试"; sleep 10
+              if sudo apt-get install -y -qq p7zip-full || sudo apt-get install -y -qq 7zip; then break; fi
+              echo "::warning::7z 安装第 $i 次失败，30s 后重试"; sleep 30
             done
           fi
           7z | head -2 || { echo "::error::7z 不可用"; exit 1; }
@@ -229,9 +181,8 @@ jobs:
     name: 真机端到端验证（windows-latest）
     needs: build
     runs-on: windows-latest
-    # 正常 ~3min（驱动安装 + 灌音 + 2×2 裁决 + GUI）；30min 硬上限。
-    # 调试窗口会拉长作业：任一插点启用时放宽到 150 分钟。
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && (inputs.debug_before_d != '0' || inputs.debug_before_g != '0' || inputs.debug_after_g != '0') && 150 || 30 }}
+    # 驱动安装 ~1min + 灌音取证 ~1min + R3 2×2 裁决 ~4min + 余量；40min 宽松上限。
+    timeout-minutes: 40
     defaults:
       run:
         shell: pwsh
@@ -378,26 +329,6 @@ jobs:
       #     本步骤是任务书唯一允许的 continue-on-error 例外（兜底路径），
       #     失败会打 ::warning:: 显式记录，不掩盖问题。
       # ---------------------------------------------------------------
-      # ---------------------------------------------------------------
-      # debug. 可选调试窗口（workflow_dispatch 输入 minutes>0 时启用）：
-      #   在真实流程的指定阶段把 tailnet + OpenSSH 拉起来，等人 SSH 进来
-      #   交互排查，到点自动关闭、节点注销。三个插点：
-      #     debug_before_d（装驱动前）/ debug_before_g（矩阵前）/
-      #     debug_after_g（矩阵后）
-      #   与一次性调试 workflow 的区别：这里是"真流程跑到一半"的环境，
-      #   产物、驱动、用户、探针目录都是真实上下文，不是复刻。
-      # ---------------------------------------------------------------
-      - name: debug. d1 前调试窗口（可选）
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_before_d != '' && inputs.debug_before_d != '0' }}
-        uses: ./.github/actions/tailnet-debug
-        with:
-          minutes: ${{ inputs.debug_before_d }}
-          label: before-d
-          tags: 'tag:ci'
-          oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
-          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
-
       - name: d1. 客户端自助安装驱动（记录 UAC/非交互行为）
         timeout-minutes: 10
         continue-on-error: true
@@ -714,17 +645,6 @@ jobs:
       #      缺角。e2e_probe.py 只依赖标准库且只往 --out 目录写文件，
       #      复制到 $dir 后自包含可跑。
       # ---------------------------------------------------------------
-      - name: debug. g 前调试窗口（可选）
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_before_g != '' && inputs.debug_before_g != '0' }}
-        uses: ./.github/actions/tailnet-debug
-        with:
-          minutes: ${{ inputs.debug_before_g }}
-          label: before-g
-          tags: 'tag:ci'
-          oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
-          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
-
       - name: g. R3 权限裁决：标准用户 2×2 矩阵（会话0 + 交互会话）
         timeout-minutes: 15
         run: |
@@ -979,18 +899,14 @@ jobs:
             exit 1
           }
           # 快速失败探测：任务无法启动（密码错/凭据被拒/无批登录权限）时
-          # Last Result 立即变非 0。三种非失败值要放行：
-          #   0      = 已跑完
-          #   267011 = SCHED_S_TASK_HAS_NOT_RUN（从未运行，刚注册）
-          #   267009 = SCHED_S_TASK_IS_RUNNING（正在运行——run 39973799266
-          #            实证：探针每 5s 查一次，恰好撞上任务运行中，被误判
-          #            为启动失败；真机会话里 marker 秒出所以没暴露）
+          # Last Result 立即变非 0 且非 267011（SCHED_S_TASK_HAS_NOT_RUN，
+          # run 39906824245 实证的"从未运行"值）——提前暴露，不必等满 4 分钟
           $fastFail = $false
           for ($i = 0; $i -lt 12 -and -not (Test-Path $marker1); $i++) {
             Start-Sleep -Seconds 5
             $q = & schtasks /query /tn WomicE2EG1 /fo LIST /v 2>&1 | Out-String
             $lr = [regex]::Match($q, 'Last Result:\s*(\S+)')
-            if ($lr.Success -and $lr.Groups[1].Value -notin @('0', '267011', '267009')) {
+            if ($lr.Success -and $lr.Groups[1].Value -ne '0' -and $lr.Groups[1].Value -ne '267011') {
               Write-Host "::error::g1: 计划任务启动即失败（Last Result=$($lr.Groups[1].Value)）"
               Write-Host $q
               $fastFail = $true
@@ -1050,17 +966,6 @@ jobs:
       # h. GUI 冒烟：无参启动 6 秒后进程仍活着（-mwindows 双击不闪黑窗
       #    的形态也要在真机上验一次）。主窗口标题可选打印作参考。
       # ---------------------------------------------------------------
-      - name: debug. g 后调试窗口（可选）
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_after_g != '' && inputs.debug_after_g != '0' }}
-        uses: ./.github/actions/tailnet-debug
-        with:
-          minutes: ${{ inputs.debug_after_g }}
-          label: after-g
-          tags: 'tag:ci'
-          oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
-          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
-
       - name: h. GUI 冒烟：无参启动 6 秒进程存活
         timeout-minutes: 5
         run: |
