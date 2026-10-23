@@ -963,14 +963,18 @@ jobs:
             exit 1
           }
           # 快速失败探测：任务无法启动（密码错/凭据被拒/无批登录权限）时
-          # Last Result 立即变非 0 且非 267011（SCHED_S_TASK_HAS_NOT_RUN，
-          # run 39906824245 实证的"从未运行"值）——提前暴露，不必等满 4 分钟
+          # Last Result 立即变非 0。三种非失败值要放行：
+          #   0      = 已跑完
+          #   267011 = SCHED_S_TASK_HAS_NOT_RUN（从未运行，刚注册）
+          #   267009 = SCHED_S_TASK_IS_RUNNING（正在运行——run 39973799266
+          #            实证：探针每 5s 查一次，恰好撞上任务运行中，被误判
+          #            为启动失败；真机会话里 marker 秒出所以没暴露）
           $fastFail = $false
           for ($i = 0; $i -lt 12 -and -not (Test-Path $marker1); $i++) {
             Start-Sleep -Seconds 5
             $q = & schtasks /query /tn WomicE2EG1 /fo LIST /v 2>&1 | Out-String
             $lr = [regex]::Match($q, 'Last Result:\s*(\S+)')
-            if ($lr.Success -and $lr.Groups[1].Value -ne '0' -and $lr.Groups[1].Value -ne '267011') {
+            if ($lr.Success -and $lr.Groups[1].Value -notin @('0', '267011', '267009')) {
               Write-Host "::error::g1: 计划任务启动即失败（Last Result=$($lr.Groups[1].Value)）"
               Write-Host $q
               $fastFail = $true
