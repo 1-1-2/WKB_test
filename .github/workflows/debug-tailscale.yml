@@ -26,9 +26,8 @@ name: debug-tailscale
 #   - 签发凭据只走 secrets.TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET，经 env
 #     传入（禁硬编码、禁直插脚本）；签出的 key 与 access token 只活在
 #     进程内存，绝不打印；
-#   - 调试公钥：SSH 公钥非敏感（私钥只在沙箱，从不入仓），优先取
-#     secrets.UPTERM_DEBUG_PUBKEY / WOMIC_CI_DEBUG_PUBKEY，取不到时
-#     回退到内置公钥并打 warning（见步骤 7 注释）；
+#   - 调试公钥走仓库 Actions Variable（vars.UPTERM_DEBUG_PUBKEY，**不是
+#     Secret**），公钥非敏感，配对私钥只在沙箱；
 #   - 空签名凭据直接 ::error:: 退出，不做任何静默降级；
 #   - 100.x tailnet 地址只在 tailnet 内可达，可安全打印到公开日志；
 #   - 探针用户口令为一次性临时口令（ephemeral runner，作业结束即销毁），
@@ -308,33 +307,30 @@ jobs:
       #    SYSTEM 可访问，继承自 ProgramData 的 Users 读权限会导致
       #    sshd 直接忽略它）。
       #
-      #    公钥处理：SSH **公钥不是敏感信息**（私钥才敏感，只在沙箱
-      #    ~/.ssh/womic_ci_debug，从不入仓）。run 39935881550 实证
-      #    secrets.UPTERM_DEBUG_PUBKEY / WOMIC_CI_DEBUG_PUBKEY 在本仓库
-      #    均取不到值（env 为空 → 步骤失败），故此处优先取 secret，
-      #    取不到则回退到内置公钥并打 warning——该公钥与沙箱私钥配对
+      #    公钥来源：仓库 Actions **Variable**（不是 Secret）——
+      #    vars.UPTERM_DEBUG_PUBKEY，与沙箱 ~/.ssh/womic_ci_debug 配对
       #    （ED25519，指纹 SHA256:C9OEi1jq6bhnlUpb+vlKxoRVyQ7Wj3BMqQO4QiKRVOI）。
-      #    任一情形下，拿到公钥也必须有配对私钥才能登录，且节点仅在
-      #    tailnet 内可达（ACL 限定 member/tag:ops → tag:ci:22）。
+      #    run 39935881550 的教训：曾误用 secrets.* 读取，env 恒为空、
+      #    步骤 7 直接失败——Variables 与 Secrets 是两个不同的上下文。
+      #    公钥非敏感可公开，配对私钥只在沙箱；空值直接 ::error:: 退出。
       # ---------------------------------------------------------------
       - name: 7. 公钥认证（administrators_authorized_keys + ACL 修复）
         env:
-          SECRET_PUBKEY: ${{ secrets.UPTERM_DEBUG_PUBKEY || secrets.WOMIC_CI_DEBUG_PUBKEY }}
+          DEBUG_PUBKEY: ${{ vars.UPTERM_DEBUG_PUBKEY || vars.WOMIC_CI_DEBUG_PUBKEY }}
         run: |
-          $pub = $env:SECRET_PUBKEY
-          if ([string]::IsNullOrWhiteSpace($pub)) {
-            $pub = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILhEgs2u4IK7QazB+VRouxNEfrc+vj1SzrThxDArxJvj workbuddy-ci-debug'
-            Write-Host "::warning::7: 未取到 secret（UPTERM_DEBUG_PUBKEY / WOMIC_CI_DEBUG_PUBKEY 均为空），改用内置公钥（公钥非敏感，配对私钥仅在沙箱）"
+          if ([string]::IsNullOrWhiteSpace($env:DEBUG_PUBKEY)) {
+            Write-Host "::error::7: vars.UPTERM_DEBUG_PUBKEY 与 vars.WOMIC_CI_DEBUG_PUBKEY 均为空——公钥变量未配置（注意是 Variables 不是 Secrets）"
+            exit 1
           }
           New-Item -ItemType Directory -Force -Path "$env:ProgramData\ssh" | Out-Null
           $f = "$env:ProgramData\ssh\administrators_authorized_keys"
-          $pub | Set-Content -Path $f -Encoding ascii
+          $env:DEBUG_PUBKEY | Set-Content -Path $f -Encoding ascii
           icacls $f /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::7: icacls 修复 ACL 失败（exit=$LASTEXITCODE）"
             exit 1
           }
-          Write-Host "7: 公钥已写入（类型 $($pub.Split(' ')[0])），ACL 已修复"
+          Write-Host "7: 公钥已写入（类型 $($env:DEBUG_PUBKEY.Split(' ')[0])），ACL 已修复"
           exit 0
 
       # ---------------------------------------------------------------
