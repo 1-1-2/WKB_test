@@ -764,38 +764,110 @@ jobs:
           # 任务以标准用户身份跑，进程落在 Session 0（非交互）——与 f 的
           # (SYSTEM, s0) 只差用户权限一个变量，权限维度由此分离。
           #
-          # 四轮失败的演进（勿删，团队知识）：
-          # * run 39906824245：schtasks /create /tr ... /ru <标准用户>
-          #   /rp <密码>（无 /xml）实际建成 Interactive/Background logon
-          #   （schtasks /query 显示 Logon Mode: Interactive/Background、
-          #   Last Run Time 11/30/1999、Last Result: 267011 =
-          #   SCHED_S_TASK_HAS_NOT_RUN）：标准用户从未登录交互会话，任务
-          #   永不启动，marker 4 分钟不出现 → 超时 exit 1。
+          # 五轮失败的演进（勿删，团队知识；后两轮由 schedtask-diag
+          # workflow 的变体实验定性，run 39926625705）：
+          # * run 39906824245：schtasks /create /tr /ru /rp（无 /xml），
+          #   schtasks /query 显示 Interactive/Background、Last Result
+          #   267011（SCHED_S_TASK_HAS_NOT_RUN），marker 4 分钟不出现。
           # * run 39910125177/39910107431：Register-ScheduledTask
           #   -Principal ... -Password 报 "Parameter set cannot be
           #   resolved"——两参数不属同一参数集（-Password 只在 User/Xml/
           #   Object 集，-Principal 只在 Principal 集）。
-          # * run 39921983841：改 schtasks /create /xml（XML 显式
-          #   <LogonType>Password</LogonType>）+ /ru /rp，任务仍被注册成
-          #   Interactive/Background（/ru 覆盖了 XML 的 LogonType），且
-          #   schtasks 警告 "Batch logon privilege needs to be enabled
-          #   for the task principal"——任务从未运行，4 分钟超时。
-          # * 定案：Register-ScheduledTask User（默认）参数集（官方 syntax
-          #   实证：-User/-Password/-Action/-Settings/-RunLevel 同集），
-          #   -User + -Password 即 Password logon type（不管用户是否登录
-          #   都运行，进程落 Session 0、身份为标准用户，g1 裁决语义不变），
-          #   -RunLevel Limited（标准用户无升高令牌）。
-          #   SeBatchLogonRight 由任务计划程序注册时自动授予（Microsoft
-          #   Learn《作为批处理作业登录》："任务计划程序在用户计划任务时
-          #   自动授予此权限"）。
+          # * run 39921983841：schtasks /create /xml(LogonType=Password)
+          #   + /ru /rp，仍显示 Interactive/Background + schtasks 警告
+          #   "Batch logon privilege needs to be enabled"。
+          # * run 39924487481：Register-ScheduledTask -User -Password
+          #   （User 集）注册成功，schtasks /query 仍显示
+          #   Interactive/Background——当时误判为登录类型错误。
+          # * schedtask-diag run 39926625705 一次性变体实验定性：
+          #   1) schtasks /query 的 "Logon Mode: Interactive/Background"
+          #      是显示层假象——Get-ScheduledTask 的 Principal.LogonType
+          #      实测为 Password（cmdlet User/Xml/Object 三集皆然）。
+          #      判据必须用 Get-ScheduledTask，不能用 schtasks 显示。
+          #   2) 任务 /run 后从不启动（marker 不出现、Last Result 一直
+          #      停在 267011）的真正原因：SeBatchLogonRight 缺失。
+          #      secedit /export USER_RIGHTS 实证该权限只有内置四组
+          #      （Administrators/Backup Operators/Performance Log
+          #      Users/Performance Monitor Users），探针用户不在其中。
+          #      MS Learn《作为批处理作业登录》所称"任务计划程序自动
+          #      授予"只对 UI 向导成立，API/cmdlet 注册不自动授予。
+          #   3) -Password 必须传 String：传 SecureString 会被 ToString
+          #      成垃圾，注册即报 "The user name or password is
+          #      incorrect"（V2 实证）。
+          # 定案：secedit 导出 USER_RIGHTS → 把探针用户 SID 追加进
+          # SeBatchLogonRight → 导入（只加这一个权限，其余原样带回）
+          # → 验证在位 → Register-ScheduledTask User 集注册（-User +
+          # -Password String + -RunLevel Limited）→ Get-ScheduledTask
+          # 校验 Principal.LogonType=Password → schtasks /run 触发。
           $bat1 = "$dir\run_g1.cmd"
           $marker1 = "$dir\g1_exit.txt"
           $out1 = "$dir\probe-g1"
           $so1 = "$dir\g1-stdout.txt"
           if (Test-Path $marker1) { Remove-Item $marker1 -Force }
           Write-ProbeBat $bat1 $marker1 $out1 $so1
-          # 无触发器：Register-ScheduledTask 不设 trigger，靠 schtasks /run
-          # 强制立即触发（/run 不依赖任何计划时间）
+          # ---- 0) 授予 SeBatchLogonRight（Password logon 的硬前提）----
+          # secedit /configure /areas USER_RIGHTS 会整块替换用户权限区，
+          # 因此必须先 /export 当前状态、只往 SeBatchLogonRight 追加一个
+          # SID、再原样导回——其余权限一字不动。
+          $sid = (Get-LocalUser -Name $user).SID.Value
+          $inf = "$dir\userrights.inf"
+          $sdb = "$dir\userrights.sdb"
+          & secedit /export /cfg $inf /areas USER_RIGHTS 2>&1 | Out-Null
+          if (-not (Test-Path $inf)) {
+            Write-Host "::error::g1: secedit 导出 USER_RIGHTS 失败"
+            "ITEM_G1=ERROR" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          $lines = Get-Content $inf
+          $patched = $false
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^\s*SeBatchLogonRight\s*=\s*(.*)$') {
+              # 已授权判定要同时认 SID 与账户名：secedit /export 会把能解析
+              # 的 SID 写成账户名（2026-10-23 真机实证：导出为
+              # "womic-e2e-probe,*S-1-5-32-544,..."），只比 SID 会重复追加。
+              if (($matches[1] -notmatch [regex]::Escape($sid)) -and
+                  ($matches[1] -notmatch [regex]::Escape($user))) {
+                $lines[$i] = "SeBatchLogonRight = $($matches[1].TrimEnd()),*$sid"
+              }
+              $patched = $true
+              break
+            }
+          }
+          if (-not $patched) {
+            # 极端情况：导出里没有这一行——插到 [Privilege Rights] 节头后
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match '^\[Privilege Rights\]') {
+                $lines = @($lines[0..$i]) + @("SeBatchLogonRight = *$sid") + @($lines[($i+1)..($lines.Count-1)])
+                $patched = $true
+                break
+              }
+            }
+          }
+          if (-not $patched) {
+            Write-Host "::error::g1: USER_RIGHTS 导出里找不到 SeBatchLogonRight 行"
+            "ITEM_G1=ERROR" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          Set-Content -Path $inf -Value $lines -Encoding Unicode
+          & secedit /configure /db $sdb /cfg $inf /areas USER_RIGHTS 2>&1 | Out-String | Write-Host
+          # 授予后必须验证：再导一次，不在位就当场炸（不带着假授权往下走）。
+          # 2026-10-23 真机实证（debug-tailscale 交互会话）：secedit /export
+          # 会把能解析的 SID 写成账户名，导出行为
+          #   SeBatchLogonRight = womic-e2e-probe,*S-1-5-32-544,...
+          # 因此判据必须 SID 或账户名任一命中——只比 SID 会假失败。
+          $inf2 = "$dir\userrights2.inf"
+          & secedit /export /cfg $inf2 /areas USER_RIGHTS 2>&1 | Out-Null
+          $chk = Get-Content $inf2 -ErrorAction SilentlyContinue |
+            Where-Object { $_ -match 'SeBatchLogonRight' }
+          $sidOk = $chk -and (("$chk" -match [regex]::Escape($sid)) -or ("$chk" -match [regex]::Escape($user)))
+          if (-not $sidOk) {
+            Write-Host "::error::g1: SeBatchLogonRight 授予后验证失败（SID=$sid / user=$user 均不在位）"
+            "ITEM_G1=ERROR" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          Write-Host "g1: SeBatchLogonRight 已授予 $env:COMPUTERNAME\$user（SID=$sid，已验证）"
+          # ---- 1) 注册：Register-ScheduledTask User（默认）参数集 ----
+          # 无触发器：靠 schtasks /run 强制立即触发（不依赖任何计划时间）
           $action1 = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/c `"$bat1`"" -WorkingDirectory $dir
           $settings1 = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew
           try {
@@ -807,13 +879,14 @@ jobs:
             "ITEM_G1=ERROR" | Out-File -FilePath $env:GITHUB_ENV -Append
             exit 1
           }
-          # 注册后先校验登录类型再触发：不是 Password（尤其 Interactive/
-          # Background）说明凭据没吃进去，任务永远等不到交互会话——
-          # 这正是 run 39906824245/39921983841 两轮静默 4 分钟超时的根因。
-          $q1 = & schtasks /query /tn WomicE2EG1 /fo LIST /v 2>&1 | Out-String
-          Write-Host $q1
-          if ($q1 -notmatch 'Logon Mode:\s*Password') {
-            Write-Host "::error::g1: 任务登录类型不是 Password（见上方 /query 输出），非交互 CI 里不会启动"
+          # ---- 2) 登录类型校验：权威判据是 Get-ScheduledTask 的
+          #      Principal.LogonType，不是 schtasks /query 的显示
+          #      （schedtask-diag 实证：Password 任务被 schtasks 显示成
+          #      Interactive/Background，显示层不可信）----
+          $lt1 = (Get-ScheduledTask -TaskName WomicE2EG1 -ErrorAction Stop).Principal.LogonType
+          Write-Host "g1: Principal.LogonType='$lt1'（期望 Password）"
+          if ("$lt1" -ne 'Password') {
+            Write-Host "::error::g1: Principal.LogonType 不是 Password"
             "ITEM_G1=ERROR" | Out-File -FilePath $env:GITHUB_ENV -Append
             & schtasks /delete /tn WomicE2EG1 /f 2>&1 | Out-Null
             exit 1
