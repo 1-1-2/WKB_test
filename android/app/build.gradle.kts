@@ -119,6 +119,8 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    // 抽屉导航 NavHost（T05）：三个目的地 = 主页 / 外观 / 关于与帮助
+    implementation(libs.androidx.navigation.compose)
 
     val composeBom = platform(libs.androidx.compose.bom)
     implementation(composeBom)
@@ -128,4 +130,17 @@ dependencies {
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.material.icons.extended)
     debugImplementation(libs.androidx.compose.ui.tooling)
+
+    // 主题系统的种子配色生成（Material You 的 HCT 色彩空间实现）。
+    // 版本 4.0.5 是兼容性选择（风险 R12）：5.0.x 的类文件是 Kotlin 2.4 元数据，
+    // 本项目的 Kotlin 编译器 2.2.21 读不了（"incompatible version" 编译失败）；
+    // 4.0.5 的元数据是 2.0，且其 kotlin-stdlib 依赖正好是 2.2.21，无版本冲突。
+    // 它 POM 里的 org.jetbrains.compose.* 是 Compose Multiplatform 重分发，
+    // Android 侧全部由 composeBom 提供，排除掉可避免拉一整套 JB 变体。
+    implementation(libs.material.kolor) {
+        exclude(group = "org.jetbrains.compose")
+    }
+
+    // 主题/配色的纯 JVM 单元测试（AMOLED 梯度、WCAG 对比度、预置表自洽）
+    testImplementation(libs.junit)
 }

@@ -4,6 +4,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
+import com.miclink.open.theme.AppPalette
+import com.miclink.open.theme.ThemeMode
+import com.miclink.open.theme.ThemeState
 
 /**
  * 主界面状态：配置 + 服务状态 + 统计 + 电平。
@@ -46,6 +49,17 @@ class MainViewModel : ViewModel() {
     var uiState: MainUiState by mutableStateOf(MainUiState())
         private set
 
+    /**
+     * 主题设置（与运行参数分离）：
+     * 运行参数是"启动服务前锁定"的编辑态，主题是"改完立刻生效并落盘"的偏好态，
+     * 两者生命周期不同，混在一个 state 里会让"什么时候该写盘"变糊。
+     */
+    var themeState: ThemeState by mutableStateOf(ThemeState())
+        private set
+
+    /** 主题存储（[loadTheme] 时保留引用；Prefs 持有 applicationContext，无泄漏风险）。 */
+    private var themeStore: Prefs? = null
+
     /** Activity 创建时从 Prefs 灌入可编辑配置。 */
     fun loadConfig(prefs: Prefs) {
         val config = prefs.load()
@@ -54,6 +68,17 @@ class MainViewModel : ViewModel() {
             volume = config.volume,
             debugTone = config.debugTone
         )
+    }
+
+    /**
+     * Activity 创建时灌入主题设置，并保留存储引用供后续修改落盘。
+     *
+     * 与 [loadConfig] 的差别：配置只在点"启动服务"时保存，主题每次变更都即时保存
+     * （验收 #3：重启保持），所以这里必须留住 [Prefs]（经它委托 ThemePrefs）。
+     */
+    fun loadTheme(prefs: Prefs) {
+        themeStore = prefs
+        themeState = prefs.loadTheme()
     }
 
     /** 把当前 UI 配置读成 [Prefs.Config]（端口文本非法时返回 null）。 */
@@ -79,6 +104,31 @@ class MainViewModel : ViewModel() {
 
     fun onDebugToneChanged(value: Boolean) {
         uiState = uiState.copy(debugTone = value)
+    }
+
+    // ------------------------------------------------------------------
+    // 主题（变更即时生效 + 即时落盘）
+    // ------------------------------------------------------------------
+
+    fun onThemeModeChanged(mode: ThemeMode) {
+        updateTheme(themeState.copy(mode = mode))
+    }
+
+    fun onThemePaletteChanged(palette: AppPalette) {
+        updateTheme(themeState.copy(palette = palette))
+    }
+
+    fun onThemeAmoledChanged(value: Boolean) {
+        updateTheme(themeState.copy(amoled = value))
+    }
+
+    /**
+     * 统一的主题变更入口：先改状态（触发 WomicTheme 重组，即时生效无闪烁），
+     * 再落盘（重启后保持）。两条验收标准（#1/#3）都靠这个方法一次满足。
+     */
+    private fun updateTheme(state: ThemeState) {
+        themeState = state
+        themeStore?.saveTheme(state)
     }
 
     /** 服务状态回调（主线程）。 */

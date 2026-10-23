@@ -44,4 +44,51 @@
     <string name="permission_denied">权限被拒绝：%1$s（请在系统设置中授予后重试）</string>
     <string name="opus_version">libopus：%1$s</string>
     <string name="opus_not_loaded">native 库未加载：%1$s。请按 android/README.md 把 opus 源码放到 app/src/main/cpp/opus/ 后重新构建。</string>
+
+    <!-- ==================== 抽屉导航（T05） ==================== -->
+    <string name="nav_home">主页</string>
+    <string name="nav_appearance">外观</string>
+    <string name="nav_about">关于与帮助</string>
+    <string name="nav_open_drawer">打开导航抽屉</string>
+
+    <!-- ==================== 外观设置（T05） ==================== -->
+    <string name="theme_section_mode">主题模式</string>
+    <string name="theme_mode_system">跟随系统</string>
+    <string name="theme_mode_light">浅色</string>
+    <string name="theme_mode_dark">深色</string>
+    <string name="theme_section_palette">配色</string>
+    <string name="theme_group_vibrant">活泼</string>
+    <string name="theme_group_muted">低饱和</string>
+    <string name="palette_dynamic">动态取色</string>
+    <string name="palette_dynamic_hint">Android 12+ 跟随壁纸生成主题色</string>
+    <string name="palette_coral">珊瑚橙</string>
+    <string name="palette_magenta">品红</string>
+    <string name="palette_amber">琥珀</string>
+    <string name="palette_teal">湖蓝</string>
+    <string name="palette_mist">雾蓝</string>
+    <string name="palette_sage">苔绿</string>
+    <string name="palette_rose">枯玫瑰</string>
+    <string name="palette_stone">石灰</string>
+    <string name="palette_brand_blue">品牌蓝</string>
+    <string name="theme_dynamic_unsupported">当前系统（Android 11 及以下）不支持动态取色，已回退到「%1$s」</string>
+    <string name="theme_section_amoled">AMOLED 纯黑</string>
+    <string name="theme_amoled_hint">仅深色模式生效：背景与卡片统一为纯黑，用灰度梯度区分层级</string>
+    <string name="theme_amoled_unavailable">当前为浅色模式，AMOLED 仅在深色模式下生效</string>
+
+    <!-- ==================== 电平表（T05 VoiceMeter） ==================== -->
+    <string name="vm_rms">RMS</string>
+    <string name="vm_peak">Peak</string>
+    <string name="vm_db_format">%1$.1f dB</string>
+    <string name="vm_signal">有信号</string>
+    <string name="vm_silent">无信号</string>
+    <string name="vm_clip">过载</string>
+
+    <!-- ==================== 关于与帮助（T05） ==================== -->
+    <string name="about_protocol">协议说明</string>
+    <string name="about_protocol_body">手机是 TCP 服务端（默认端口 8125）+ UDP 发送端：PC 客户端连入后经 CONFIG 消息协商采样率与媒体端口，随后 Opus 编码音频经 UDP 发出。控制通道与媒体通道分离，心跳 5s 超时断开。</string>
+    <string name="about_version">版本</string>
+    <string name="about_app_version">应用版本</string>
+    <string name="about_opus_version">libopus 版本</string>
+    <string name="about_licenses">开源许可</string>
+    <string name="about_licenses_intro">本应用运行期使用以下开源组件：</string>
 </resources>

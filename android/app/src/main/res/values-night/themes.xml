@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        深色启动窗口主题：parent 换成平台深色变体，状态栏/导航栏从第一帧起
+        就是深色（图标为浅色），与 WomicTheme 的深色方案无缝衔接。
+    -->
+    <style name="Theme.Womic" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/womic_window_background</item>
+    </style>
+</resources>
