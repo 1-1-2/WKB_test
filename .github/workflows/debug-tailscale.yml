@@ -305,24 +305,30 @@ jobs:
       #    拒绝读取（微软文档明确的坑：该文件要求仅 Administrators/
       #    SYSTEM 可访问，继承自 ProgramData 的 Users 读权限会导致
       #    sshd 直接忽略它）。公钥经 env 传入；空 secret 直接退出。
+      #
+      #    secret 名沿用 upterm 时期建的 UPTERM_DEBUG_PUBKEY：其内容与
+      #    沙箱 ~/.ssh/womic_ci_debug.pub 是同一把（ED25519，指纹
+      #    SHA256:C9OEi1jq6bhnlUpb+vlKxoRVyQ7Wj3BMqQO4QiKRVOI），
+      #    无需重复建 secret。若将来改用新名字 WOMIC_CI_DEBUG_PUBKEY，
+      #    表达式会自动回退到它（|| 取第一个非空）。
       # ---------------------------------------------------------------
       - name: 7. 公钥认证（administrators_authorized_keys + ACL 修复）
         env:
-          WOMIC_CI_DEBUG_PUBKEY: ${{ secrets.WOMIC_CI_DEBUG_PUBKEY }}
+          DEBUG_PUBKEY: ${{ secrets.UPTERM_DEBUG_PUBKEY || secrets.WOMIC_CI_DEBUG_PUBKEY }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:WOMIC_CI_DEBUG_PUBKEY)) {
-            Write-Host "::error::7: secrets.WOMIC_CI_DEBUG_PUBKEY 为空——公钥必须走 secrets（禁硬编码）"
+          if ([string]::IsNullOrWhiteSpace($env:DEBUG_PUBKEY)) {
+            Write-Host "::error::7: secrets.UPTERM_DEBUG_PUBKEY 与 WOMIC_CI_DEBUG_PUBKEY 均为空——公钥必须走 secrets（禁硬编码）"
             exit 1
           }
           New-Item -ItemType Directory -Force -Path "$env:ProgramData\ssh" | Out-Null
           $f = "$env:ProgramData\ssh\administrators_authorized_keys"
-          $env:WOMIC_CI_DEBUG_PUBKEY | Set-Content -Path $f -Encoding ascii
+          $env:DEBUG_PUBKEY | Set-Content -Path $f -Encoding ascii
           icacls $f /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::7: icacls 修复 ACL 失败（exit=$LASTEXITCODE）"
             exit 1
           }
-          Write-Host "7: 公钥已写入（类型 $($env:WOMIC_CI_DEBUG_PUBKEY.Split(' ')[0])），ACL 已修复"
+          Write-Host "7: 公钥已写入（类型 $($env:DEBUG_PUBKEY.Split(' ')[0])），ACL 已修复"
           exit 0
 
       # ---------------------------------------------------------------
