@@ -656,10 +656,24 @@ jobs:
             Write-Host "::error::g: 解析 python 绝对路径失败"
             exit 1
           }
-          net user $user $pass /add | Out-Null
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::g: 创建标准用户失败"
-            exit 1
+          # 建用户：run 39904485784 真机教训——net user ... /add 在 pwsh 7
+          # （步骤 shell 是 C:\Program Files\PowerShell\7\pwsh.EXE）下返回
+          # 非零退出码，且错误文本被 | Out-Null 吞掉，日志只剩
+          # "No valid response was provided."（net.exe 的通用错误输出），
+          # 无法定位失败原因。改用 pwsh 原生的 New-LocalUser + try/catch，
+          # 让完整错误信息暴露出来；-ErrorAction Stop 把非终止错误转终止
+          # 错误交给 catch。$sec 前置创建：New-LocalUser 与 g2 的
+          # Start-Process -Credential 共用同一个 SecureString。
+          $sec = ConvertTo-SecureString $pass -AsPlainText -Force
+          # 幂等：用户已存在（重复跑/重试）则跳过创建，不算基础设施错误
+          if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+            try {
+              New-LocalUser -Name $user -Password $sec `
+                -Description "WOMic E2E R3 标准用户裁决" -ErrorAction Stop | Out-Null
+            } catch {
+              Write-Host "::error::g: 创建标准用户失败: $($_.Exception.Message)"
+              exit 1
+            }
           }
           $dir = "$env:TEMP\womic-stduser"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -793,7 +807,7 @@ jobs:
           $so2 = "$dir\g2-stdout.txt"
           if (Test-Path $marker2) { Remove-Item $marker2 -Force }
           Write-ProbeBat $bat2 $marker2 $out2 $so2
-          $sec = ConvertTo-SecureString $pass -AsPlainText -Force
+          # $sec 在建用户处已创建（New-LocalUser 与 -Credential 共用），此处直接用
           $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$user", $sec)
           Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$bat2`"" `
             -Credential $cred -WorkingDirectory $dir -Wait
