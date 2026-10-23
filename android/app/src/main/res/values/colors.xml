@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        窗口背景色：Compose 首帧之前的窗口底色。
+        与浅色主题的 Material 背景保持一致，避免深色模式冷启动时
+        先闪一下亮色窗口再进入深色界面（values-night 下有对应的深色版）。
+    -->
+    <color name="womic_window_background">#FFFFFFFF</color>
+</resources>

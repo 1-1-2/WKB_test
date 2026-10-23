@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        启动窗口主题：只比平台主题多一个 windowBackground（见 colors.xml）。
+        其余行为与原先直接引用 @android:style/Theme.Material.Light.NoActionBar 一致。
+    -->
+    <style name="Theme.Womic" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/womic_window_background</item>
+    </style>
+</resources>
