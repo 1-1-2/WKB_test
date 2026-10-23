@@ -95,7 +95,18 @@ jobs:
             sleep 3
           done
           if [ -z "$net_ok" ]; then
-            echo "::error::archive.ubuntu.com 15s 内不可达——runner 网络问题，快速失败（换一台重跑即可）"
+            # 主镜像不通：GitHub runner 在 Azure 内网，azure.archive.ubuntu.com
+            # 通常可达（2026-10-23 多台 runner 只有主镜像抖动）。切过去再试。
+            echo "::warning::archive.ubuntu.com 不可达，尝试 azure 镜像"
+            if curl -fsS -m 5 -o /dev/null http://azure.archive.ubuntu.com/ubuntu/; then
+              sudo sed -i 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+                /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+              echo "已切换 sources 到 azure.archive.ubuntu.com"
+              net_ok=1
+            fi
+          fi
+          if [ -z "$net_ok" ]; then
+            echo "::error::archive 与 azure 两个镜像 15s 内均不可达——runner 网络问题，换一台重跑"
             exit 1
           fi
           ok=""
