@@ -7,7 +7,7 @@ name: windows-e2e
 #   build   —— ubuntu 上交叉编译（装 mingw、现场取官方驱动打内置包、静态编
 #              libopus），产出 womic.exe + test_drvpkg.exe + 解出的驱动三件套；
 #   verify  —— windows-latest 真机上逐项验证 CLI 行为、驱动安装、灌音闭环、
-#              标准用户权限裁决（R3）与 GUI 冒烟。
+#              标准用户权限裁决矩阵（R3，2×2）与 GUI 冒烟。
 #
 # 为什么驱动要"现场从官方安装包提取"：womic.sys 等第三方已签名驱动二进制不进
 # 源码库（法律决策 R8），构建时从官方安装包解出，并校验 womic_1.sys 的
@@ -181,7 +181,7 @@ jobs:
     name: 真机端到端验证（windows-latest）
     needs: build
     runs-on: windows-latest
-    # 驱动安装 ~1min + 灌音取证 ~1min + R3 标准用户 ~2min + 余量；40min 宽松上限。
+    # 驱动安装 ~1min + 灌音取证 ~1min + R3 2×2 裁决 ~4min + 余量；40min 宽松上限。
     timeout-minutes: 40
     defaults:
       run:
@@ -456,35 +456,206 @@ jobs:
       #    判 1kHz 正弦。IOCTL 0x222001 恒定返回 FALSE+gle=1（驱动防
       #    逆向），所以判据不是 IOCTL 状态码，而是实际录音效果：
       #    RESULT=PASS（设备枚举 + 句柄 + RMS + 主峰 1kHz + SNR）。
+      #
+      #    为什么探针必须由 SYSTEM 计划任务跑（会话隔离根因，已实证）：
+      #    run 39901322823 的 f 步骤在交互会话上下文（env 存证
+      #    session_id=2, user=runneradmin, elevated=true）下探针
+      #    waveInOpen rc=1（MMSYSERR_ERROR）失败。历史实证
+      #    （womic-recovery/diagnostics/diagnosis.md）：
+      #      §8.1  同一份代码、同一设备，仅会话上下文不同——以 SYSTEM
+      #             计划任务（Session 0）跑 WASAPI 采集全链路 PASS；
+      #             交互会话（session 2, runneradmin）跑同代码直接
+      #             E_ACCESSDENIED (0x80070005)。原话："CI 里探针
+      #             必须由 SYSTEM 计划任务跑"。
+      #      §9.2/§358  waveInOpen rc=1 在 SYSTEM/Session 0 下从未
+      #             复现（2022 基线 waveInOpen 成功录到 288000 字节）；
+      #             早期"rc=1 是格式问题"的判断已被证伪。
+      #    设备枚举本身成功（waveInGetNumDevs=1、设备名 Microphone
+      #    (WO Mic Device)、\\.\WOMic 可打开），所以不是设备识别
+      #    问题，是 waveIn 打开录音流的会话隔离——与提权与否无关
+      #    （elevated 的交互会话同样失败，见 g 的 2×2 矩阵）。
+      #
+      #    实现（范式来自 womic-recovery/runner/deploy_task.py，真机
+      #    验证过）：schtasks 部署计划任务 WomicE2EF（UserId
+      #    S-1-5-18 + RunLevel HighestAvailable；BootTrigger 占位 +
+      #    AllowStartOnDemand，再用 /run 立即触发；XML 必须 UTF-16），
+      #    探针在 bat 里跑（chcp 65001 + PYTHONIOENCODING=utf-8，
+      #    防 stdout 重定向时 Windows 默认 cp1252 导致中文日志
+      #    UnicodeEncodeError 崩），marker 文件轮询判完成，
+      #    try/finally 保证任务删除（失败路径也删）。
       # ---------------------------------------------------------------
-      - name: f. 端到端灌音验证（e2e_probe，须 RESULT=PASS）
+      - name: f. 端到端灌音验证（SYSTEM 计划任务跑 e2e_probe，须 RESULT=PASS）
         timeout-minutes: 8
         run: |
-          $out = & python client/tools/e2e_probe.py --seconds 3 --out probe-results/probe 2>&1
-          $rc = $LASTEXITCODE
-          $txt = $out -join "`n"
-          $txt | Out-File probe-results/logs/f-e2e-probe.txt -Encoding utf8
-          if ($rc -ne 0 -or $txt -notmatch 'RESULT=PASS') {
-            Write-Host "::error::f: e2e_probe 未 PASS（exit=$rc）——灌音闭环失败"
+          $ws = $env:GITHUB_WORKSPACE
+          # 计划任务的 cmd 环境不继承 Actions 进程 PATH，python 必须写绝对路径
+          $py = (Get-Command python).Source
+          if (-not $py) {
+            Write-Host "::error::f: 解析 python 绝对路径失败"
             "ITEM_F=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
             exit 1
           }
-          Write-Host "f: 灌音闭环 PASS（waveIn 录到 1kHz 正弦）"
-          "ITEM_F=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # 预建收证目录：避免 bat 里重定向因目录不存在而失败
+          New-Item -ItemType Directory -Force -Path "$ws\probe-results\logs" | Out-Null
+          $bat = "$ws\probe-results\run_f.cmd"
+          $marker = "$ws\probe-results\f_exit.txt"
+          if (Test-Path $marker) { Remove-Item $marker -Force }
+          # 不用 here-string（结束标记顶行首会截断 YAML 块标量）；
+          # 不用 @(...) 逗号后 + 拼接（会被解析成数组元素）——统一插值 + 反引号转义。
+          $batLines = @(
+            '@echo off',
+            'chcp 65001 >nul 2>&1',
+            'set PYTHONIOENCODING=utf-8',
+            "cd /d `"$ws`"",
+            "`"$py`" client\tools\e2e_probe.py --seconds 3 --out `"$ws\probe-results\probe`" > `"$ws\probe-results\logs\f-e2e-probe.txt`" 2>&1",
+            "echo PROBE_EXIT=%ERRORLEVEL% > `"$marker`""
+          )
+          $batLines | Set-Content -Path $bat -Encoding ascii
+          # 计划任务 XML：schtasks /create /xml 要求 XML 文件 UTF-16 编码
+          $xmlPath = "$ws\probe-results\WomicE2EF.xml"
+          $xmlLines = @(
+            '<?xml version="1.0" encoding="UTF-16"?>',
+            '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
+            '  <RegistrationInfo>',
+            '    <Description>WOMic E2E f 探针（SYSTEM/Session 0，脱离交互会话）</Description>',
+            '    <URI>\WomicE2EF</URI>',
+            '  </RegistrationInfo>',
+            '  <Triggers>',
+            '    <BootTrigger><Enabled>false</Enabled></BootTrigger>',
+            '  </Triggers>',
+            '  <Principals>',
+            '    <Principal id="Author">',
+            '      <UserId>S-1-5-18</UserId>',
+            '      <RunLevel>HighestAvailable</RunLevel>',
+            '    </Principal>',
+            '  </Principals>',
+            '  <Settings>',
+            '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>',
+            '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>',
+            '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>',
+            '    <AllowHardTerminate>true</AllowHardTerminate>',
+            '    <StartWhenAvailable>true</StartWhenAvailable>',
+            '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>',
+            '    <IdleSettings>',
+            '      <StopOnIdleEnd>false</StopOnIdleEnd>',
+            '      <RestartOnIdle>false</RestartOnIdle>',
+            '    </IdleSettings>',
+            '    <AllowStartOnDemand>true</AllowStartOnDemand>',
+            '    <Enabled>true</Enabled>',
+            '    <Hidden>false</Hidden>',
+            '    <RunOnlyIfIdle>false</RunOnlyIfIdle>',
+            '    <WakeToRun>false</WakeToRun>',
+            '    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>',
+            '    <Priority>4</Priority>',
+            '  </Settings>',
+            '  <Actions Context="Author">',
+            '    <Exec>',
+            '      <Command>cmd.exe</Command>',
+            "      <Arguments>/c `"$bat`"</Arguments>",
+            "      <WorkingDirectory>$ws</WorkingDirectory>",
+            '    </Exec>',
+            '  </Actions>',
+            '</Task>'
+          )
+          [IO.File]::WriteAllText($xmlPath, ($xmlLines -join "`r`n"), [Text.Encoding]::Unicode)
+          try {
+            & schtasks /create /tn WomicE2EF /xml $xmlPath /f 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::f: 创建计划任务 WomicE2EF 失败"
+              "ITEM_F=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+              exit 1
+            }
+            & schtasks /run /tn WomicE2EF 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::f: 触发计划任务 WomicE2EF 失败"
+              "ITEM_F=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+              exit 1
+            }
+            # 轮询 marker（bat 末尾写），最多 4 分钟，每 3 秒一次
+            $deadline = (Get-Date).AddMinutes(4)
+            while (-not (Test-Path $marker) -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 3
+            }
+            if (-not (Test-Path $marker)) {
+              Write-Host "::error::f: 计划任务探针 4 分钟超时（marker 未出现）"
+              & schtasks /query /tn WomicE2EF /fo LIST /v 2>&1 | Out-String | Write-Host
+              "ITEM_F=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+              exit 1
+            }
+            $m = [regex]::Match((Get-Content $marker -Raw), 'PROBE_EXIT=(\d+)')
+            $probeExit = if ($m.Success) { [int]$m.Groups[1].Value } else { -1 }
+            $log = "$ws\probe-results\logs\f-e2e-probe.txt"
+            $txt = if (Test-Path $log) { Get-Content $log -Raw -Encoding utf8 } else { '' }
+            Get-Content $log -ErrorAction SilentlyContinue | Write-Host
+            if ($probeExit -eq 0 -and $txt -match 'RESULT=PASS') {
+              Write-Host "f: SYSTEM/Session 0 计划任务灌音闭环 PASS（waveIn 录到 1kHz 正弦）"
+              "ITEM_F=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+            } else {
+              Write-Host "::error::f: e2e_probe 未 PASS（probe_exit=$probeExit）——灌音闭环失败"
+              "ITEM_F=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+              exit 1
+            }
+          } finally {
+            # 失败路径也删：避免残留任务影响同 job 后续步骤
+            & schtasks /delete /tn WomicE2EF /f 2>&1 | Out-Null
+          }
           exit 0
 
       # ---------------------------------------------------------------
-      # g. R3 权限裁决：建标准用户，以其身份跑同一探针，记录 PASS/FAIL。
-      #    结论写进报告（灌音是否需要管理员）。这是裁决记录而非通过性
-      #    门禁——所以探针 FAIL 不失败作业，但用户创建等基础设施错误要失败。
-      #    注意：Start-Process -Credential 不能与 -RedirectStandardOutput
-      #    共用（参数集冲突），用 cmd /c 包一层在目标用户上下文里重定向。
+      # g. R3 权限裁决：2×2 矩阵（会话上下文 × 用户权限）。
+      #
+      #    根因修正：早期把灌音失败归因为"标准用户权限不够"，但 run
+      #    39901322823 的实证是——elevated=true 的交互会话
+      #    （runneradmin）下探针仍然 waveInOpen rc=1 失败；而 SYSTEM
+      #    计划任务（Session 0）从未复现（diagnosis.md §8.1/§9.2）。
+      #    即根因是会话隔离而非用户权限，必须把两个变量分离、补齐矩阵：
+      #      (SYSTEM,   session 0) = f  （上一步，计划任务）
+      #      (标准用户,  session 0) = g1 （本次新增：schtasks /ru 标准用户）
+      #      (标准用户,  交互会话)   = g2 （原有实现，保留作对照）
+      #    加上历史 run 39901322823 的 (elevated, 交互会话)=FAIL
+      #    记录，2×2 矩阵完备。预期结论：灌音约束取决于会话上下文
+      #    （Session 0 vs 交互会话），而非用户权限（管理员 vs 标准）。
+      #
+      #    这是裁决记录而非通过性门禁——探针 FAIL 不失败作业，但
+      #    建用户失败、计划任务创建失败、轮询超时等基础设施错误要
+      #    ::error:: 并 exit 1。结论 ITEM_G1/ITEM_G2 写进 GITHUB_ENV
+      #    供 i 步骤汇总。
+      #
+      #    坑注释（团队知识，勿删）：
+      #    * Start-Process -Credential 不能与 -RedirectStandardOutput
+      #      共用（参数集冲突），用 cmd /c 包一层在目标用户上下文里
+      #      重定向（g2 仍走此路）。
+      #    * 不用 here-string：PowerShell here-string 的结束标记必须
+      #      顶行首，会截断 YAML 块标量。
+      #    * 不要在多行 @(...) 里用 + 拼接字符串——逗号之后的 + 连接
+      #      会被解析成多个数组元素（pwsh 实测踩坑），统一用插值 +
+      #      反引号转义引号。
+      #    * schtasks /create /xml 的 XML 必须 UTF-16 编码
+      #      （[IO.File]::WriteAllText(..., [Text.Encoding]::Unicode)）。
+      #    * 计划任务 Actions 的 cmd 环境不继承 pwsh 的 PATH，python
+      #      必须写绝对路径；WorkingDirectory 用绝对路径（相对路径会
+      #      被解析到 C:\Windows\System32）。
+      #    * workspace（C:\Users\runneradmin\work\...）各级目录默认 ACL
+      #      只允许 runneradmin/Administrators/SYSTEM traverse——标准用户
+      #      进不去 workspace。因此 g1/g2 的探针必须由 elevated pwsh 复制
+      #      到已授权 Modify 的 $dir（$env:TEMP\womic-stduser）里跑：cd
+      #      进 workspace 会失败（cwd 落 system32），打开 workspace 下的
+      #      脚本也会被 traverse 拒绝，两者都会把裁决污染成 ERROR、矩阵
+      #      缺角。e2e_probe.py 只依赖标准库且只往 --out 目录写文件，
+      #      复制到 $dir 后自包含可跑。
       # ---------------------------------------------------------------
-      - name: g. R3 权限裁决：标准用户实测灌音
-        timeout-minutes: 10
+      - name: g. R3 权限裁决：标准用户 2×2 矩阵（会话0 + 交互会话）
+        timeout-minutes: 15
         run: |
           $user = 'womic-e2e-probe'
           $pass = 'Womic-Probe-2026!'
+          $ws = $env:GITHUB_WORKSPACE
+          # 计划任务的 cmd 环境不继承 Actions 进程 PATH，python 必须写绝对路径
+          $py = (Get-Command python).Source
+          if (-not $py) {
+            Write-Host "::error::g: 解析 python 绝对路径失败"
+            exit 1
+          }
           net user $user $pass /add | Out-Null
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::g: 创建标准用户失败"
@@ -497,36 +668,145 @@ jobs:
           $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
             $user, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
           Set-Acl $dir $acl
-          $bat = "$dir\run_probe.cmd"
-          # 不用 here-string：PowerShell here-string 的结束标记必须顶行首，
-          # 会截断 YAML 块标量。另外不要在多行 @(...) 里用 + 拼接字符串——
-          # 逗号之后的 + 连接会被解析成多个数组元素（pwsh 实测踩坑），
-          # 统一用插值 + 反引号转义引号。
-          $lines = @(
-            '@echo off',
-            "python client\tools\e2e_probe.py --seconds 3 --out `"$dir\probe`" > `"$dir\stdout.txt`" 2>&1",
-            "echo PROBE_EXIT=%ERRORLEVEL% >> `"$dir\stdout.txt`""
-          )
-          $lines | Set-Content -Path $bat -Encoding ascii
+          # 预建收证目录（Copy-Item 静默失败教训：先确保目标目录存在）
+          New-Item -ItemType Directory -Force -Path "$ws\probe-results\logs" | Out-Null
+          # 标准用户进不去 workspace（各级 ACL 只允许 runneradmin/Administrators/
+          # SYSTEM traverse）：由 elevated pwsh 把探针复制到已授权的 $dir，
+          # g1/g2 都从这里跑。复制后必须验证目标存在（Copy-Item 会静默失败）。
+          $probeSrc = "$ws\client\tools\e2e_probe.py"
+          $probeDst = "$dir\e2e_probe.py"
+          if (-not (Test-Path $probeSrc)) {
+            Write-Host "::error::g: 探针源文件不存在: $probeSrc"
+            exit 1
+          }
+          Copy-Item $probeSrc $probeDst -Force
+          if (-not (Test-Path $probeDst)) {
+            Write-Host "::error::g: 探针副本不存在（Copy-Item 静默失败？src=$probeSrc）"
+            exit 1
+          }
+
+          # ---- 公共小工具（本步骤作用域内复用；判据只看 RESULT= 行与 marker）----
+          function Write-ProbeBat($bat, $marker, $outDir, $stdoutTxt) {
+            # 探针跑在 $dir（已授权标准用户 Modify）里，不依赖 workspace；
+            # 所有输入输出路径均为绝对路径；goto 标签顶行首；cd 失败时写
+            # PROBE_EXIT=97（与"探针 FAIL"区分，便于定位是基础设施问题）。
+            $lines = @(
+              '@echo off',
+              'chcp 65001 >nul 2>&1',
+              'set PYTHONIOENCODING=utf-8',
+              "cd /d `"$dir`" || goto :fail",
+              "`"$py`" e2e_probe.py --seconds 3 --out `"$outDir`" > `"$stdoutTxt`" 2>&1",
+              'set RC=%ERRORLEVEL%',
+              "echo PROBE_EXIT=%RC% > `"$marker`"",
+              'exit /b %RC%',
+              ':fail',
+              "echo PROBE_EXIT=97 > `"$marker`"",
+              'exit /b 97'
+            )
+            $lines | Set-Content -Path $bat -Encoding ascii
+          }
+          function Wait-ProbeMarker($marker, $minutes) {
+            $deadline = (Get-Date).AddMinutes($minutes)
+            while (-not (Test-Path $marker) -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 3
+            }
+            return (Test-Path $marker)
+          }
+          function Get-ProbeExit($marker) {
+            if (-not (Test-Path $marker)) { return -1 }
+            $mm = [regex]::Match((Get-Content $marker -Raw), 'PROBE_EXIT=(\d+)')
+            if ($mm.Success) { return [int]$mm.Groups[1].Value }
+            return -1
+          }
+          function Get-ProbeVerdict($stdoutTxt) {
+            if (-not (Test-Path $stdoutTxt)) { return 'ERROR' }
+            $mm = [regex]::Match((Get-Content $stdoutTxt -Raw -Encoding utf8), 'RESULT=(PASS|FAIL)')
+            if ($mm.Success) { return $mm.Groups[1].Value }
+            return 'ERROR'
+          }
+          function Save-ProbeEvidence($stdoutTxt, $outDir, $logDst, $probeDst) {
+            # Copy-Item -ErrorAction SilentlyContinue 会吞错：复制后必须验证目标
+            if (Test-Path $stdoutTxt) {
+              Copy-Item $stdoutTxt $logDst -Force
+              if (-not (Test-Path $logDst)) {
+                Write-Host "::warning::g: 日志复制后仍不存在: $logDst"
+              }
+            } else {
+              Write-Host "::warning::g: 探针 stdout 不存在: $stdoutTxt"
+            }
+            if (Test-Path $outDir) {
+              New-Item -ItemType Directory -Force -Path $probeDst | Out-Null
+              Copy-Item "$outDir\*" $probeDst -Recurse -Force -ErrorAction SilentlyContinue
+              if (-not (Get-ChildItem $probeDst -ErrorAction SilentlyContinue)) {
+                Write-Host "::warning::g: 探针输出复制后为空: $probeDst"
+              }
+            } else {
+              Write-Host "::warning::g: 探针输出目录不存在: $outDir"
+            }
+          }
+
+          # ---- g1：标准用户 × 计划任务（Session 0）----
+          # /ru <标准用户> /rl limited：任务仍跑在 Session 0（非交互），
+          # 但身份是标准用户——与 f 的 (SYSTEM, s0) 只差用户权限一个变量。
+          $bat1 = "$dir\run_g1.cmd"
+          $marker1 = "$dir\g1_exit.txt"
+          $out1 = "$dir\probe-g1"
+          $so1 = "$dir\g1-stdout.txt"
+          if (Test-Path $marker1) { Remove-Item $marker1 -Force }
+          Write-ProbeBat $bat1 $marker1 $out1 $so1
+          # schtasks /run 是强制立即触发，不依赖 /st 计划时间——所以 /st 取
+          # 当前时间+1 分钟即可，无需处理跨天/已过期的边界
+          $st = (Get-Date).AddMinutes(1).ToString('HH:mm')
+          $tr1 = "cmd /c `"$bat1`""
+          & schtasks /create /tn WomicE2EG1 /tr $tr1 /sc once /st $st /ru $user /rp $pass /rl limited /f 2>&1 |
+            Out-String | Write-Host
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::g1: 创建计划任务失败（标准用户上下文）"
+            "ITEM_G1=ERROR" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          & schtasks /run /tn WomicE2EG1 2>&1 | Out-String | Write-Host
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::g1: 触发计划任务失败"
+            "ITEM_G1=ERROR" | Out-File -FilePath $env:GITHUB_ENV -Append
+            & schtasks /delete /tn WomicE2EG1 /f 2>&1 | Out-Null
+            exit 1
+          }
+          if (-not (Wait-ProbeMarker $marker1 4)) {
+            Write-Host "::error::g1: 计划任务探针 4 分钟超时（marker 未出现）"
+            & schtasks /query /tn WomicE2EG1 /fo LIST /v 2>&1 | Out-String | Write-Host
+            "ITEM_G1=ERROR" | Out-File -FilePath $env:GITHUB_ENV -Append
+            & schtasks /delete /tn WomicE2EG1 /f 2>&1 | Out-Null
+            exit 1
+          }
+          $exit1 = Get-ProbeExit $marker1
+          Save-ProbeEvidence $so1 $out1 "$ws\probe-results\logs\g1-e2e-probe-stduser-s0.txt" "$ws\probe-results\probe-stduser-s0"
+          $v1 = Get-ProbeVerdict $so1
+          "ITEM_G1=$v1" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "::notice::g1: 标准用户×会话0 灌音结果 = $v1（probe_exit=$exit1，R3 裁决数据）"
+          & schtasks /delete /tn WomicE2EG1 /f 2>&1 | Out-Null
+
+          # ---- g2：标准用户 × 交互会话（原有实现，保留作对照）----
+          $bat2 = "$dir\run_g2.cmd"
+          $marker2 = "$dir\g2_exit.txt"
+          $out2 = "$dir\probe-g2"
+          $so2 = "$dir\g2-stdout.txt"
+          if (Test-Path $marker2) { Remove-Item $marker2 -Force }
+          Write-ProbeBat $bat2 $marker2 $out2 $so2
           $sec = ConvertTo-SecureString $pass -AsPlainText -Force
           $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$user", $sec)
-          Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$bat`"" `
-            -Credential $cred -WorkingDirectory $env:GITHUB_WORKSPACE -Wait
-          $out = Get-Content "$dir\stdout.txt" -Raw -ErrorAction SilentlyContinue
-          $out | Out-File probe-results/logs/g-e2e-probe-stduser.txt -Encoding utf8
-          if (Test-Path "$dir\probe") {
-            New-Item -ItemType Directory -Force -Path probe-results/probe-stduser | Out-Null
-            Copy-Item "$dir\probe\*" probe-results/probe-stduser/ -Recurse -Force -ErrorAction SilentlyContinue
-          }
-          $m = [regex]::Match($out, 'RESULT=(PASS|FAIL)')
-          $res = if ($m.Success) { $m.Groups[1].Value } else { 'ERROR' }
-          "std_user_result=$res" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "::notice::g: 标准用户灌音结果 = $res（R3 裁决数据，详见 windows-e2e-report.md）"
-          if ($res -eq 'PASS') {
-            Write-Host "g: 标准用户灌音 PASS —— 灌音不需要管理员"
-          } else {
-            Write-Host "g: 标准用户灌音 $res —— 灌音链路在标准用户下不可用（裁决数据）"
-          }
+          Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$bat2`"" `
+            -Credential $cred -WorkingDirectory $dir -Wait
+          $exit2 = Get-ProbeExit $marker2
+          Save-ProbeEvidence $so2 $out2 "$ws\probe-results\logs\g2-e2e-probe-stduser-interactive.txt" "$ws\probe-results\probe-stduser-interactive"
+          $v2 = Get-ProbeVerdict $so2
+          "ITEM_G2=$v2" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "::notice::g2: 标准用户×交互会话 灌音结果 = $v2（probe_exit=$exit2，R3 裁决数据）"
+
+          # ---- 裁决汇总：2×2 矩阵 + 历史记录 ----
+          $fRes = if ($env:ITEM_F) { $env:ITEM_F } else { 'n/a' }
+          Write-Host "g: 2×2 裁决矩阵 {(SYSTEM,s0)=$fRes, (std,s0)=$v1, (std,interactive)=$v2}；历史 (elevated,interactive)=FAIL（run 39901322823）"
+          Write-Host "::notice::g: 若 g1/g2 分化而 f=PASS，结论=灌音约束取决于会话上下文而非用户权限"
           # g 是裁决记录步骤：探针 FAIL 不失败作业（结论写报告），显式 exit 0
           exit 0
 
@@ -575,8 +855,9 @@ jobs:
             'c 未装驱动 status=3'     = $(if ($env:ITEM_C) { $env:ITEM_C } else { 'n/a' })
             'd 驱动安装系统状态'      = $(if ($env:INSTALL_STATE) { $env:INSTALL_STATE } else { 'n/a' })
             'e 已装驱动 status=0'     = $(if ($env:ITEM_E) { $env:ITEM_E } else { 'n/a' })
-            'f 端到端灌音（核心）'    = $(if ($env:ITEM_F) { $env:ITEM_F } else { 'n/a' })
-            'g 标准用户灌音裁决'      = $(if ($env:STD_USER_RESULT) { $env:STD_USER_RESULT } else { 'n/a' })
+            'f 端到端灌音（核心）'     = $(if ($env:ITEM_F) { $env:ITEM_F } else { 'n/a' })
+            'g1 标准用户×会话0 灌音'   = $(if ($env:ITEM_G1) { $env:ITEM_G1 } else { 'n/a' })
+            'g2 标准用户×交互会话 灌音' = $(if ($env:ITEM_G2) { $env:ITEM_G2 } else { 'n/a' })
             'h GUI 冒烟（6s 存活）'   = $(if ($env:ITEM_H) { $env:ITEM_H } else { 'n/a' })
           }
           $md = @()
@@ -587,6 +868,13 @@ jobs:
           foreach ($k in $rows.Keys) { $md += "| $k | $($rows[$k]) |" }
           $md += ''
           $md += "客户端自助安装退出码: $env:CLIENT_INSTALL_EXIT（UAC 行为实录见报告）"
+          # R3 2×2 裁决矩阵：(SYSTEM,s0)=f / (std,s0)=g1 / (std,interactive)=g2；
+          # 历史 (elevated,interactive)=FAIL（run 39901322823）。矩阵齐备时
+          # 结论应为"灌音约束取决于会话上下文而非用户权限"。
+          $g1s = $(if ($env:ITEM_G1) { $env:ITEM_G1 } else { 'n/a' })
+          $g2s = $(if ($env:ITEM_G2) { $env:ITEM_G2 } else { 'n/a' })
+          $fs = $(if ($env:ITEM_F) { $env:ITEM_F } else { 'n/a' })
+          $md += "R3 2×2 裁决矩阵: (SYSTEM,s0)=$fs ; (std,s0)=$g1s ; (std,interactive)=$g2s ; 历史(elevated,interactive)=FAIL"
           $md | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           # 同步落一份到 probe-results 根：既保证 upload-artifact 的
           # 公共祖先目录是 probe-results（否则只有 logs/ 有文件时 artifact
