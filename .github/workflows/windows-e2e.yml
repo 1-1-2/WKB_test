@@ -1,0 +1,518 @@
+name: windows-e2e
+
+# Windows 客户端真机端到端验证（WO Mic Link）。
+#
+# 背景：客户端（womic.exe）此前只做过 wine 级验证，从未在真实 Windows 上
+# 端到端跑过。本作业分两段：
+#   build   —— ubuntu 上交叉编译（装 mingw、现场取官方驱动打内置包、静态编
+#              libopus），产出 womic.exe + test_drvpkg.exe + 解出的驱动三件套；
+#   verify  —— windows-latest 真机上逐项验证 CLI 行为、驱动安装、灌音闭环、
+#              标准用户权限裁决（R3）与 GUI 冒烟。
+#
+# 为什么驱动要"现场从官方安装包提取"：womic.sys 等第三方已签名驱动二进制不进
+# 源码库（法律决策 R8），构建时从官方安装包解出，并校验 womic_1.sys 的
+# sha256 锚定基线（75f080f2...）。
+#
+# 触发范围：客户端源码/工具/本 workflow 变更即验证；其余情况手动触发。
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'client/**'
+      - 'tools/**'
+      - '.github/workflows/windows-e2e.yml'
+
+# 同一分支连续 push 取消上一轮（省 runner 分钟）；手动触发的验证不取消别人。
+concurrency:
+  group: windows-e2e-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  build:
+    name: 交叉构建（Linux → Windows x64）
+    runs-on: ubuntu-latest
+    # 装工具链 ~1min + 下载安装包 ~10s + 编 libopus ~6min + 编 exe ~1min；
+    # 30min 是宽松上限，正常 10min 内。
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # ---------------------------------------------------------------
+      # 1. 交叉编译工具链。objdump 也要（build.sh 的导入表自检用它，
+      #    gcc-mingw-w64-x86-64 会带上 binutils-mingw-w64-x86-64）。
+      # ---------------------------------------------------------------
+      - name: 安装交叉编译工具链
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-mingw-w64-x86-64
+          x86_64-w64-mingw32-gcc --version | head -1
+          x86_64-w64-mingw32-objdump --version | head -1
+          if ! command -v 7z >/dev/null 2>&1; then
+            # p7zip-full（老 7z）优先，装不上再试新 7zip 包
+            sudo apt-get install -y -qq p7zip-full || sudo apt-get install -y -qq 7zip
+          fi
+          7z | head -2 || { echo "::error::7z 不可用"; exit 1; }
+
+      # ---------------------------------------------------------------
+      # 2. 下载官方安装包并校验大小（1743456 B，Client 6.3 / Driver 2.1.0.0）。
+      #    大小是第一道闸：拦 CDN 劫持/占位页/版本漂移。
+      # ---------------------------------------------------------------
+      - name: 下载官方安装包并校验大小
+        shell: bash
+        run: |
+          curl -sSL --retry 3 -o WOMicClientSetup6.3.exe \
+            https://wolicheng.com/womic/downloads/WOMicClientSetup6.3.exe
+          sz=$(stat -c %s WOMicClientSetup6.3.exe)
+          echo "安装包大小: $sz B"
+          if [ "$sz" != "1743456" ]; then
+            echo "::error::官方安装包大小 $sz ≠ 1743456（下载不完整或被篡改）"
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------
+      # 3. 解出三套官方 2022 驱动并校验 sha256。
+      #
+      #    ⚠ 必须加 -aou（auto-rename）：NSIS 包里 driver/womic.* 有 7 组同名
+      #    文件（2022 三套 x86/amd64/arm64 + 2017 四套），默认覆盖模式只剩
+      #    最后一组（2017 版）。加 -aou 后重名按存档顺序依次改名
+      #    womic_1/womic_2/...，与恢复仓库实证一致：womic=2022x86、
+      #    womic_1=2022amd64、womic_2=2022arm64、womic_3..6=2017。
+      # ---------------------------------------------------------------
+      - name: 解出官方驱动并校验 sha256
+        shell: bash
+        run: |
+          rm -rf installer-extract womic-driver
+          mkdir -p womic-driver
+          7z x -aou -y WOMicClientSetup6.3.exe -oinstaller-extract >7z.log 2>&1 || {
+            echo "::error::7z 解包失败"; tail -20 7z.log; exit 1; }
+          for f in womic.inf womic.sys womic.cat \
+                   womic_1.inf womic_1.sys womic_1.cat \
+                   womic_2.inf womic_2.sys womic_2.cat; do
+            src="installer-extract/driver/$f"
+            if [ ! -f "$src" ]; then
+              echo "::error::解出结果缺少 $f（-aou 重名改名行为异常？）"
+              ls -la installer-extract/driver/ || true
+              exit 1
+            fi
+            cp "$src" womic-driver/
+          done
+          got=$(sha256sum womic-driver/womic_1.sys | cut -d' ' -f1)
+          echo "womic_1.sys sha256: $got"
+          if [ "$got" != "75f080f206ff0c13701ff66388c4a404529d9ec71b2ba0f1fadd4b71481c0475" ]; then
+            echo "::error::womic_1.sys 哈希不符（官方 2022 amd64 基线必须是 75f080f2...0475）"
+            exit 1
+          fi
+          ls -la womic-driver/
+
+      # ---------------------------------------------------------------
+      # 4. 生成内置驱动包（src/drvpkg_data.h + res/drvpkg.bin + res/app.ico）。
+      #    驱动二进制只在构建机内存里过一遍，不落源码库。
+      # ---------------------------------------------------------------
+      - name: 生成内置驱动包
+        shell: bash
+        working-directory: client
+        run: |
+          python3 tools/pack_driver.py --driver-dir ../womic-driver
+
+      # ---------------------------------------------------------------
+      # 5. 静态交叉编 libopus（只 decoder 会被链接进来，约 140KB）。
+      # ---------------------------------------------------------------
+      - name: 静态构建 libopus
+        shell: bash
+        working-directory: client
+        timeout-minutes: 15
+        run: bash tools/build_opus.sh
+
+      # ---------------------------------------------------------------
+      # 6. 编译 womic.exe（~396KB）与 test_drvpkg.exe。
+      #    体积预算 450KiB + 导入表全系统 DLL 的自检在 build.sh 里，
+      #    不重复造轮子；这里只保证退出码传播。
+      # ---------------------------------------------------------------
+      - name: 交叉编译 womic.exe 与解压自检程序
+        shell: bash
+        working-directory: client
+        run: |
+          bash build.sh
+          bash build.sh test
+
+      # ---------------------------------------------------------------
+      # 7. 整理产物：exe ×2 + 解出的驱动目录（verify 作业的 pnputil 兜底要用）。
+      # ---------------------------------------------------------------
+      - name: 整理构建产物
+        shell: bash
+        run: |
+          mkdir -p dist/womic-driver
+          cp client/build/womic.exe client/build/test_drvpkg.exe dist/
+          cp womic-driver/* dist/womic-driver/
+          ls -la dist dist/womic-driver
+          for f in dist/womic.exe dist/test_drvpkg.exe; do
+            [ -f "$f" ] || { echo "::error::缺少产物 $f"; exit 1; }
+          done
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: womic-e2e-build
+          path: |
+            dist/womic.exe
+            dist/test_drvpkg.exe
+            dist/womic-driver/
+          if-no-files-found: error
+          retention-days: 3
+
+  verify:
+    name: 真机端到端验证（windows-latest）
+    needs: build
+    runs-on: windows-latest
+    # 驱动安装 ~1min + 灌音取证 ~1min + R3 标准用户 ~2min + 余量；40min 宽松上限。
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # 为什么 checkout：e2e_probe.py 从仓库取（它本身也是被验证对象之一）。
+      - uses: actions/checkout@v7
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@v8
+        with:
+          name: womic-e2e-build
+          path: dist
+
+      # ---------------------------------------------------------------
+      # 0. 环境自检 + 建收证目录。后续每个步骤的文本输出都进
+      #    probe-results/logs/，最后统一传 artifact。
+      # ---------------------------------------------------------------
+      - name: 0. 环境自检（python / 系统信息）
+        run: |
+          New-Item -ItemType Directory -Force -Path probe-results/logs | Out-Null
+          python --version
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::0: python 不可用"; exit 1 }
+          "OS: $([System.Environment]::OSVersion.VersionString)" |
+            Tee-Object probe-results/logs/0-env.txt
+
+      # ---------------------------------------------------------------
+      # a. 内置驱动包 inflate 字节级自检：9 个文件（3 架构 × inf/sys/cat）
+      #    的长度 + FNV-1a-64 必须全对，退出码 0。解压错一个字节，装驱动
+      #    就会以 0xE000024B/0xE0000242 失败，真机上排查成本极高。
+      # ---------------------------------------------------------------
+      - name: a. test_drvpkg.exe 驱动包解压自检（须 9/9）
+        timeout-minutes: 5
+        run: |
+          $out = & .\dist\test_drvpkg.exe 2>&1
+          $rc = $LASTEXITCODE
+          $out | Tee-Object -FilePath probe-results/logs/a-test_drvpkg.txt
+          $okN = ($out | Where-Object { $_ -match '^ok  : arch=' }).Count
+          "exit=$rc ok_lines=$okN" | Out-File probe-results/logs/a-test_drvpkg.txt -Append
+          if ($rc -ne 0 -or $okN -ne 9 -or ($out -join "`n") -notmatch 'RESULT=PASS') {
+            Write-Host "::error::a: test_drvpkg 未 9/9 PASS（exit=$rc, ok=$okN）"
+            "ITEM_A=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          "ITEM_A=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ---------------------------------------------------------------
+      # b. CLI 说明书完整：--help 退出码 0，且关键选项都在。
+      #    判据是"用户能查到用法"，不是实现细节。
+      # ---------------------------------------------------------------
+      - name: b. womic.exe --help CLI 说明书完整性
+        timeout-minutes: 5
+        run: |
+          $out = & .\dist\womic.exe --help 2>&1
+          $rc = $LASTEXITCODE
+          $txt = $out -join "`n"
+          $txt | Out-File probe-results/logs/b-help.txt -Encoding utf8
+          $miss = @()
+          foreach ($opt in @('--status', '--install-driver', '--driver-pack', '--connect')) {
+            if ($txt -notmatch [regex]::Escape($opt)) { $miss += $opt }
+          }
+          if ($rc -ne 0 -or $miss.Count -gt 0) {
+            Write-Host "::error::b: --help 退出码=$rc，缺少选项: $($miss -join ' ')"
+            "ITEM_B=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          Write-Host "b: 帮助文本完整（退出码 $rc）"
+          "ITEM_B=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ---------------------------------------------------------------
+      # c. 未装驱动时 --status 必须退出码 3（驱动未就绪）且带架构信息。
+      #    注意：不断言 "SYS 落盘=否" 之类环境相关细节，只验契约。
+      # ---------------------------------------------------------------
+      - name: c. 未装驱动 --status 退出码 3 + 架构信息
+        timeout-minutes: 5
+        run: |
+          $out = & .\dist\womic.exe --status 2>&1
+          $rc = $LASTEXITCODE
+          $txt = $out -join "`n"
+          $txt | Out-File probe-results/logs/c-status-preinstall.txt -Encoding utf8
+          if ($rc -ne 3) {
+            Write-Host "::error::c: 未装驱动时 --status 退出码 $rc ≠ 3"
+            "ITEM_C=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          if ($txt -notmatch '架构') {
+            Write-Host "::error::c: --status 输出缺少架构信息"
+            "ITEM_C=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          Write-Host "c: 退出码 3 + 架构信息在（符合驱动未装契约）"
+          "ITEM_C=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ---------------------------------------------------------------
+      # d1. 客户端自助安装驱动。
+      #
+      #     UAC 行为实录要点：GitHub windows runner 的步骤本身运行在提权
+      #     上下文里，客户端 drv_is_elevated() 通常直接返回真、不走
+      #     ShellExecute(runas) 弹窗；但若非交互 CI 下 UAC 被挂起/取消，
+      #     ShellExecuteW 仍可能返回 >32（父进程误以为成功、退出码 0），
+      #     所以**退出码 0 不算数**，一律以 d2 的系统状态为准。
+      #     本步骤是任务书唯一允许的 continue-on-error 例外（兜底路径），
+      #     失败会打 ::warning:: 显式记录，不掩盖问题。
+      # ---------------------------------------------------------------
+      - name: d1. 客户端自助安装驱动（记录 UAC/非交互行为）
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          $out = & .\dist\womic.exe --install-driver 2>&1
+          $rc = $LASTEXITCODE
+          $out | Tee-Object -FilePath probe-results/logs/d1-install-client.txt
+          "client_install_exit=$rc" | Out-File probe-results/logs/d1-install-client.txt -Append
+          "client_install_exit=$rc" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if ($rc -eq 0) {
+            Write-Host "d1: 客户端自助安装退出码 0（是否真装上以 d2 系统状态为准）"
+          } else {
+            Write-Host "::warning::d1: 客户端自助安装退出码 $rc —— 记录在案，由 d2/d3 兜底（UAC 非交互行为详见报告）"
+          }
+
+      # ---------------------------------------------------------------
+      # d2. 以系统状态验证驱动是否真的装上（不看任何安装工具输出——
+      #     devcon 会先打 "Device node created" 再选驱动，失败也是这句）。
+      #     判据两条：womic.sys 落盘 System32\drivers + 注册表
+      #     InfPath 非空（MatchingDeviceId 含 WOMic 的媒体类设备节点）。
+      #     本步骤不判失败，只写 install_state 供 d3 决策。
+      # ---------------------------------------------------------------
+      - name: d2. 验证驱动系统状态（SYS 落盘 + 注册表 InfPath）
+        timeout-minutes: 5
+        run: |
+          $sysOnDisk = Test-Path "$env:SystemRoot\System32\drivers\womic.sys"
+          $infPath = ""
+          $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e96c-e325-11ce-bfc1-08002be10318}'
+          Get-ChildItem $classKey -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+            if ($p -and $p.MatchingDeviceId -match 'WOMic' -and $p.InfPath) {
+              $infPath = $p.InfPath
+            }
+          }
+          $state = if ($sysOnDisk -and $infPath) { 'ok' } else { 'bad' }
+          "sys_on_disk=$sysOnDisk inf_path=$infPath state=$state" |
+            Tee-Object probe-results/logs/d2-system-state.txt
+          "install_state=$state" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if ($state -eq 'ok') {
+            Write-Host "d2: 驱动已就位（SYS 落盘 + InfPath=$infPath）"
+          } else {
+            Write-Host "::warning::d2: 系统状态不完整（SYS=$sysOnDisk, InfPath='$infPath'），转 d3 兜底"
+          }
+
+      # ---------------------------------------------------------------
+      # d3. UAC 兜底路径（仅当 d2 判定未装上时执行）：
+      #     pnputil /add-driver 先把 INF+CAT 登进 DriverStore（治
+      #     0xE0000242 签名者不受信），再重试客户端安装（它负责创建
+      #     root devnode，pnputil 自己不建）。最终仍以系统状态为准，
+      #     不达标即 ::error:: 并失败作业。
+      # ---------------------------------------------------------------
+      - name: d3. pnputil 兜底安装（仅 d2 未通过时）
+        if: env.install_state != 'ok'
+        timeout-minutes: 10
+        run: |
+          Write-Host "d3: 走兜底路径（pnputil /add-driver + 重试客户端安装）"
+          pnputil /add-driver "$env:GITHUB_WORKSPACE\dist\womic-driver\womic.inf" /install 2>&1 |
+            Tee-Object -FilePath probe-results/logs/d3-pnputil.txt
+          $out = & .\dist\womic.exe --install-driver 2>&1
+          $rc = $LASTEXITCODE
+          $out | Tee-Object -FilePath probe-results/logs/d3-install-retry.txt
+          "retry_exit=$rc" | Out-File probe-results/logs/d3-install-retry.txt -Append
+          $sysOnDisk = Test-Path "$env:SystemRoot\System32\drivers\womic.sys"
+          $infPath = ""
+          $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e96c-e325-11ce-bfc1-08002be10318}'
+          Get-ChildItem $classKey -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+            if ($p -and $p.MatchingDeviceId -match 'WOMic' -and $p.InfPath) { $infPath = $p.InfPath }
+          }
+          if (-not $sysOnDisk -or -not $infPath) {
+            Write-Host "::error::d3: 兜底后驱动仍未就位（SYS=$sysOnDisk, InfPath='$infPath'）"
+            "ITEM_D=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          Write-Host "d3: 兜底安装成功（InfPath=$infPath）"
+          "ITEM_D=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ---------------------------------------------------------------
+      # e. 安装后 --status 必须退出码 0，输出含"已就绪"且 INF 路径非空。
+      # ---------------------------------------------------------------
+      - name: e. 安装后 --status 退出码 0 + 驱动就绪
+        timeout-minutes: 5
+        run: |
+          $out = & .\dist\womic.exe --status 2>&1
+          $rc = $LASTEXITCODE
+          $txt = $out -join "`n"
+          $txt | Out-File probe-results/logs/e-status-postinstall.txt -Encoding utf8
+          if ($rc -ne 0) {
+            Write-Host "::error::e: 安装后 --status 退出码 $rc ≠ 0"
+            "ITEM_E=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          if ($txt -notmatch '已就绪') {
+            Write-Host "::error::e: --status 未报告驱动已就绪"
+            "ITEM_E=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          if ($txt -match 'INF 路径\s*:\s*\(无\)') {
+            Write-Host "::error::e: --status 的 INF 路径为空"
+            "ITEM_E=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          Write-Host "e: 驱动已就绪，INF 路径非空（退出码 0）"
+          "ITEM_E=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ---------------------------------------------------------------
+      # f. 【核心】端到端灌音：e2e_probe 以真实 waveIn 录音 + Goertzel
+      #    判 1kHz 正弦。IOCTL 0x222001 恒定返回 FALSE+gle=1（驱动防
+      #    逆向），所以判据不是 IOCTL 状态码，而是实际录音效果：
+      #    RESULT=PASS（设备枚举 + 句柄 + RMS + 主峰 1kHz + SNR）。
+      # ---------------------------------------------------------------
+      - name: f. 端到端灌音验证（e2e_probe，须 RESULT=PASS）
+        timeout-minutes: 8
+        run: |
+          $out = & python client/tools/e2e_probe.py --seconds 3 --out probe-results/probe 2>&1
+          $rc = $LASTEXITCODE
+          $txt = $out -join "`n"
+          $txt | Out-File probe-results/logs/f-e2e-probe.txt -Encoding utf8
+          if ($rc -ne 0 -or $txt -notmatch 'RESULT=PASS') {
+            Write-Host "::error::f: e2e_probe 未 PASS（exit=$rc）——灌音闭环失败"
+            "ITEM_F=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          Write-Host "f: 灌音闭环 PASS（waveIn 录到 1kHz 正弦）"
+          "ITEM_F=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ---------------------------------------------------------------
+      # g. R3 权限裁决：建标准用户，以其身份跑同一探针，记录 PASS/FAIL。
+      #    结论写进报告（灌音是否需要管理员）。这是裁决记录而非通过性
+      #    门禁——所以探针 FAIL 不失败作业，但用户创建等基础设施错误要失败。
+      #    注意：Start-Process -Credential 不能与 -RedirectStandardOutput
+      #    共用（参数集冲突），用 cmd /c 包一层在目标用户上下文里重定向。
+      # ---------------------------------------------------------------
+      - name: g. R3 权限裁决：标准用户实测灌音
+        timeout-minutes: 10
+        run: |
+          $user = 'womic-e2e-probe'
+          $pass = 'Womic-Probe-2026!'
+          net user $user $pass /add | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::g: 创建标准用户失败"
+            exit 1
+          }
+          $dir = "$env:TEMP\womic-stduser"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          # 标准用户对默认 TEMP 子目录未必有写权限，显式授权
+          $acl = Get-Acl $dir
+          $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $user, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+          Set-Acl $dir $acl
+          $bat = "$dir\run_probe.cmd"
+          # 不用 here-string：PowerShell here-string 的结束标记必须顶行首，
+          # 会截断 YAML 块标量。另外不要在多行 @(...) 里用 + 拼接字符串——
+          # 逗号之后的 + 连接会被解析成多个数组元素（pwsh 实测踩坑），
+          # 统一用插值 + 反引号转义引号。
+          $lines = @(
+            '@echo off',
+            "python client\tools\e2e_probe.py --seconds 3 --out `"$dir\probe`" > `"$dir\stdout.txt`" 2>&1",
+            "echo PROBE_EXIT=%ERRORLEVEL% >> `"$dir\stdout.txt`""
+          )
+          $lines | Set-Content -Path $bat -Encoding ascii
+          $sec = ConvertTo-SecureString $pass -AsPlainText -Force
+          $cred = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$user", $sec)
+          Start-Process -FilePath 'cmd.exe' -ArgumentList "/c `"$bat`"" `
+            -Credential $cred -WorkingDirectory $env:GITHUB_WORKSPACE -Wait
+          $out = Get-Content "$dir\stdout.txt" -Raw -ErrorAction SilentlyContinue
+          $out | Out-File probe-results/logs/g-e2e-probe-stduser.txt -Encoding utf8
+          if (Test-Path "$dir\probe") {
+            Copy-Item "$dir\probe\*" probe-results/probe-stduser/ -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          $m = [regex]::Match($out, 'RESULT=(PASS|FAIL)')
+          $res = if ($m.Success) { $m.Groups[1].Value } else { 'ERROR' }
+          "std_user_result=$res" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "::notice::g: 标准用户灌音结果 = $res（R3 裁决数据，详见 windows-e2e-report.md）"
+          if ($res -eq 'PASS') {
+            Write-Host "g: 标准用户灌音 PASS —— 灌音不需要管理员"
+          } else {
+            Write-Host "g: 标准用户灌音 $res —— 灌音链路在标准用户下不可用（裁决数据）"
+          }
+
+      # ---------------------------------------------------------------
+      # h. GUI 冒烟：无参启动 6 秒后进程仍活着（-mwindows 双击不闪黑窗
+      #    的形态也要在真机上验一次）。主窗口标题可选打印作参考。
+      # ---------------------------------------------------------------
+      - name: h. GUI 冒烟：无参启动 6 秒进程存活
+        timeout-minutes: 5
+        run: |
+          $p = Start-Process -FilePath "$env:GITHUB_WORKSPACE\dist\womic.exe" `
+            -WorkingDirectory "$env:GITHUB_WORKSPACE\dist" -PassThru
+          Start-Sleep -Seconds 6
+          $proc = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
+          $alive = $null -ne $proc
+          $title = if ($proc) { $proc.MainWindowTitle } else { '' }
+          "alive=$alive title='$title'" | Tee-Object probe-results/logs/h-gui-smoke.txt
+          if (-not $alive) {
+            Write-Host "::error::h: womic.exe 启动 6 秒后进程退出（GUI 冒烟失败）"
+            "ITEM_H=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          Stop-Process -Id $p.Id -Force
+          Write-Host "h: GUI 存活 6s（主窗口标题='$title'）"
+          "ITEM_H=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # ---------------------------------------------------------------
+      # i. 汇总：把各项结论写进 Step Summary（含 a 的判定从日志里读），
+      #    所有文本输出与 e2e_probe 的 JSON/wav 由下面的上传步骤收进
+      #    artifact（失败也传，便于诊断）。
+      # ---------------------------------------------------------------
+      - name: i. 汇总验证结论
+        if: always()
+        run: |
+          # a 的结论从其日志的最后一行读（exit=/ok_lines=），其余项来自各步骤
+          # 写入 GITHUB_ENV 的 ITEM_* 变量；没跑到的步骤显示为 n/a。
+          $itemA = 'n/a'
+          if (Test-Path probe-results/logs/a-test_drvpkg.txt) {
+            $last = Get-Content probe-results/logs/a-test_drvpkg.txt | Select-Object -Last 1
+            if ($last -match 'ok_lines=9') { $itemA = 'PASS' } else { $itemA = "FAIL ($last)" }
+          }
+          $rows = [ordered]@{
+            'a 驱动包解压自检（9/9）' = $itemA
+            'b CLI 帮助文本完整'      = $(if ($env:ITEM_B) { $env:ITEM_B } else { 'n/a' })
+            'c 未装驱动 status=3'     = $(if ($env:ITEM_C) { $env:ITEM_C } else { 'n/a' })
+            'd 驱动安装系统状态'      = $(if ($env:INSTALL_STATE) { $env:INSTALL_STATE } else { 'n/a' })
+            'e 已装驱动 status=0'     = $(if ($env:ITEM_E) { $env:ITEM_E } else { 'n/a' })
+            'f 端到端灌音（核心）'    = $(if ($env:ITEM_F) { $env:ITEM_F } else { 'n/a' })
+            'g 标准用户灌音裁决'      = $(if ($env:STD_USER_RESULT) { $env:STD_USER_RESULT } else { 'n/a' })
+            'h GUI 冒烟（6s 存活）'   = $(if ($env:ITEM_H) { $env:ITEM_H } else { 'n/a' })
+          }
+          $md = @()
+          $md += '## Windows E2E 验证结论'
+          $md += ''
+          $md += '| 验证项 | 结果 |'
+          $md += '|---|---|'
+          foreach ($k in $rows.Keys) { $md += "| $k | $($rows[$k]) |" }
+          $md += ''
+          $md += "客户端自助安装退出码: $env:CLIENT_INSTALL_EXIT（UAC 行为实录见报告）"
+          $md | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Upload probe results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: womic-e2e-results
+          path: probe-results/
+          if-no-files-found: warn
+          retention-days: 7
