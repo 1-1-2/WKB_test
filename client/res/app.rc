@@ -20,13 +20,12 @@ IDI_APP ICON "app.ico"
 1        ICON "app.ico"
 
 /* ------------------------------------------------- 内置驱动包（RT_RCDATA） */
-/* 与 src/drvpkg_data.h 同源（tools/pack_driver.py 一起生成）。
- * drvpkg.c 优先从这里读；资源缺失时回退到 C 数组，两条路径数据完全一致。
- *
- * 注意 res/drvpkg.bin 不入库（第三方已签名驱动二进制，架构文档 R8）：干净检出时
- * 由 build.sh 先尝试真实打包，找不到官方驱动目录就用 --empty 生成 16 字节空包
- * （magic 正确、ver=1、count=0）兜底，因此本引用永远有文件可编。 */
-101      RCDATA "drvpkg.bin"        /* IDR_DRVPKG = 101，见 src/drvpkg.c */
+/* ⚠ 这一行曾经是 `101 RCDATA "drvpkg.bin"`，现已移除：应用本体**不再内置**
+ * 任何第三方驱动二进制（它们只随驱动安装器 womic-drvinst.exe 分发，见
+ * res/drvinst.rc）。src/drvpkg.c 仍被编译进应用（架构判定与 drvpkg_origin()
+ * 的展示要用），但它找不到 RT_RCDATA 资源时只会如实报「未内置驱动包」，
+ * 不会报错、不卡启动。--install-driver 也早已改为转发给安装器（drvbridge）。
+ * build.sh 的资源自检会**反向**断言：本 exe 的 .rsrc 里不许出现 MICLDRV1。 */
 
 /* ---------------------------------------------------------------- manifest */
 1 RT_MANIFEST "app.manifest"
@@ -53,7 +52,7 @@ BEGIN
             VALUE "OriginalFilename", "womic.exe\0"
             VALUE "ProductName",      "WO Mic Link\0"
             VALUE "ProductVersion",   "1.1.0.0\0"
-            VALUE "Comments",         "Bundled driver: womic.sys 2.1.0.0 by Wolicheng, https://www.wolicheng.com/womic/ - unmodified, WHCP signed.\0"
+            VALUE "Comments",         "Virtual microphone client. Driver (womic.sys 2.1.0.0 by Wolicheng, https://www.wolicheng.com/womic/ - unmodified, WHCP signed) is installed separately by womic-drvinst.exe.\0"
         END
     END
     BLOCK "VarFileInfo"

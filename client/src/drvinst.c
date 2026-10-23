@@ -42,6 +42,15 @@ static wchar_t g_lastdir[MAX_PATH];   /* 本次释放目录，成功后清理 */
 const char *drv_last_error(void)     { return g_err; }
 const wchar_t *drv_last_error_w(void) { return g_errw; }
 
+/* drvpkg 的错误串是 UTF-8 字节流。直接用 %hs 塞进宽格式串会按当前 locale
+ * （这里是 C）做 ANSI→宽字符转换，中文变乱码（"\xe4\xb8\xad" 被当 Latin-1）。
+ * 显式按 CP_UTF8 转成宽串、再用 %ls 拼，链路两端才一致。 */
+static void u8_to_w(const char *u8, wchar_t *out, int cap)
+{
+    if (MultiByteToWideChar(CP_UTF8, 0, u8, -1, out, cap) <= 0) out[0] = 0;
+    out[cap - 1] = 0;
+}
+
 static void set_errw(const wchar_t *fmt, ...)
 {
     va_list ap;
@@ -385,21 +394,27 @@ int drv_install(void)
     drvpkg_target_dir(arch, dir, MAX_PATH);
     wcsncpy(g_lastdir, dir, MAX_PATH - 1);
     if (g_extpack[0]) {
+        wchar_t pkgerr[512];
         if (!drvpkg_extract_dir(g_extpack, dir, 1)) {
-            set_errw(L"从外部驱动包 %ls 释放失败：%hs", g_extpack, drvpkg_last_error());
+            u8_to_w(drvpkg_last_error(), pkgerr, 512);
+            set_errw(L"从外部驱动包 %ls 释放失败：%ls", g_extpack, pkgerr);
             return 0;
         }
     } else {
         /* 空包构建（源码库不内置第三方驱动二进制）时的降级路径：
          * 提前给出可操作的提示，不要走到解压阶段才报一句看不懂的错。 */
+        /* drv_install 现在只有安装器会走（应用侧已全部转发），因此这里按
+         * 安装器的开关名提示，避免用户照抄到应用上得不到结果。 */
         if (!drvpkg_available(arch)) {
-            set_errw(L"本 exe 未内置驱动包（空包构建）：请用 --driver-pack <dir> 指定"
+            set_errw(L"本 exe 未内置驱动包（空包构建）：请用 /driver-pack <dir> 指定"
                      L"驱动目录（需 womic.inf/womic.sys/womic.cat 三件套），"
                      L"或从官方渠道 wolicheng.com/womic 获取驱动后重新打包");
             return 0;
         }
         if (!drvpkg_extract(arch, dir, 1)) {
-            set_errw(L"释放内置驱动包失败：%hs", drvpkg_last_error());
+            wchar_t pkgerr[512];
+            u8_to_w(drvpkg_last_error(), pkgerr, 512);
+            set_errw(L"释放内置驱动包失败：%ls", pkgerr);
             return 0;
         }
     }

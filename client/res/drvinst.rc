@@ -1,0 +1,62 @@
+/* res/drvinst.rc — 驱动安装器（womic-drvinst.exe）的资源
+ *
+ * 与 res/app.rc 的差异只有三点：
+ *   1. manifest 是 requireAdministrator（应用是 asInvoker）——装驱动必须提权；
+ *   2. **只有这里**带 101 RCDATA drvpkg.bin：第三方已签名驱动二进制只随
+ *      安装器分发，应用本体一个第三方字节都不带（这是本次拆分的全部意义）；
+ *   3. OriginalFilename / InternalName / FileDescription 指向安装器自身。
+ *
+ * 其余（图标、冰蓝/版本块结构、全 ASCII 约束）与应用保持一致。
+ * 用 x86_64-w64-mingw32-windres 编成 COFF 后链进 exe。
+ */
+#include <winresrc.h>
+
+#define VER_MAJOR 1
+#define VER_MINOR 1
+#define VER_PATCH 0
+#define VER_BUILD 0
+
+/* ------------------------------------------------------------------ 图标 */
+IDI_APP ICON "app.ico"
+1        ICON "app.ico"
+
+/* ------------------------------------------------- 内置驱动包（RT_RCDATA） */
+/* res/drvpkg.bin 由 tools/pack_driver.py 生成；找不到官方驱动目录时是 16 字节
+ * 空包（magic MICLDRV1 / ver=1 / count=0）。两种形态都能编进去：
+ * 空包下 /install 会明确报错、/status 照实返回未安装，不会静默成功。
+ * IDR_DRVPKG = 101，见 src/drvpkg.c。 */
+101      RCDATA "drvpkg.bin"
+
+/* ---------------------------------------------------------------- manifest */
+1 RT_MANIFEST "drvinst.manifest"
+
+/* ----------------------------------------------------------- 版本信息 */
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    VER_MAJOR, VER_MINOR, VER_PATCH, VER_BUILD
+PRODUCTVERSION VER_MAJOR, VER_MINOR, VER_PATCH, VER_BUILD
+FILEFLAGSMASK  0x3fL
+FILEFLAGS      0x0L
+FILEOS         0x40004L      /* VOS_NT_WINDOWS32 */
+FILETYPE       0x1L          /* VFT_APP */
+FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"     /* lang-US, Unicode */
+        BEGIN
+            VALUE "CompanyName",      "MicLink open source project\0"
+            VALUE "FileDescription",  "WO Mic Link driver installer - install/uninstall/query the virtual microphone driver\0"
+            VALUE "FileVersion",      "1.1.0.0\0"
+            VALUE "InternalName",     "womic-drvinst\0"
+            VALUE "LegalCopyright",   "Client (C) MicLink. Driver womic.sys (C) Wolicheng.\0"
+            VALUE "OriginalFilename", "womic-drvinst.exe\0"
+            VALUE "ProductName",      "WO Mic Link\0"
+            VALUE "ProductVersion",   "1.1.0.0\0"
+            VALUE "Comments",         "Installs womic.sys 2.1.0.0 by Wolicheng, https://www.wolicheng.com/womic/ - unmodified, WHCP signed.\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -13,6 +13,7 @@
 #include "ui_help.h"
 #include "cli.h"
 #include "drvinst.h"
+#include "drvbridge.h"
 #include "devio.h"
 #include "opusdec.h"
 #include "singleinst.h"
@@ -85,26 +86,22 @@ static void toggle_connection(void)
     }
 }
 
-/* ------------------------------------------------- 驱动安装/卸载（提权） */
-/* 主 exe 是 asInvoker，只有这一个动作提权：ShellExecuteW("runas") 重启自身。
- * runas 子进程的工作目录可能是 System32，所以一律用 GetModuleFileNameW 定位自身。 */
+/* ------------------------------------------------- 驱动安装/卸载：转发给安装器 */
+/* 安装器 exe 自带 requireAdministrator manifest，双击/被拉起时会自己申请提权，
+ * 应用本体继续保持 asInvoker（日常使用不弹 UAC）。因此这里不再
+ * ShellExecute("runas") 重启自身，而是把同目录的 womic-drvinst.exe 拉起来。
+ * 安装逻辑有且只有一份（drvinst.c 的 drv_install/uninstall，两个 exe 共用）。 */
 static void request_driver_op(int install)
 {
-    wchar_t self[MAX_PATH], params[512];
-    HINSTANCE r;
-    GetModuleFileNameW(NULL, self, MAX_PATH);
-    _snwprintf(params, 512, L"\"%s\" %s", self,
-               install ? L"--install-driver" : L"--uninstall-driver");
-    if (g_args.driver_pack) {
-        wchar_t tmp[768];
-        _snwprintf(tmp, 768, L"%s --driver-pack \"%s\"", params, g_args.driver_pack);
-        wcsncpy(params, tmp, 512);
-        params[511] = 0;
+    DrvOp op = install ? DRVOP_INSTALL : DRVOP_UNINSTALL;
+    if (!drvbridge_launch(op, g_args.driver_pack)) {
+        ui_log_add(drvbridge_last_error(), 1);
+        ui_log_add("提示：把 womic-drvinst.exe 放在本程序同一目录即可安装驱动", 0);
+        g_dirty = 1;
+        return;
     }
-    ui_log_add(install ? "已请求管理员权限以安装驱动…" : "已请求管理员权限以卸载驱动…", 0);
-    r = ShellExecuteW(NULL, L"runas", self, params, NULL, SW_SHOWNORMAL);
-    if ((int)(size_t)r <= 32)
-        ui_log_add("提权失败或被取消：请以管理员身份运行 womic.exe --install-driver", 1);
+    ui_log_add(install ? "已启动驱动安装器（如需权限请同意 UAC 提示）…"
+                       : "已启动驱动安装器卸载驱动…", 0);
     g_dirty = 1;
 }
 
@@ -495,8 +492,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE prev, LPSTR cmd, int show)
     drv_detect(&g_ui.drv, 1);
     if (g_ui.drv.state == DRV_READY)
         ui_log_add("虚拟麦克风驱动已就绪", 2);
-    else
+    else {
+        wchar_t inst[MAX_PATH];
         ui_log_add("未检测到虚拟麦克风驱动：可在下方点“安装驱动”", 0);
+        /* 安装器不在时对他说清楚：此时再点按钮也只能得到同一句提示，
+         * 提前说一次避免用户在 GUI 里空转。 */
+        if (!drvbridge_find(inst, MAX_PATH))
+            ui_log_add("也未找到 womic-drvinst.exe：把它与本程序放同一目录才能安装驱动", 0);
+    }
 
     ui_layout_compute();
     place_edits();
