@@ -73,10 +73,7 @@ runs:
         $ErrorActionPreference = 'Stop'
         $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
         $hostname = "womic-dbg-$env:DEBUG_LABEL-$env:GITHUB_RUN_ID"
-        # 时长容错：空/非数字/<=0 一律回落 15 分钟（输入框是自由文本，
-        # 不能因为手滑打字把整个调试窗口搞挂）
-        $mins = 0
-        if (-not [int]::TryParse("$env:DEBUG_MINUTES", [ref]$mins)) { $mins = 15 }
+        $mins = [int]$env:DEBUG_MINUTES
         if ($mins -le 0) { $mins = 15 }
         $tags = @($env:DEBUG_TAGS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         if (-not $tags.Count) { Write-Host "::error::debug: tags 为空"; exit 1 }
