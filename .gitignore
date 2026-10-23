@@ -90,3 +90,6 @@ __pycache__/
 *.tmp
 .DS_Store
 Thumbs.db
+
+# ---- 本地调试观察脚本（含 PAT，绝不入库）----
+.tmp-*/

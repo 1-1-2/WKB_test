@@ -1,0 +1,191 @@
+name: tailnet-debug
+description: >
+  在 workflow 任意位置拉起一个交互调试窗口：OAuth 现签 ephemeral key →
+  入网 → 装 OpenSSH + 写公钥 + 防火墙 → 挂起等待 SSH 接入。
+  仅支持 Windows runner。窗口到点自动关闭，ephemeral 节点随之注销，
+  不残留任何长期 auth key。
+
+inputs:
+  minutes:
+    description: '挂起分钟数（调用方负责判断是否启用；本 action 恒执行）'
+    required: false
+    default: '15'
+  label:
+    description: '调试点标签，写进 hostname 便于区分（如 before-g / after-g）'
+    required: false
+    default: 'debug'
+  tags:
+    description: 'key 的 tag 集合，必须与签发凭据 Auth Keys 的 tags 完全一致（精确集合语义）'
+    required: false
+    default: 'tag:ci'
+  oauth_client_id:
+    description: 'OAuth client id（调用方传 secrets.TS_OAUTH_CLIENT_ID）'
+    required: true
+  oauth_secret:
+    description: 'OAuth client secret（调用方传 secrets.TS_OAUTH_SECRET）'
+    required: true
+  debug_pubkey:
+    description: 'SSH 公钥（调用方传 vars.UPTERM_DEBUG_PUBKEY；公钥非敏感）'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # ---------------------------------------------------------------
+    # 1) 装 Tailscale：winget 优先，官方静默安装包兜底
+    # ---------------------------------------------------------------
+    - name: debug.1 安装 Tailscale
+      shell: pwsh
+      run: |
+        $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+        if (Test-Path $ts) {
+          Write-Host "debug: tailscale.exe 已存在，跳过安装"
+        } else {
+          winget install --id tailscale.tailscale --accept-source-agreements --accept-package-agreements
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $ts)) {
+            Write-Host "::warning::debug: winget 未成功（exit=$LASTEXITCODE），转静默安装包"
+            $exe = "$env:RUNNER_TEMP\tailscale-setup-latest.exe"
+            Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' `
+              -OutFile $exe -ErrorAction Stop
+            Start-Process -FilePath $exe -ArgumentList '/S' -Wait
+          }
+        }
+        if (-not (Test-Path $ts)) {
+          Write-Host "::error::debug: tailscale.exe 未就位: $ts"
+          exit 1
+        }
+      # 说明：安装失败即失败——调试窗口是显式请求的，不做静默降级。
+
+    # ---------------------------------------------------------------
+    # 2) OAuth 现签 ephemeral key → 入网 → OpenSSH + 公钥 → 挂起
+    #    连接信息写 Step Summary（100.x 仅 tailnet 内可达，可安全公开）
+    # ---------------------------------------------------------------
+    - name: debug.2 入网并挂起等待 SSH
+      shell: pwsh
+      env:
+        TS_OAUTH_CLIENT_ID: ${{ inputs.oauth_client_id }}
+        TS_OAUTH_SECRET: ${{ inputs.oauth_secret }}
+        DEBUG_PUBKEY: ${{ inputs.debug_pubkey }}
+        DEBUG_MINUTES: ${{ inputs.minutes }}
+        DEBUG_LABEL: ${{ inputs.label }}
+        DEBUG_TAGS: ${{ inputs.tags }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+        $hostname = "womic-dbg-$env:DEBUG_LABEL-$env:GITHUB_RUN_ID"
+        $mins = [int]$env:DEBUG_MINUTES
+        if ($mins -le 0) { $mins = 15 }
+        $tags = @($env:DEBUG_TAGS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if (-not $tags.Count) { Write-Host "::error::debug: tags 为空"; exit 1 }
+        if ([string]::IsNullOrWhiteSpace($env:TS_OAUTH_CLIENT_ID) -or [string]::IsNullOrWhiteSpace($env:TS_OAUTH_SECRET)) {
+          Write-Host "::error::debug: OAuth 凭据为空（secrets.TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET）"
+          exit 1
+        }
+        if ([string]::IsNullOrWhiteSpace($env:DEBUG_PUBKEY)) {
+          Write-Host "::error::debug: vars.UPTERM_DEBUG_PUBKEY 为空"
+          exit 1
+        }
+
+        # 2.1 换 token
+        $tok = (Invoke-RestMethod -Method Post -Uri 'https://api.tailscale.com/api/v2/oauth/token' `
+          -Body @{ client_id = $env:TS_OAUTH_CLIENT_ID; client_secret = $env:TS_OAUTH_SECRET }).access_token
+        if ([string]::IsNullOrWhiteSpace($tok)) { Write-Host "::error::debug: access_token 为空"; exit 1 }
+
+        # 2.2 签 ephemeral 单次 key（tags 精确等于签发凭据配置）
+        $kb = @{
+          capabilities = @{ devices = @{ create = @{ reusable = $false; ephemeral = $true; tags = $tags } } }
+          expirySeconds = 3600
+          description = $hostname
+        } | ConvertTo-Json -Depth 8
+        $key = (Invoke-RestMethod -Method Post -Uri 'https://api.tailscale.com/api/v2/tailnet/-/keys' `
+          -Headers @{ Authorization = "Bearer $tok" } -ContentType 'application/json' -Body $kb).key
+        if ([string]::IsNullOrWhiteSpace($key)) { Write-Host "::error::debug: auth key 为空"; exit 1 }
+
+        # 2.3 入网
+        & $ts up --authkey=$key --hostname=$hostname --accept-dns=false
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "::error::debug: tailscale up 失败（exit=$LASTEXITCODE）"
+          & $ts status
+          exit 1
+        }
+        # up 只等后端启动、不等地址分配——轮询最多 60s（run 39934585851 实证）
+        $ip = ''
+        for ($i = 0; $i -lt 30 -and [string]::IsNullOrWhiteSpace($ip); $i++) {
+          Start-Sleep -Seconds 2
+          $cand = (& $ts ip -4 2>$null | Select-Object -First 1)
+          if ($cand) { $ip = "$cand".Trim() }
+        }
+        if ([string]::IsNullOrWhiteSpace($ip)) {
+          Write-Host "::error::debug: 60s 内未取得 tailnet IPv4"
+          & $ts status
+          exit 1
+        }
+
+        # 2.4 OpenSSH Server
+        if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+          Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+        }
+        if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+          Write-Host "::error::debug: sshd 服务不存在（能力安装失败）"
+          exit 1
+        }
+        Set-Service sshd -StartupType Automatic
+        Start-Service sshd
+        Write-Host "debug: sshd 状态 = $((Get-Service sshd).Status)"
+
+        # 2.5 防火墙：优先只放行 tailscale 适配器
+        $ruleName = 'sshd (tailnet debug)'
+        Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule | Out-Null
+        $tsAlias = (Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*Tailscale*' } |
+          Select-Object -First 1).Name
+        if ($tsAlias) {
+          New-NetFirewallRule -Name $ruleName -DisplayName 'sshd (tailnet debug)' `
+            -InterfaceAlias $tsAlias -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow | Out-Null
+          Write-Host "debug: 防火墙已限定到 tailscale 适配器: $tsAlias"
+        } else {
+          Write-Host "::warning::debug: 未找到 tailscale 适配器，回退放行所有接口 22（主防线仍是 tailnet ACL）"
+          New-NetFirewallRule -Name $ruleName -DisplayName 'sshd (tailnet debug)' `
+            -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow | Out-Null
+        }
+
+        # 2.6 公钥（runneradmin 是管理员 → administrators_authorized_keys，必须修 ACL）
+        New-Item -ItemType Directory -Force -Path "$env:ProgramData\ssh" | Out-Null
+        $f = "$env:ProgramData\ssh\administrators_authorized_keys"
+        $env:DEBUG_PUBKEY | Set-Content -Path $f -Encoding ascii
+        icacls $f /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Host "::error::debug: icacls 修复 ACL 失败"; exit 1 }
+
+        # 2.7 自检：22 端口确实在听
+        $listen = (Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue) -ne $null
+        if (-not $listen) { Write-Host "::error::debug: 22 端口未监听"; exit 1 }
+
+        # 2.8 连接信息（写 Summary，公开日志可安全展示）
+        $info = @(
+          "### 调试窗口已开启（$env:DEBUG_LABEL）",
+          "",
+          "| 项 | 值 |",
+          "|---|---|",
+          "| hostname | ``$hostname`` |",
+          "| tailnet IP | ``$ip`` |",
+          "| 端口/用户 | ``22`` / ``runneradmin`` |",
+          "| 窗口时长 | $mins 分钟（到点自动关闭，节点注销） |",
+          "| ssh | ``ssh -o StrictHostKeyChecking=accept-new runneradmin@$ip`` |"
+        )
+        $info | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+        $info | Write-Host
+
+        # 2.9 挂起（每分钟检查一次，每 5 分钟心跳）
+        $deadline = (Get-Date).AddMinutes($mins)
+        $tick = 0
+        while ((Get-Date) -lt $deadline) {
+          Start-Sleep -Seconds 60
+          $tick++
+          if ($tick % 5 -eq 0) {
+            $left = [int]($deadline - (Get-Date)).TotalMinutes
+            Write-Host "debug: 窗口剩余约 $left 分钟（$ip，hostname=$hostname）"
+          }
+        }
+
+        # 2.10 收尾：down 之后 ephemeral 节点由控制面自动删除
+        & $ts down 2>&1 | Out-Null
+        Write-Host "debug: 窗口关闭（$env:DEBUG_LABEL，$mins 分钟）"
