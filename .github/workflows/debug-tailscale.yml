@@ -218,14 +218,21 @@ jobs:
       - name: 5. 取 tailnet 地址 + 写连接信息
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          $ip = (& $ts ip -4 | Select-Object -First 1)
-          if ($ip) { $ip = $ip.Trim() }
-          if (-not $ip) {
-            Write-Host "::error::5: 未取得 tailnet IPv4"
+          # tailscale up 只等后端进程启动、不等 IP 分配就返回。run 39934585851
+          # 实证：步骤 4 报"已入网"成功后，紧接着 ip -4 仍为空，status 打出
+          # "Tailscale is starting. Please wait."。故此处轮询最多 60 秒。
+          $ip = ''
+          for ($i = 0; $i -lt 30 -and [string]::IsNullOrWhiteSpace($ip); $i++) {
+            Start-Sleep -Seconds 2
+            $cand = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if ($cand) { $ip = "$cand".Trim() }
+          }
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            Write-Host "::error::5: 60 秒内未取得 tailnet IPv4"
             & $ts status
             exit 1
           }
-          Write-Host "5: tailnet IPv4 = $ip（仅 tailnet 内可达，可安全打印）"
+          Write-Host "5: tailnet IPv4 = $ip（轮询 $($i) 次取得，仅 tailnet 内可达，可安全打印）"
           $tsHost = "womic-debug-$env:GITHUB_RUN_ID"
           $runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
           $info = @(
