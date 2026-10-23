@@ -610,7 +610,8 @@ jobs:
       #    计划任务（Session 0）从未复现（diagnosis.md §8.1/§9.2）。
       #    即根因是会话隔离而非用户权限，必须把两个变量分离、补齐矩阵：
       #      (SYSTEM,   session 0) = f  （上一步，计划任务）
-      #      (标准用户,  session 0) = g1 （本次新增：schtasks /ru 标准用户）
+      #      (标准用户,  session 0) = g1 （本次新增：schtasks /create /xml
+      #                               显式 Password logon，标准用户身份）
       #      (标准用户,  交互会话)   = g2 （原有实现，保留作对照）
       #    加上历史 run 39901322823 的 (elevated, 交互会话)=FAIL
       #    记录，2×2 矩阵完备。预期结论：灌音约束取决于会话上下文
@@ -763,45 +764,116 @@ jobs:
           # 任务以标准用户身份跑，进程落在 Session 0（非交互）——与 f 的
           # (SYSTEM, s0) 只差用户权限一个变量，权限维度由此分离。
           #
-          # run 39906824245 教训：schtasks /create /ru <标准用户> /rp <密码>
-          # 实际创建的是 Interactive/Background logon（交互令牌）任务——
-          # schtasks /query 显示 Logon Mode: Interactive/Background、
-          # Last Run Time 11/30/1999、Last Result: 267011
-          # （SCHED_S_TASK_HAS_NOT_RUN）：标准用户从未登录交互会话，任务
-          # 永不启动，marker 4 分钟不出现 → 超时 exit 1。
-          # （文档称 /ru+/rp 应为 Password logon type，实测未生效，不再深究）
-          # 改用 pwsh 原生 Register-ScheduledTask -LogonType Password：
-          # 显式"密码登录类型"= 不管用户是否登录都运行，非交互 CI 里可注册，
-          # 进程同样落 Session 0 且身份是标准用户——g1 裁决语义不变。
+          # 三轮失败的演进（勿删，团队知识）：
+          # * run 39906824245：schtasks /create /tr ... /ru <标准用户>
+          #   /rp <密码>（无 /xml）实际建成 Interactive/Background logon
+          #   （schtasks /query 显示 Logon Mode: Interactive/Background、
+          #   Last Run Time 11/30/1999、Last Result: 267011 =
+          #   SCHED_S_TASK_HAS_NOT_RUN）：标准用户从未登录交互会话，任务
+          #   永不启动，marker 4 分钟不出现 → 超时 exit 1。
+          # * run 39910125177/39910107431：改 Register-ScheduledTask
+          #   -Principal ... -Password，报 "Parameter set cannot be
+          #   resolved"——-Password 与 -Principal 不属同一参数集
+          #   （User 集：-User/-Password/-Action/-Settings；Object 集：
+          #   -Principal/-InputObject，无 -Password），cmdlet 路线放弃。
+          # * 定案：复刻 f 步骤已真机 PASS 的 schtasks /create /xml 路线
+          #   （f PASS 实证：session_id=0、RESULT=PASS），XML 显式声明
+          #   <LogonType>Password</LogonType>（= 不管用户是否登录都运行，
+          #   非交互 CI 里可注册，进程落 Session 0 且身份是标准用户——
+          #   g1 裁决语义不变）+ <RunLevel>LeastPrivilege</RunLevel>
+          #   （标准用户无升高令牌，HighestAvailable 会直接失败）；
+          #   /ru /rp 提供标准用户凭据（Password logon 必须带凭据）。
+          #   权限侧依据（Microsoft Learn《作为批处理作业登录》）：
+          #   "任务计划程序在用户计划任务时自动授予此权限"——注册时
+          #   自动给该用户 SeBatchLogonRight，无需手工改本地安全策略。
           $bat1 = "$dir\run_g1.cmd"
           $marker1 = "$dir\g1_exit.txt"
           $out1 = "$dir\probe-g1"
           $so1 = "$dir\g1-stdout.txt"
+          $xmlPath1 = "$dir\WomicE2EG1.xml"
           if (Test-Path $marker1) { Remove-Item $marker1 -Force }
           Write-ProbeBat $bat1 $marker1 $out1 $so1
-          # 无触发器：Register-ScheduledTask 不设 trigger，靠 schtasks /run
-          # 强制立即触发（/run 不依赖任何计划时间，也无需 /st）
-          $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/c `"$bat1`"" -WorkingDirectory $dir
-          $principal = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$user" -LogonType Password -RunLevel Limited
-          $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew
-          try {
-            Register-ScheduledTask -TaskName WomicE2EG1 -Action $action -Principal $principal `
-              -Settings $settings -Password $sec -Force -ErrorAction Stop | Out-Null
-          } catch {
-            Write-Host "::error::g1: 注册计划任务失败: $($_.Exception.Message)"
+          # 计划任务 XML：schtasks /create /xml 要求 XML 文件 UTF-16 编码
+          # （[IO.File]::WriteAllText(..., [Text.Encoding]::Unicode)）
+          $xmlLines1 = @(
+            '<?xml version="1.0" encoding="UTF-16"?>',
+            '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
+            '  <RegistrationInfo>',
+            '    <Description>WOMic E2E g1 探针（标准用户/Session 0，Password logon）</Description>',
+            '    <URI>\WomicE2EG1</URI>',
+            '  </RegistrationInfo>',
+            '  <Triggers>',
+            '    <BootTrigger><Enabled>false</Enabled></BootTrigger>',
+            '  </Triggers>',
+            '  <Principals>',
+            '    <Principal id="Author">',
+            "      <UserId>$env:COMPUTERNAME\$user</UserId>",
+            '      <LogonType>Password</LogonType>',
+            '      <RunLevel>LeastPrivilege</RunLevel>',
+            '    </Principal>',
+            '  </Principals>',
+            '  <Settings>',
+            '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>',
+            '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>',
+            '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>',
+            '    <AllowHardTerminate>true</AllowHardTerminate>',
+            '    <StartWhenAvailable>true</StartWhenAvailable>',
+            '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>',
+            '    <IdleSettings>',
+            '      <StopOnIdleEnd>false</StopOnIdleEnd>',
+            '      <RestartOnIdle>false</RestartOnIdle>',
+            '    </IdleSettings>',
+            '    <AllowStartOnDemand>true</AllowStartOnDemand>',
+            '    <Enabled>true</Enabled>',
+            '    <Hidden>false</Hidden>',
+            '    <RunOnlyIfIdle>false</RunOnlyIfIdle>',
+            '    <WakeToRun>false</WakeToRun>',
+            '    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>',
+            '    <Priority>4</Priority>',
+            '  </Settings>',
+            '  <Actions Context="Author">',
+            '    <Exec>',
+            '      <Command>cmd.exe</Command>',
+            "      <Arguments>/c `"$bat1`"</Arguments>",
+            "      <WorkingDirectory>$dir</WorkingDirectory>",
+            '    </Exec>',
+            '  </Actions>',
+            '</Task>'
+          )
+          [IO.File]::WriteAllText($xmlPath1, ($xmlLines1 -join "`r`n"), [Text.Encoding]::Unicode)
+          & schtasks /create /tn WomicE2EG1 /xml $xmlPath1 /ru "$env:COMPUTERNAME\$user" /rp $pass /f 2>&1 | Out-String | Write-Host
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::g1: 创建计划任务 WomicE2EG1 失败"
             "ITEM_G1=ERROR" | Out-File -FilePath $env:GITHUB_ENV -Append
             exit 1
           }
           & schtasks /run /tn WomicE2EG1 2>&1 | Out-String | Write-Host
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::g1: 触发计划任务失败"
+            Write-Host "::error::g1: 触发计划任务 WomicE2EG1 失败"
             "ITEM_G1=ERROR" | Out-File -FilePath $env:GITHUB_ENV -Append
             & schtasks /delete /tn WomicE2EG1 /f 2>&1 | Out-Null
             exit 1
           }
-          if (-not (Wait-ProbeMarker $marker1 4)) {
-            Write-Host "::error::g1: 计划任务探针 4 分钟超时（marker 未出现）"
-            & schtasks /query /tn WomicE2EG1 /fo LIST /v 2>&1 | Out-String | Write-Host
+          # 快速失败探测：任务无法启动（密码错/凭据被拒/无批登录权限）时
+          # Last Result 立即变非 0 且非 267011（SCHED_S_TASK_HAS_NOT_RUN，
+          # run 39906824245 实证的"从未运行"值）——提前暴露，不必等满 4 分钟
+          $fastFail = $false
+          for ($i = 0; $i -lt 12 -and -not (Test-Path $marker1); $i++) {
+            Start-Sleep -Seconds 5
+            $q = & schtasks /query /tn WomicE2EG1 /fo LIST /v 2>&1 | Out-String
+            $lr = [regex]::Match($q, 'Last Result:\s*(\S+)')
+            if ($lr.Success -and $lr.Groups[1].Value -ne '0' -and $lr.Groups[1].Value -ne '267011') {
+              Write-Host "::error::g1: 计划任务启动即失败（Last Result=$($lr.Groups[1].Value)）"
+              Write-Host $q
+              $fastFail = $true
+              break
+            }
+          }
+          if ($fastFail -or -not (Wait-ProbeMarker $marker1 4)) {
+            if (-not $fastFail) {
+              Write-Host "::error::g1: 计划任务探针 4 分钟超时（marker 未出现）"
+              & schtasks /query /tn WomicE2EG1 /fo LIST /v 2>&1 | Out-String | Write-Host
+            }
             "ITEM_G1=ERROR" | Out-File -FilePath $env:GITHUB_ENV -Append
             & schtasks /delete /tn WomicE2EG1 /f 2>&1 | Out-Null
             exit 1
