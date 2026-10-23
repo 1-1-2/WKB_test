@@ -26,9 +26,8 @@ name: debug-tailscale
 #   - 签发凭据只走 secrets.TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET，经 env
 #     传入（禁硬编码、禁直插脚本）；签出的 key 与 access token 只活在
 #     进程内存，绝不打印；
-#   - 调试公钥走仓库 Actions Variable（vars.UPTERM_DEBUG_PUBKEY，**不是
-#     Secret**），公钥非敏感，配对私钥只在沙箱；
-#   - 空签名凭据直接 ::error:: 退出，不做任何静默降级；
+#   - 调试公钥只走 secrets.WOMIC_CI_DEBUG_PUBKEY，同样经 env 传入；
+#   - 空 secrets 直接 ::error:: 退出，不做任何静默降级；
 #   - 100.x tailnet 地址只在 tailnet 内可达，可安全打印到公开日志；
 #   - 探针用户口令为一次性临时口令（ephemeral runner，作业结束即销毁），
 #     与 windows-e2e.yml g 步骤保持一致，非生产凭据。
@@ -219,21 +218,14 @@ jobs:
       - name: 5. 取 tailnet 地址 + 写连接信息
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          # tailscale up 只等后端进程启动、不等 IP 分配就返回。run 39934585851
-          # 实证：步骤 4 报"已入网"成功后，紧接着 ip -4 仍为空，status 打出
-          # "Tailscale is starting. Please wait."。故此处轮询最多 60 秒。
-          $ip = ''
-          for ($i = 0; $i -lt 30 -and [string]::IsNullOrWhiteSpace($ip); $i++) {
-            Start-Sleep -Seconds 2
-            $cand = (& $ts ip -4 2>$null | Select-Object -First 1)
-            if ($cand) { $ip = "$cand".Trim() }
-          }
-          if ([string]::IsNullOrWhiteSpace($ip)) {
-            Write-Host "::error::5: 60 秒内未取得 tailnet IPv4"
+          $ip = (& $ts ip -4 | Select-Object -First 1)
+          if ($ip) { $ip = $ip.Trim() }
+          if (-not $ip) {
+            Write-Host "::error::5: 未取得 tailnet IPv4"
             & $ts status
             exit 1
           }
-          Write-Host "5: tailnet IPv4 = $ip（轮询 $($i) 次取得，仅 tailnet 内可达，可安全打印）"
+          Write-Host "5: tailnet IPv4 = $ip（仅 tailnet 内可达，可安全打印）"
           $tsHost = "womic-debug-$env:GITHUB_RUN_ID"
           $runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
           $info = @(
@@ -305,32 +297,25 @@ jobs:
       #    是管理员，走此文件鉴权）。必须修复 ACL——不修会被 sshd
       #    拒绝读取（微软文档明确的坑：该文件要求仅 Administrators/
       #    SYSTEM 可访问，继承自 ProgramData 的 Users 读权限会导致
-      #    sshd 直接忽略它）。
-      #
-      #    公钥来源：仓库 Actions **Variable**（不是 Secret）——
-      #    vars.UPTERM_DEBUG_PUBKEY，与沙箱 ~/.ssh/womic_ci_debug 配对
-      #    （ED25519，指纹 SHA256:C9OEi1jq6bhnlUpb+vlKxoRVyQ7Wj3BMqQO4QiKRVOI）。
-      #    run 39935881550 的教训：曾误用 secrets.* 读取，env 恒为空、
-      #    步骤 7 直接失败——Variables 与 Secrets 是两个不同的上下文。
-      #    公钥非敏感可公开，配对私钥只在沙箱；空值直接 ::error:: 退出。
+      #    sshd 直接忽略它）。公钥经 env 传入；空 secret 直接退出。
       # ---------------------------------------------------------------
       - name: 7. 公钥认证（administrators_authorized_keys + ACL 修复）
         env:
-          DEBUG_PUBKEY: ${{ vars.UPTERM_DEBUG_PUBKEY || vars.WOMIC_CI_DEBUG_PUBKEY }}
+          WOMIC_CI_DEBUG_PUBKEY: ${{ secrets.WOMIC_CI_DEBUG_PUBKEY }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:DEBUG_PUBKEY)) {
-            Write-Host "::error::7: vars.UPTERM_DEBUG_PUBKEY 与 vars.WOMIC_CI_DEBUG_PUBKEY 均为空——公钥变量未配置（注意是 Variables 不是 Secrets）"
+          if ([string]::IsNullOrWhiteSpace($env:WOMIC_CI_DEBUG_PUBKEY)) {
+            Write-Host "::error::7: secrets.WOMIC_CI_DEBUG_PUBKEY 为空——公钥必须走 secrets（禁硬编码）"
             exit 1
           }
           New-Item -ItemType Directory -Force -Path "$env:ProgramData\ssh" | Out-Null
           $f = "$env:ProgramData\ssh\administrators_authorized_keys"
-          $env:DEBUG_PUBKEY | Set-Content -Path $f -Encoding ascii
+          $env:WOMIC_CI_DEBUG_PUBKEY | Set-Content -Path $f -Encoding ascii
           icacls $f /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::7: icacls 修复 ACL 失败（exit=$LASTEXITCODE）"
             exit 1
           }
-          Write-Host "7: 公钥已写入（类型 $($env:DEBUG_PUBKEY.Split(' ')[0])），ACL 已修复"
+          Write-Host "7: 公钥已写入（类型 $($env:WOMIC_CI_DEBUG_PUBKEY.Split(' ')[0])），ACL 已修复"
           exit 0
 
       # ---------------------------------------------------------------
@@ -450,25 +435,13 @@ jobs:
             }
           }
 
-          # ---- 9.4 pnputil 入库（只 stage，不 /install）----
-          # run 39965098219 实证：连续对两个包执行 /install 时，第二个
-          # （womic_1.inf）在"设备安装"阶段挂死 25 分钟直到步骤超时
-          # （第一个 womic.inf 已成功 oem13.inf，之后无任何输出）。
-          # 本步骤只负责把 INF+CAT 登进 DriverStore；设备节点（root
-          # devnode）的创建留给交互会话按需执行，避免把调试窗口拖死。
-          # 每次调用加 120s 硬超时，任何一次卡住都只降级为 warning。
+          # ---- 9.4 pnputil 安装（windows-e2e.yml d3 同款路径）----
+          # x64 runner 上同时 stage amd64 包（womic_1.*）供 DriverStore
+          # 命中；root devnode 创建与客户端自助安装留给会话里手工执行。
           foreach ($inf in @('womic.inf', 'womic_1.inf')) {
-            $p = Start-Process -FilePath 'pnputil.exe' `
-              -ArgumentList @('/add-driver', "$drv\$inf") `
-              -NoNewWindow -PassThru
-            if (-not $p.WaitForExit(120000)) {
-              Write-Host "::warning::9: pnputil $inf 超过 120s 未返回，强制结束（不影响调试窗口）"
-              try { $p.Kill() } catch { }
-              continue
-            }
-            Write-Host "9: pnputil $inf 入库 exit=$($p.ExitCode)"
-            if ($p.ExitCode -ne 0) {
-              Write-Host "::warning::9: pnputil $inf 返回 $($p.ExitCode)"
+            pnputil /add-driver "$drv\$inf" /install 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::9: pnputil $inf 返回 $LASTEXITCODE"
             }
           }
 
