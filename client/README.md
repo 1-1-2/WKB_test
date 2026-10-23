@@ -129,12 +129,8 @@ build/shots/    开发过程截图（wine + Xvfb 真实渲染，非设计稿）
   成功（`install_state=ok`），SYSTEM 计划任务跑 `e2e_probe` 拿到
   `RESULT=PASS`（waveIn 录到 288000 B / 1 kHz 正弦）。"装驱动会重置控制台
   导致 SSH 断开"的早期障碍已用计划任务方式解耦（f 步的设计前提）。
-  GUI 冒烟已真机通过（h 步：无参启动 6 秒进程存活，主窗口标题 `WO Mic Link`）。
-  R3 2×2 权限裁决矩阵齐备：`(SYSTEM, Session 0)=PASS`、
-  `(标准用户, Session 0)=PASS`、`(标准用户, 交互会话)=FAIL`
-  （`waveInOpen rc=1`）、历史 `(管理员, 交互会话)=FAIL`——
-  **灌音约束取决于会话上下文（Session 0 vs 交互会话），与用户权限无关**。
-  DPI 缩放与 DWM 圆角仍只在代码层保证，真机首跑建议先看 `--light` 与
-  125%/150% 缩放。
+  界面渲染与 6s 进程存活此前只在 wine 9.0 + Xvfb 验证；真机 GUI 冒烟
+  （h 步）随权限裁决矩阵（g 步）跑通后补验，DPI 缩放与 DWM 圆角目前
+  仍只在代码层保证，真机首跑建议先看 `--light` 与 125%/150% 缩放。
 - **Opus 已静态链接**：默认构建（`deps/opus` 就位时）把 Opus 解码器编进
   exe，没有 `opus.dll` 也能出声；仅在干净环境无静态库时才回退运行时加载。
