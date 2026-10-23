@@ -7,25 +7,12 @@
 
 ## 体积与依赖（这是本项目的首要约束）
 
-一次构建产出**两个 exe**，各管一段：
-
-| 产物 | 实测大小 | 内含第三方二进制 | manifest | 说明 |
-|---|---|---|---|---|
-| `womic.exe` | **298,496 B（291.5 KiB）** | **无**（零第三方字节） | `asInvoker` | 应用本体：GUI / CLI / 网络层 / Opus / 驱动调用 |
-| `womic-drvinst.exe` | **214,016 B（209 KiB）**（内嵌三套驱动）／ 113,664 B（空包构建） | 有：官方驱动三件套 | `requireAdministrator` | 驱动安装器：只负责装 / 卸 / 查驱动 |
-
-为什么要拆：驱动是**第三方已签名二进制**。塞进应用本体就等于每次分发应用都在
-分发第三方驱动；拆开后，凡已用官方安装器装过驱动的机器，只要 `womic.exe`
-（291 KB，纯自有代码），只有没装过的机器才需要多拿一次安装器。
-两个 exe **共用同一份安装逻辑**（`src/drvinst.c`），不存在两套实现。
-
-其余依赖事实：
-
 | 指标 | 实测值 |
 |---|---|
+| 可执行文件 | **396,800 B（387.5 KiB）**，单文件（含内置驱动包与静态 Opus 解码器） |
 | 静态资源 | 无（图标、圆角、渐变全部代码绘制；不嵌图片、不嵌字体） |
-| 安装包 | 无（绿色 exe，双击即用；驱动安装器同样免安装） |
-| 导入的系统 DLL | `KERNEL32` `USER32` `GDI32` `SHELL32` `UxTheme` `WS2_32` `msvcrt` `ADVAPI32` `ole32` `SETUPAPI` `newdev` `CRYPT32`（共 12 个，全部为系统自带；安装器只用到其中 8 个：无 UI/网络/Opus） |
+| 安装包 | 无（绿色单文件，双击即用） |
+| 导入的系统 DLL | `KERNEL32` `USER32` `GDI32` `SHELL32` `UxTheme` `WS2_32` `msvcrt` `ADVAPI32` `ole32` `SETUPAPI` `newdev` `CRYPT32`（共 12 个，全部为系统自带） |
 | 需要额外安装的运行库 | **零** |
 | 可选组件 | 无（Opus 已静态链接；见下） |
 
@@ -33,8 +20,8 @@
 **不是** VC++ Redistributable。因此不需要装"微软常用运行库合集"这类东西。
 
 后 5 个系统 DLL（`ADVAPI32` `ole32` `SETUPAPI` `newdev` `CRYPT32`）随
-"安装驱动"能力引入（SetupAPI/newdev 枚举安装、ole32/crypt32/advapi32 辅助），
-仍是系统自带，不构成额外运行库依赖。
+"客户端自助安装驱动"功能引入（SetupAPI/newdev 枚举安装、ole32/crypt32/
+advapi32 辅助），仍是系统自带，不构成额外运行库依赖。
 
 Opus 解码**默认静态链接**（`build.sh` 检测到 `deps/opus/lib/libopus.a` 时
 传 `-DMICLINK_HAVE_OPUS`，`-Wl,--gc-sections` 把 encoder 全部裁掉）——
@@ -64,46 +51,19 @@ Opus 解码**默认静态链接**（`build.sh` 检测到 `deps/opus/lib/libopus.
 
 ![亮色主题](build/womic-light.png)
 
-## 驱动怎么装（两个 exe 的分工）
-
-```
-womic-drvinst.exe                # 无参：进交互菜单（1 装 / 2 卸 / 3 查 / 0 退）
-womic-drvinst.exe /install       # 静默安装，0=成功 / 4=失败
-womic-drvinst.exe /uninstall     # 同上
-womic-drvinst.exe /status        # 0=已装且就绪 / 3=未装（与应用 --status 同语义）
-womic-drvinst.exe /driver-pack D:\drivers\womic2022 /install   # 用外置驱动目录
-womic-drvinst.exe /help
-```
-
-安装器的 manifest 是 `requireAdministrator`，**双击自动弹 UAC**；菜单里若发现
-未提权，选 1/2 会明确提示「请以管理员身份运行」。菜单只是壳，内部调用的就是
-`/install` 那条路径。
-
-应用侧的 `--install-driver` / `--uninstall-driver` 保留，但**改为转发**：找到同
-目录的 `womic-drvinst.exe` 拉起来、等它结束、把退出码带回来；找不到就明确提示
-「请把 womic-drvinst.exe 与本程序放在同一目录」，绝不假装成功。
-已用官方安装器装过驱动的机器，两种操作都不需要，直接跑 `womic.exe` 即可。
-
 ## 构建
 
 ```bash
 # Linux 交叉编译（推荐，产物一致）
 sudo apt install gcc-mingw-w64-x86-64
-./build.sh            # 默认 all：产出下面两个 exe
-./build.sh app        # 只编 womic.exe
-./build.sh drvinst    # 只编 womic-drvinst.exe
-./build.sh test       # 驱动包 inflate 字节自检（wine 下 9/9 PASS）
+./build.sh                 # → build/womic.exe
 
 # Windows 原生（mingw-w64 的 gcc 在 PATH 即可，无需 VS/SDK）
-build.bat             # 同样支持 [all|app|drvinst]
+build.bat
 ```
 
 不用 MSVC：MSVC 产物依赖 `vcruntime140.dll`，正是需求里要避免的"额外运行库"。
 mingw 的 `-Os -s` 已足够小，且只链系统 DLL。
-
-自检（每个产物都要过）：体积预算（应用 320 KiB / 安装器 256 KiB，可用
-`SIZE_BUDGET_APP` `SIZE_BUDGET_DRVINST` 覆盖）、导入表只允许系统 DLL、资源面
-断言（`tools/check_pe.py`：应用 **不许**内置驱动包，安装器 **必须**内置且头合法）。
 
 ## 构建与驱动包
 
@@ -112,25 +72,17 @@ mingw 的 `-Os -s` 已足够小，且只链系统 DLL。
 仍有法律风险（架构文档 R8）。因此 `res/drvpkg.bin` 与 `src/drvpkg_data.h`
 都是**生成物、已列入 `.gitignore`**，干净检出里没有它们。
 
-⚠ **`drvpkg.bin` 只被 `res/drvinst.rc` 引用**，应用本体 `res/app.rc` 里没有它
-（这是本次拆分的核心：`womic.exe` 一个第三方字节都不带）。
-
 `./build.sh` 发现这两个文件缺失时，先尝试真实打包（`tools/pack_driver.py`
 按下面的顺序找驱动目录）；找不到就用 `--empty` 生成一个合法空包
 （magic `MICLDRV1`、ver=1、count=0，16 字节）兜底并打 warned 日志，
-构建不中断。空包形态下：
+构建不中断，产出的 exe 约 300 KB，导入表仍全是系统 DLL。
 
-- `womic.exe` —— 与有无驱动包**完全无关**（本来就不带包），体积仍是 291.5 KiB；
-- `womic-drvinst.exe` —— `/install` 会明确报「未内置驱动包（空包构建）」并退出码 4，
-  **绝不静默成功**；`/status` 照实返回 3（未安装）。
-
-要产出**内嵌驱动**的安装器，自备官方驱动目录后重新生成：
+要产出**内置驱动**的 exe，自备官方驱动目录后重新生成：
 
 ```bash
 # 查找顺序：--driver-dir 参数 > 环境变量 WOMIC_DRIVER_DIR > 内置候选路径列表
 python3 tools/pack_driver.py --driver-dir /path/to/womic2022
-./build.sh          # → build/womic.exe（291.5 KB，无第三方二进制）
-./build.sh          # → build/womic-drvinst.exe（~209 KB，内含三套驱动）
+./build.sh          # → build/womic.exe（~396 KB，内含三套驱动）
 ./build.sh test     # wine 下校验 9 个驱动文件的字节一致性（9/9 PASS）
 ```
 
@@ -138,32 +90,26 @@ python3 tools/pack_driver.py --driver-dir /path/to/womic2022
 及同名 `.sys` / `.cat`，硬件 ID `Root\WOMic`。2017 版（`womic_3/4/5/6`）
 握手长度检查与 2022 版不兼容，一律不打包。
 
-空包构建的安装器通过外置驱动目录工作：
+不带内置驱动的 exe 通过 `--driver-pack` 外置驱动工作：
 
 ```
-womic-drvinst.exe /driver-pack D:\drivers\womic2022 /install
 womic.exe --driver-pack D:\drivers\womic2022 --install-driver
+womic.exe --driver-pack D:\drivers\womic2022 --status
 ```
 
-`--status` 的「驱动包来源」一栏会显示当前是内置资源、内置数组还是空包；
-应用侧因不再内置，恒显示「未内置驱动包（请用 --driver-pack 指定目录）」。
+`--status` 的「驱动包来源」一栏会显示当前是内置资源、内置数组还是空包。
 空包构建下 `./build.sh test` 会明确报告"无内置驱动包"并以非零退出，
 绝不假装 PASS。
 
 ## 目录
 
 ```
-src/main.c          应用入口：窗口、输入、事件分发
-src/cli.c           应用的命令行：参数解析、--status、驱动操作转发
-src/drvbridge.c     应用侧转发层：定位并拉起 womic-drvinst.exe（转发本身不做安装）
-src/drvinst_main.c  womic-drvinst.exe 入口：菜单 + /install /uninstall /status
-src/drvinst.c       两个 exe 共用的驱动检测/安装/卸载（唯一一份实现）
-src/engine.c        引擎：TCP 握手、UDP 收流、电平统计、驱动注音、可选 Opus
-src/app.h           公共定义
-tools/check_pe.py   产物资源面自检（应用不许带驱动包 / 安装器必须带）
+src/main.c      界面：窗口、布局、自绘控件、主题、输入
+src/engine.c    引擎：TCP 握手、UDP 收流、电平统计、驱动注音、可选 Opus
+src/app.h       公共定义
 tools/fake_server.py   服务端参考实现（无手机也能端到端联调）
 tools/pack_driver.py   驱动包/图标生成器（--driver-dir / --empty，见上一节）
-build/shots/       开发过程截图（wine + Xvfb 真实渲染，非设计稿）
+build/shots/    开发过程截图（wine + Xvfb 真实渲染，非设计稿）
 ```
 
 ## 已验证
@@ -173,23 +119,18 @@ build/shots/       开发过程截图（wine + Xvfb 真实渲染，非设计稿�
 | 协议握手 | `tools/fake_server.py` 充当服务端 | 101 variant=4 / 102 codec=2 48000 / 103 全部接受 |
 | 媒体流 | 服务端按 20 ms 下发格式 C 帧 | 客户端 78 kbps、835 帧、0 丢包（见上图统计） |
 | 界面渲染 | wine 9.0 + Xvfb，真实运行 exe | 两套主题、连接/未连接态、日志时间线均正常 |
-| 体积 | `stat` + `objdump -p` | womic.exe 298,496 B（无第三方二进制）／ womic-drvinst.exe 214,016 B（内嵌三套驱动）；导入表全为系统自带 DLL |
-| 资源面 | `tools/check_pe.py` | 应用 `.rsrc` 内无 `MICLDRV1`（零第三方字节）；安装器有且头合法、manifest 为 requireAdministrator |
+| 体积 | `stat` + `objdump -p` | 396,800 B；导入表 12 个 DLL 全部为系统自带 |
 | 无运行库依赖 | 导入表逐项核对 | 无 MSVC/UCRT/第三方 DLL |
 
 ## 限制（如实记录）
 
 - **真机覆盖范围（如实记录）**：驱动安装与注音闭环已在 GitHub Actions
-  Windows 真机端到端验证——`windows-e2e` 的 d/e/f 步：驱动安装器自助安装驱动
+  Windows 真机端到端验证——`windows-e2e` 的 d/e/f 步：客户端自助安装驱动
   成功（`install_state=ok`），SYSTEM 计划任务跑 `e2e_probe` 拿到
   `RESULT=PASS`（waveIn 录到 288000 B / 1 kHz 正弦）。"装驱动会重置控制台
   导致 SSH 断开"的早期障碍已用计划任务方式解耦（f 步的设计前提）。
-  GUI 冒烟已真机通过（h 步：无参启动 6 秒进程存活，主窗口标题 `WO Mic Link`）。
-  R3 2×2 权限裁决矩阵齐备：`(SYSTEM, Session 0)=PASS`、
-  `(标准用户, Session 0)=PASS`、`(标准用户, 交互会话)=FAIL`
-  （`waveInOpen rc=1`）、历史 `(管理员, 交互会话)=FAIL`——
-  **灌音约束取决于会话上下文（Session 0 vs 交互会话），与用户权限无关**。
-  DPI 缩放与 DWM 圆角仍只在代码层保证，真机首跑建议先看 `--light` 与
-  125%/150% 缩放。
+  界面渲染与 6s 进程存活此前只在 wine 9.0 + Xvfb 验证；真机 GUI 冒烟
+  （h 步）随权限裁决矩阵（g 步）跑通后补验，DPI 缩放与 DWM 圆角目前
+  仍只在代码层保证，真机首跑建议先看 `--light` 与 125%/150% 缩放。
 - **Opus 已静态链接**：默认构建（`deps/opus` 就位时）把 Opus 解码器编进
   exe，没有 `opus.dll` 也能出声；仅在干净环境无静态库时才回退运行时加载。
