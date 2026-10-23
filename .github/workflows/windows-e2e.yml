@@ -187,6 +187,11 @@ jobs:
       - name: 0. 环境自检（python / 系统信息）
         run: |
           New-Item -ItemType Directory -Force -Path probe-results/logs | Out-Null
+          # artifact 下载的文件可能带 Zone.Identifier（MOTW），SmartScreen 会
+          # 拦会话 0 里的静默执行；统一解锁，排除"文件在但跑不起来"类干扰。
+          Get-ChildItem .\dist -Recurse -File | ForEach-Object {
+            Unblock-File $_.FullName -ErrorAction SilentlyContinue
+          }
           python --version
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::0: python 不可用"; exit 1 }
           "OS: $([System.Environment]::OSVersion.VersionString)" |
@@ -215,44 +220,76 @@ jobs:
       # ---------------------------------------------------------------
       # b. CLI 说明书完整：--help 退出码 0，且关键选项都在。
       #    判据是"用户能查到用法"，不是实现细节。
+      #
+      #    调用方式说明（Round 1 失败教训，勿改回 & 直接调用）：
+      #    womic.exe 是 -mwindows 的 GUI 子系统程序。pwsh 的 & 调用运算符
+      #    对 GUI 子系统程序的重定向/等待行为在真机 runner 上不可靠——
+      #    Round 1 实测：步骤 0.4s 结束、$out 为空、$LASTEXITCODE 为空、
+      #    日志里没有任何报错（对照：同目录 console 子系统的
+      #    test_drvpkg.exe 用同样写法输出/退出码都正常捕获）。
+      #    cmd.exe 是控制台子系统，作中间层能稳定地把子进程 stdio 继承到
+      #    重定向目标并回传退出码（本地 wine 实测：rc=0、帮助全文落盘）。
+      #    因此统一：cmd /c "exe 参数 > 日志 2>&1"，再从日志文件读输出。
       # ---------------------------------------------------------------
       - name: b. womic.exe --help CLI 说明书完整性
         timeout-minutes: 5
         run: |
-          $out = & .\dist\womic.exe --help 2>&1
+          $exe = '.\dist\womic.exe'
+          $log = 'probe-results/logs/b-help.txt'
+          if (-not (Test-Path $exe)) {
+            Write-Host "::error::b: 找不到 $exe"
+            Get-ChildItem .\dist -Force | Select-Object Name, Length | Out-String | Write-Host
+            "ITEM_B=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          & cmd /c "$exe --help > $log 2>&1"
           $rc = $LASTEXITCODE
-          $txt = $out -join "`n"
-          $txt | Out-File probe-results/logs/b-help.txt -Encoding utf8
+          $txt = if (Test-Path $log) { Get-Content $log -Raw -Encoding utf8 } else { '' }
           $miss = @()
           foreach ($opt in @('--status', '--install-driver', '--driver-pack', '--connect')) {
             if ($txt -notmatch [regex]::Escape($opt)) { $miss += $opt }
           }
-          if ($rc -ne 0 -or $miss.Count -gt 0) {
-            Write-Host "::error::b: --help 退出码=$rc，缺少选项: $($miss -join ' ')"
+          if ($rc -ne 0 -or $miss.Count -gt 0 -or [string]::IsNullOrWhiteSpace($txt)) {
+            Write-Host "::error::b: --help 退出码=$rc，缺少选项: $($miss -join ' ')，输出 $($txt.Length) 字符"
+            # 失败诊断：目录列举 + 文件哈希 + 去掉重定向再直跑一次看原始返回
+            Get-ChildItem .\dist -Force | Select-Object Name, Length | Out-String | Write-Host
+            "sha256=$((Get-FileHash $exe -Algorithm SHA256).Hash)" | Write-Host
+            $raw = & cmd /c "$exe --help" 2>&1
+            "raw_rc=$LASTEXITCODE raw_lines=$($raw.Count)" | Write-Host
             "ITEM_B=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
             exit 1
           }
-          Write-Host "b: 帮助文本完整（退出码 $rc）"
+          Write-Host "b: 帮助文本完整（退出码 $rc，$($txt.Length) 字符）"
           "ITEM_B=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # ---------------------------------------------------------------
       # c. 未装驱动时 --status 必须退出码 3（驱动未就绪）且带架构信息。
       #    注意：不断言 "SYS 落盘=否" 之类环境相关细节，只验契约。
+      #    调用方式同 b：cmd /c 包装（GUI 子系统程序，& 直调不可靠）。
       # ---------------------------------------------------------------
       - name: c. 未装驱动 --status 退出码 3 + 架构信息
         timeout-minutes: 5
         run: |
-          $out = & .\dist\womic.exe --status 2>&1
+          $exe = '.\dist\womic.exe'
+          $log = 'probe-results/logs/c-status-preinstall.txt'
+          if (-not (Test-Path $exe)) {
+            Write-Host "::error::c: 找不到 $exe"
+            Get-ChildItem .\dist -Force | Select-Object Name, Length | Out-String | Write-Host
+            "ITEM_C=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          & cmd /c "$exe --status > $log 2>&1"
           $rc = $LASTEXITCODE
-          $txt = $out -join "`n"
-          $txt | Out-File probe-results/logs/c-status-preinstall.txt -Encoding utf8
+          $txt = if (Test-Path $log) { Get-Content $log -Raw -Encoding utf8 } else { '' }
           if ($rc -ne 3) {
             Write-Host "::error::c: 未装驱动时 --status 退出码 $rc ≠ 3"
+            Get-Content $log -ErrorAction SilentlyContinue | Out-String | Write-Host
             "ITEM_C=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
             exit 1
           }
           if ($txt -notmatch '架构') {
             Write-Host "::error::c: --status 输出缺少架构信息"
+            Get-Content $log -ErrorAction SilentlyContinue | Out-String | Write-Host
             "ITEM_C=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
             exit 1
           }
@@ -274,9 +311,12 @@ jobs:
         timeout-minutes: 10
         continue-on-error: true
         run: |
-          $out = & .\dist\womic.exe --install-driver 2>&1
+          $exe = '.\dist\womic.exe'
+          $log = 'probe-results/logs/d1-install-client.txt'
+          # cmd /c 包装：GUI 子系统程序，& 直调在真机 runner 上不可靠（见 b 注释）
+          & cmd /c "$exe --install-driver > $log 2>&1"
           $rc = $LASTEXITCODE
-          $out | Tee-Object -FilePath probe-results/logs/d1-install-client.txt
+          Get-Content $log -ErrorAction SilentlyContinue | Write-Host
           "client_install_exit=$rc" | Out-File probe-results/logs/d1-install-client.txt -Append
           "client_install_exit=$rc" | Out-File -FilePath $env:GITHUB_ENV -Append
           if ($rc -eq 0) {
@@ -328,9 +368,10 @@ jobs:
           Write-Host "d3: 走兜底路径（pnputil /add-driver + 重试客户端安装）"
           pnputil /add-driver "$env:GITHUB_WORKSPACE\dist\womic-driver\womic.inf" /install 2>&1 |
             Tee-Object -FilePath probe-results/logs/d3-pnputil.txt
-          $out = & .\dist\womic.exe --install-driver 2>&1
+          # cmd /c 包装：GUI 子系统程序，& 直调在真机 runner 上不可靠（见 b 注释）
+          & cmd /c ".\dist\womic.exe --install-driver > probe-results/logs/d3-install-retry.txt 2>&1"
           $rc = $LASTEXITCODE
-          $out | Tee-Object -FilePath probe-results/logs/d3-install-retry.txt
+          Get-Content probe-results/logs/d3-install-retry.txt -ErrorAction SilentlyContinue | Write-Host
           "retry_exit=$rc" | Out-File probe-results/logs/d3-install-retry.txt -Append
           $sysOnDisk = Test-Path "$env:SystemRoot\System32\drivers\womic.sys"
           $infPath = ""
@@ -349,14 +390,22 @@ jobs:
 
       # ---------------------------------------------------------------
       # e. 安装后 --status 必须退出码 0，输出含"已就绪"且 INF 路径非空。
+      #    调用方式同 b：cmd /c 包装（GUI 子系统程序，& 直调不可靠）。
       # ---------------------------------------------------------------
       - name: e. 安装后 --status 退出码 0 + 驱动就绪
         timeout-minutes: 5
         run: |
-          $out = & .\dist\womic.exe --status 2>&1
+          $exe = '.\dist\womic.exe'
+          $log = 'probe-results/logs/e-status-postinstall.txt'
+          if (-not (Test-Path $exe)) {
+            Write-Host "::error::e: 找不到 $exe"
+            "ITEM_E=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          & cmd /c "$exe --status > $log 2>&1"
           $rc = $LASTEXITCODE
-          $txt = $out -join "`n"
-          $txt | Out-File probe-results/logs/e-status-postinstall.txt -Encoding utf8
+          $txt = if (Test-Path $log) { Get-Content $log -Raw -Encoding utf8 } else { '' }
+          Get-Content $log -ErrorAction SilentlyContinue | Write-Host
           if ($rc -ne 0) {
             Write-Host "::error::e: 安装后 --status 退出码 $rc ≠ 0"
             "ITEM_E=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
@@ -507,6 +556,10 @@ jobs:
           $md += ''
           $md += "客户端自助安装退出码: $env:CLIENT_INSTALL_EXIT（UAC 行为实录见报告）"
           $md | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          # 同步落一份到 probe-results 根：既保证 upload-artifact 的
+          # 公共祖先目录是 probe-results（否则只有 logs/ 有文件时 artifact
+          # 会把 logs/ 拍平到根，Round 1 实测如此），也便于离线诊断。
+          $md | Out-File -FilePath probe-results/verdict.txt -Encoding utf8
 
       - name: Upload probe results
         if: always()
