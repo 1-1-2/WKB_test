@@ -16,34 +16,6 @@ name: windows-e2e
 # 触发范围：客户端源码/工具/本 workflow 变更即验证；其余情况手动触发。
 on:
   workflow_dispatch:
-    inputs:
-      # 调试窗口：勾选即在该阶段把 tailnet + SSH 拉起来，等人（或 Agent）
-      # 连进去交互排查；时长由 debug_minutes 统一控制。
-      # 实现见 .github/actions/tailnet-debug。
-      debug_minutes:
-        description: '调试窗口时长（分钟，对所有勾选的插点生效）'
-        required: false
-        default: '15'
-      debug_before_a:
-        description: 'a 之前（产物已下载、未跑任何真实步骤）开调试窗口'
-        required: false
-        type: boolean
-        default: false
-      debug_before_d:
-        description: 'd1（装驱动）之前开调试窗口'
-        required: false
-        type: boolean
-        default: false
-      debug_before_g:
-        description: 'g（2×2 权限矩阵）之前开调试窗口'
-        required: false
-        type: boolean
-        default: false
-      debug_after_g:
-        description: 'g 之后（h 之前）开调试窗口'
-        required: false
-        type: boolean
-        default: false
   push:
     paths:
       - 'client/**'
@@ -59,9 +31,9 @@ jobs:
   build:
     name: 交叉构建（Linux → Windows x64）
     runs-on: ubuntu-latest
-    # 正常 2-5min（2026-10-23 实测：apt 顺利时整轮 ~2.5min）。
-    # 15min 是硬上限：apt 卡死时整个 job 15 分钟内必死，不再无限等。
-    timeout-minutes: 15
+    # 装工具链 ~1min + 下载安装包 ~10s + 编 libopus ~6min + 编 exe ~1min；
+    # 30min 是宽松上限，正常 10min 内。
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -71,84 +43,29 @@ jobs:
       # ---------------------------------------------------------------
       - name: 安装交叉编译工具链
         shell: bash
-        # 2026-10-23 多次踩坑：apt-get update 会静默卡死（-qq 无输出，只看到
-        # 步骤不结束），同一时刻不同 runner 表现完全不同（一台 28s 过、
-        # 一台挂 10 分钟）——是公网 archive.ubuntu.com 的链路问题。
-        # 对策（主理人定调：不做探活，直接换源）：
-        #   1) 无条件把 sources 换成 azure.archive.ubuntu.com（runner 本身
-        #      就在 Azure 内网，走内网镜像稳定且快）；
-        #   2) 每个 apt 调用套 timeout -k 硬上限（update 120s / install 240s），
-        #      卡住就杀，绝不拖死作业；
-        #   3) 强制 IPv4（runner 的 IPv6 常是黑洞）；
-        #   4) 每步打进度标记，日志能直接看出卡在 update 还是 install。
+        # Round 3 教训：apt 瞬时挂起（archive.ubuntu.com 无响应）会把整个
+        # build job 拖到 30 分钟超时取消，白烧一轮 windows 计费。加固：
+        # 缩短单次超时 + 失败自动重试，三次不过才判失败。
         run: |
-          echo 'Acquire::http::Timeout "20";' | sudo tee /etc/apt/apt.conf.d/99timeout >/dev/null
-          echo 'Acquire::https::Timeout "20";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
-          echo 'Acquire::Retries "2";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
-          echo 'Acquire::ForceIPv4 "true";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
-          # 直接换源到 Azure 内网镜像，不做探活。
-          # GitHub 托管的 runner 本身跑在 Azure 上，走内网镜像比公网稳且快；
-          # 公网链路 2026-10-23 晚多次抖动（同刻不同 runner：一个 28s 过、
-          # 一个静默挂 10 分钟）。
-          #
-          # 关键（run 39981519800 实证）：GitHub 的 ubuntu-24.04 镜像里
-          # sources 写的是 "URIs: mirror+file:/etc/apt/apt-mirrors.txt"，
-          # 主机名不在 sources 里，而在 apt-mirrors.txt 这个候选列表里——
-          # 只 sed sources 是空操作。两条路都处理：
-          #   1) 有 apt-mirrors.txt → 备份后收敛成 Azure 一行；
-          #   2) 没有该文件（老镜像）→ 直接改 sources 里的主机名。
-          # 保险 2：把 ubuntu 的 deb822 sources 的 URIs 行直接钉死到 Azure，
-          # 绕过 mirror+file 选择逻辑（文件不存在/格式变化都不影响）。
-          for f in /etc/apt/sources.list.d/*ubuntu*.sources; do
-            [ -f "$f" ] || continue
-            sudo sed -i 's|^URIs: .*|URIs: http://azure.archive.ubuntu.com/ubuntu/|' "$f"
-            echo "改写 $f"
-          done
-          if [ -f /etc/apt/apt-mirrors.txt ]; then
-            sudo cp /etc/apt/apt-mirrors.txt /tmp/apt-mirrors.orig.txt
-            echo 'http://azure.archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
-            echo "===== apt-mirrors.txt（已收敛，原始备份 /tmp/apt-mirrors.orig.txt）====="
-            cat /etc/apt/apt-mirrors.txt
-          else
-            sudo sed -i \
-              -e 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
-              -e 's|https://archive.ubuntu.com/ubuntu|https://azure.archive.ubuntu.com/ubuntu|g' \
-              -e 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
-              -e 's|https://security.ubuntu.com/ubuntu|https://azure.archive.ubuntu.com/ubuntu|g' \
-              /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-            echo "===== 无 apt-mirrors.txt，已直接改 sources 主机名 ====="
-          fi
-          echo "===== sources 现状 ====="
-          grep -rhE '^(deb |URIs:)' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null | head -6 || true
+          echo 'Acquire::http::Timeout "30";' | sudo tee /etc/apt/apt.conf.d/99timeout >/dev/null
+          echo 'Acquire::https::Timeout "30";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
+          echo 'Acquire::Retries "3";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
           ok=""
-          # timeout -k：TERM 后 10s 再 KILL。apt 有时卡在 D 状态不响应 TERM，
-          # 只给 TERM 的 timeout 会一直等下去（本轮 7m40s 的另一种解释）。
           for i in 1 2 3; do
-            echo "===== apt 尝试 $i/3：update ====="
-            if timeout -k 10 120 sudo apt-get update -qq; then
-              echo "===== apt 尝试 $i/3：install gcc-mingw-w64-x86-64 ====="
-              if timeout -k 10 240 sudo apt-get install -y -qq gcc-mingw-w64-x86-64; then
-                ok=1; break
-              fi
-              echo "::warning::apt 第 $i 次 install 失败/超时"
-            else
-              echo "::warning::apt 第 $i 次 update 失败/超时（exit=$?）"
+            if sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64; then
+              ok=1; break
             fi
-            sleep 10
+            echo "::warning::apt 第 $i 次失败，30s 后重试"
+            sleep 30
           done
-          if [ -z "$ok" ]; then
-            echo "::error::apt 三次重试均失败"
-            echo "连通性探针（archive.ubuntu.com）："
-            curl -sS -m 5 -o /dev/null -w 'HTTP %{http_code} in %{time_total}s\n' http://archive.ubuntu.com/ubuntu/ || true
-            exit 1
-          fi
+          if [ -z "$ok" ]; then echo "::error::apt 三次重试均失败"; exit 1; fi
           x86_64-w64-mingw32-gcc --version | head -1
           x86_64-w64-mingw32-objdump --version | head -1
           if ! command -v 7z >/dev/null 2>&1; then
-            # p7zip-full（老 7z）优先，装不上再试新 7zip 包；同样带硬超时
+            # p7zip-full（老 7z）优先，装不上再试新 7zip 包；同样带重试
             for i in 1 2 3; do
-              if timeout -k 10 180 sudo apt-get install -y -qq p7zip-full || timeout -k 10 180 sudo apt-get install -y -qq 7zip; then break; fi
-              echo "::warning::7z 安装第 $i 次失败，10s 后重试"; sleep 10
+              if sudo apt-get install -y -qq p7zip-full || sudo apt-get install -y -qq 7zip; then break; fi
+              echo "::warning::7z 安装第 $i 次失败，30s 后重试"; sleep 30
             done
           fi
           7z | head -2 || { echo "::error::7z 不可用"; exit 1; }
@@ -242,11 +159,10 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/womic-driver
-          cp client/build/womic.exe client/build/womic-drvinst.exe \
-             client/build/test_drvpkg.exe dist/
+          cp client/build/womic.exe client/build/test_drvpkg.exe dist/
           cp womic-driver/* dist/womic-driver/
           ls -la dist dist/womic-driver
-          for f in dist/womic.exe dist/womic-drvinst.exe dist/test_drvpkg.exe; do
+          for f in dist/womic.exe dist/test_drvpkg.exe; do
             [ -f "$f" ] || { echo "::error::缺少产物 $f"; exit 1; }
           done
 
@@ -256,7 +172,6 @@ jobs:
           name: womic-e2e-build
           path: |
             dist/womic.exe
-            dist/womic-drvinst.exe
             dist/test_drvpkg.exe
             dist/womic-driver/
           if-no-files-found: error
@@ -266,9 +181,8 @@ jobs:
     name: 真机端到端验证（windows-latest）
     needs: build
     runs-on: windows-latest
-    # 正常 ~3min（驱动安装 + 灌音 + 2×2 裁决 + GUI）；30min 硬上限。
-    # 调试窗口会拉长作业：任一插点启用时放宽到 150 分钟。
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && (inputs.debug_before_a || inputs.debug_before_d || inputs.debug_before_g || inputs.debug_after_g) && 150 || 30 }}
+    # 驱动安装 ~1min + 灌音取证 ~1min + R3 2×2 裁决 ~4min + 余量；40min 宽松上限。
+    timeout-minutes: 40
     defaults:
       run:
         shell: pwsh
@@ -301,26 +215,6 @@ jobs:
           # 显式退出码 0：pwsh 部分版本会把脚本末尾残留的 $LASTEXITCODE
           # 传播为进程退出码（Round 2 实测踩坑），成功路径一律显式声明。
           exit 0
-
-      # ---------------------------------------------------------------
-      # debug. 可选调试窗口（workflow_dispatch 输入 minutes>0 时启用）。
-      # 四个插点：
-      #   debug_before_a（产物刚下载、任何真实步骤未跑——接近干净房间）
-      #   debug_before_d（装驱动前）/ debug_before_g（矩阵前）/
-      #   debug_after_g（矩阵后）
-      # 与"独立调试 workflow"的本质区别：这里是"真流程跑到一半"的环境，
-      # 产物、驱动、用户、探针目录都是真实上下文；窗口关闭后流程继续。
-      # ---------------------------------------------------------------
-      - name: debug. a 前调试窗口（可选）
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_before_a }}
-        uses: ./.github/actions/tailnet-debug
-        with:
-          minutes: ${{ inputs.debug_minutes }}
-          label: before-a
-          tags: 'tag:ci'
-          oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
-          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
 
       # ---------------------------------------------------------------
       # a. 内置驱动包 inflate 字节级自检：9 个文件（3 架构 × inf/sys/cat）
@@ -425,80 +319,36 @@ jobs:
           exit 0
 
       # ---------------------------------------------------------------
-      # d1. 驱动安装器自助安装驱动。
-      #
-      #     拆分后的形态：应用本体 womic.exe 不带第三方驱动二进制，装/卸/查
-      #     驱动由独立的 womic-drvinst.exe（requireAdministrator）负责。
-      #     本步骤直接调安装器 `/install`；d3 仍可用
-      #     `womic.exe --install-driver`（应用会转发给同目录的安装器）。
+      # d1. 客户端自助安装驱动。
       #
       #     UAC 行为实录要点：GitHub windows runner 的步骤本身运行在提权
-      #     上下文里，drv_is_elevated() 通常直接返回真、不会再弹 UAC；但若
-      #     非交互 CI 下 UAC 被挂起/取消，调用也可能"似乎成功"而实际没装，
+      #     上下文里，客户端 drv_is_elevated() 通常直接返回真、不走
+      #     ShellExecute(runas) 弹窗；但若非交互 CI 下 UAC 被挂起/取消，
+      #     ShellExecuteW 仍可能返回 >32（父进程误以为成功、退出码 0），
       #     所以**退出码 0 不算数**，一律以 d2 的系统状态为准。
       #     本步骤是任务书唯一允许的 continue-on-error 例外（兜底路径），
       #     失败会打 ::warning:: 显式记录，不掩盖问题。
-      #
-      #     空包构建降级（重要）：源码树里没有官方驱动目录时 pack_driver.py
-      #     只产出 count=0 的空包，那时 `/install` 必然失败且**必须**给出
-      #     明确错误（严禁静默成功）。本作业第 4 步已用真实官方驱动打包
-      #     （不是空包），但万一退化为错误，这里只记录不失败——真正的驱动
-      #     由 d3 的 pnputil 兜底补上，后续 d2/e/f/g/h 不受影响。
       # ---------------------------------------------------------------
-      # ---------------------------------------------------------------
-      # debug. 可选调试窗口（workflow_dispatch 输入 minutes>0 时启用）：
-      #   在真实流程的指定阶段把 tailnet + OpenSSH 拉起来，等人 SSH 进来
-      #   交互排查，到点自动关闭、节点注销。插点：
-      #     debug_before_d（装驱动前）/ debug_before_g（矩阵前）/
-      #     debug_after_g（矩阵后）；debug_before_a 见 a 步之前。
-      #   与一次性调试 workflow 的区别：这里是"真流程跑到一半"的环境，
-      #   产物、驱动、用户、探针目录都是真实上下文，不是复刻。
-      # ---------------------------------------------------------------
-      - name: debug. d1 前调试窗口（可选）
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_before_d }}
-        uses: ./.github/actions/tailnet-debug
-        with:
-          minutes: ${{ inputs.debug_minutes }}
-          label: before-d
-          tags: 'tag:ci'
-          oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
-          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
-
-      - name: d1. 驱动安装器自助安装驱动（记录 UAC/非交互行为）
+      - name: d1. 客户端自助安装驱动（记录 UAC/非交互行为）
         timeout-minutes: 10
         continue-on-error: true
         run: |
-          $inst = '.\dist\womic-drvinst.exe'
+          $exe = '.\dist\womic.exe'
           $log = 'probe-results/logs/d1-install-client.txt'
-          # 安装器是控制台子系统 + requireAdministrator，用 cmd /c 包一层调用：
-          # 既能把 stdio 稳定重定向到日志文件，也能正确回传退出码（见 b 步注释）。
-          if (-not (Test-Path $inst)) {
-            Write-Host "::error::d1: 找不到 $inst（构建产物缺失）"
-            Get-ChildItem .\dist -Force | Select-Object Name, Length | Out-String | Write-Host
-            "client_install_exit=missing_installer" | Out-File -FilePath $env:GITHUB_ENV -Append
-            exit 1
-          }
-          # 0) 装之前先照一眼契约：安装器 /status 与应用 --status 语义必须一致
-          #    （0=已装 / 3=未装）。这里只记录不断言，让 c 步与安装器自身平行印证。
-          & cmd /c "$inst /status > probe-results/logs/d1-status-pre.txt 2>&1"
-          "pre_status_exit=$LASTEXITCODE" | Out-File probe-results/logs/d1-status-pre.txt -Append
-          Get-Content probe-results/logs/d1-status-pre.txt -ErrorAction SilentlyContinue | Write-Host
-          # 1) 真正的安装
-          & cmd /c "$inst /install > $log 2>&1"
+          # cmd /c 包装：GUI 子系统程序，& 直调在真机 runner 上不可靠（见 b 注释）
+          & cmd /c "$exe --install-driver > $log 2>&1"
           $rc = $LASTEXITCODE
           Get-Content $log -ErrorAction SilentlyContinue | Write-Host
-          "installer_exit=$rc" | Out-File $log -Append
+          "client_install_exit=$rc" | Out-File probe-results/logs/d1-install-client.txt -Append
           "client_install_exit=$rc" | Out-File -FilePath $env:GITHUB_ENV -Append
           if ($rc -eq 0) {
-            Write-Host "d1: 安装器退出码 0（是否真装上以 d2 系统状态为准）"
+            Write-Host "d1: 客户端自助安装退出码 0（是否真装上以 d2 系统状态为准）"
           } else {
-            Write-Host "::warning::d1: 安装器退出码 $rc —— 记录在案，由 d2/d3 兜底（空包构建或未提权时属预期降级，详见上方安装器输出）"
-            Write-Host "::warning::d1: 若上方出现「未内置驱动包/空包」或「需要管理员权限」，属空包构建与未提权的已知降级形态，不是本分支回归"
-          }
+            Write-Host "::warning::d1: 客户端自助安装退出码 $rc —— 记录在案，由 d2/d3 兜底（UAC 非交互行为详见报告）"
           # d1 是记录型步骤（continue-on-error）：无论安装退出码如何，
           # 本步骤本身以"已记录"为成功，显式 exit 0。
           exit 0
+          }
 
       # ---------------------------------------------------------------
       # d2. 以系统状态验证驱动是否真的装上（不看任何安装工具输出——
@@ -795,17 +645,6 @@ jobs:
       #      缺角。e2e_probe.py 只依赖标准库且只往 --out 目录写文件，
       #      复制到 $dir 后自包含可跑。
       # ---------------------------------------------------------------
-      - name: debug. g 前调试窗口（可选）
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_before_g }}
-        uses: ./.github/actions/tailnet-debug
-        with:
-          minutes: ${{ inputs.debug_minutes }}
-          label: before-g
-          tags: 'tag:ci'
-          oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
-          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
-
       - name: g. R3 权限裁决：标准用户 2×2 矩阵（会话0 + 交互会话）
         timeout-minutes: 15
         run: |
@@ -1060,18 +899,14 @@ jobs:
             exit 1
           }
           # 快速失败探测：任务无法启动（密码错/凭据被拒/无批登录权限）时
-          # Last Result 立即变非 0。三种非失败值要放行：
-          #   0      = 已跑完
-          #   267011 = SCHED_S_TASK_HAS_NOT_RUN（从未运行，刚注册）
-          #   267009 = SCHED_S_TASK_IS_RUNNING（正在运行——run 39973799266
-          #            实证：探针每 5s 查一次，恰好撞上任务运行中，被误判
-          #            为启动失败；真机会话里 marker 秒出所以没暴露）
+          # Last Result 立即变非 0 且非 267011（SCHED_S_TASK_HAS_NOT_RUN，
+          # run 39906824245 实证的"从未运行"值）——提前暴露，不必等满 4 分钟
           $fastFail = $false
           for ($i = 0; $i -lt 12 -and -not (Test-Path $marker1); $i++) {
             Start-Sleep -Seconds 5
             $q = & schtasks /query /tn WomicE2EG1 /fo LIST /v 2>&1 | Out-String
             $lr = [regex]::Match($q, 'Last Result:\s*(\S+)')
-            if ($lr.Success -and $lr.Groups[1].Value -notin @('0', '267011', '267009')) {
+            if ($lr.Success -and $lr.Groups[1].Value -ne '0' -and $lr.Groups[1].Value -ne '267011') {
               Write-Host "::error::g1: 计划任务启动即失败（Last Result=$($lr.Groups[1].Value)）"
               Write-Host $q
               $fastFail = $true
@@ -1131,17 +966,6 @@ jobs:
       # h. GUI 冒烟：无参启动 6 秒后进程仍活着（-mwindows 双击不闪黑窗
       #    的形态也要在真机上验一次）。主窗口标题可选打印作参考。
       # ---------------------------------------------------------------
-      - name: debug. g 后调试窗口（可选）
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_after_g }}
-        uses: ./.github/actions/tailnet-debug
-        with:
-          minutes: ${{ inputs.debug_minutes }}
-          label: after-g
-          tags: 'tag:ci'
-          oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
-          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
-
       - name: h. GUI 冒烟：无参启动 6 秒进程存活
         timeout-minutes: 5
         run: |
