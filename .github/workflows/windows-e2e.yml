@@ -760,22 +760,35 @@ jobs:
           }
 
           # ---- g1：标准用户 × 计划任务（Session 0）----
-          # /ru <标准用户> /rl limited：任务仍跑在 Session 0（非交互），
-          # 但身份是标准用户——与 f 的 (SYSTEM, s0) 只差用户权限一个变量。
+          # 任务以标准用户身份跑，进程落在 Session 0（非交互）——与 f 的
+          # (SYSTEM, s0) 只差用户权限一个变量，权限维度由此分离。
+          #
+          # run 39906824245 教训：schtasks /create /ru <标准用户> /rp <密码>
+          # 实际创建的是 Interactive/Background logon（交互令牌）任务——
+          # schtasks /query 显示 Logon Mode: Interactive/Background、
+          # Last Run Time 11/30/1999、Last Result: 267011
+          # （SCHED_S_TASK_HAS_NOT_RUN）：标准用户从未登录交互会话，任务
+          # 永不启动，marker 4 分钟不出现 → 超时 exit 1。
+          # （文档称 /ru+/rp 应为 Password logon type，实测未生效，不再深究）
+          # 改用 pwsh 原生 Register-ScheduledTask -LogonType Password：
+          # 显式"密码登录类型"= 不管用户是否登录都运行，非交互 CI 里可注册，
+          # 进程同样落 Session 0 且身份是标准用户——g1 裁决语义不变。
           $bat1 = "$dir\run_g1.cmd"
           $marker1 = "$dir\g1_exit.txt"
           $out1 = "$dir\probe-g1"
           $so1 = "$dir\g1-stdout.txt"
           if (Test-Path $marker1) { Remove-Item $marker1 -Force }
           Write-ProbeBat $bat1 $marker1 $out1 $so1
-          # schtasks /run 是强制立即触发，不依赖 /st 计划时间——所以 /st 取
-          # 当前时间+1 分钟即可，无需处理跨天/已过期的边界
-          $st = (Get-Date).AddMinutes(1).ToString('HH:mm')
-          $tr1 = "cmd /c `"$bat1`""
-          & schtasks /create /tn WomicE2EG1 /tr $tr1 /sc once /st $st /ru $user /rp $pass /rl limited /f 2>&1 |
-            Out-String | Write-Host
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::error::g1: 创建计划任务失败（标准用户上下文）"
+          # 无触发器：Register-ScheduledTask 不设 trigger，靠 schtasks /run
+          # 强制立即触发（/run 不依赖任何计划时间，也无需 /st）
+          $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/c `"$bat1`"" -WorkingDirectory $dir
+          $principal = New-ScheduledTaskPrincipal -UserId "$env:COMPUTERNAME\$user" -LogonType Password -RunLevel Limited
+          $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -MultipleInstances IgnoreNew
+          try {
+            Register-ScheduledTask -TaskName WomicE2EG1 -Action $action -Principal $principal `
+              -Settings $settings -Password $sec -Force -ErrorAction Stop | Out-Null
+          } catch {
+            Write-Host "::error::g1: 注册计划任务失败: $($_.Exception.Message)"
             "ITEM_G1=ERROR" | Out-File -FilePath $env:GITHUB_ENV -Append
             exit 1
           }

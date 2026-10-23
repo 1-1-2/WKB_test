@@ -127,11 +127,25 @@ def push_commit(commit, parent_remote_sha, entries):
     return c["sha"], new_entries
 
 
+def commits_to_push(remote0):
+    """待推送提交列表。远端 tip 可能不是本地对象——Git Data API 产生的
+    commit sha 与本地 git 的不同（内容同、父链同、sha 异），rev-list
+    直接报 unknown revision。此时以本地历史中 tree 与远端 tree 一致的
+    提交为 base（内容同步点），diff 链不受影响。"""
+    try:
+        return [c for c in git("rev-list", "--reverse", f"{remote0}..HEAD").strip().split("\n") if c]
+    except subprocess.CalledProcessError:
+        rt = api("GET", f"/git/commits/{remote0}")["tree"]["sha"]
+        for c in git("rev-list", "HEAD").strip().split("\n"):
+            if c and git("rev-parse", f"{c}^{{tree}}").strip() == rt:
+                print(f"远端 tip {remote0[:9]} 非本地对象，以 tree 一致的本地提交 {c[:9]} 为 base")
+                return [x for x in git("rev-list", "--reverse", f"{c}..HEAD").strip().split("\n") if x]
+        raise SystemExit("远端 tip 既非本地对象，也未找到 tree 一致的本地 base")
+
+
 def main():
     remote0 = remote_head()
-    local_base = git("rev-parse", f"{remote0}").strip()
-    commits = git("rev-list", "--reverse", f"{remote0}..HEAD").strip().split("\n")
-    commits = [c for c in commits if c]
+    commits = commits_to_push(remote0)
     if not commits:
         print("无待推送提交")
         return
