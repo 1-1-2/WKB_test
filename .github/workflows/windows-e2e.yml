@@ -46,9 +46,9 @@ jobs:
   build:
     name: 交叉构建（Linux → Windows x64）
     runs-on: ubuntu-latest
-    # 装工具链 ~1min + 下载安装包 ~10s + 编 libopus ~6min + 编 exe ~1min；
-    # 30min 是宽松上限，正常 10min 内。
-    timeout-minutes: 30
+    # 正常 2-5min（2026-10-23 实测：apt 顺利时整轮 ~2.5min）。
+    # 15min 是硬上限：apt 卡死时整个 job 15 分钟内必死，不再无限等。
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -71,12 +71,28 @@ jobs:
           echo 'Acquire::https::Timeout "20";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
           echo 'Acquire::Retries "2";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
           echo 'Acquire::ForceIPv4 "true";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
+          # 预检：archive.ubuntu.com 5s 探活，三次都失败就立刻退出。
+          # run 39975789030 教训：同一时刻另一台 runner 28s 过，这台在 apt
+          # 上静默挂 7m40s（-qq 无输出，只能看到步骤不结束）。预检把
+          # "网络不通"从 10 分钟缩到 15 秒。
+          net_ok=""
+          for i in 1 2 3; do
+            if curl -fsS -m 5 -o /dev/null http://archive.ubuntu.com/ubuntu/; then net_ok=1; break; fi
+            echo "::warning::archive.ubuntu.com 第 $i 次探活失败（5s 超时）"
+            sleep 3
+          done
+          if [ -z "$net_ok" ]; then
+            echo "::error::archive.ubuntu.com 15s 内不可达——runner 网络问题，快速失败（换一台重跑即可）"
+            exit 1
+          fi
           ok=""
+          # timeout -k：TERM 后 10s 再 KILL。apt 有时卡在 D 状态不响应 TERM，
+          # 只给 TERM 的 timeout 会一直等下去（本轮 7m40s 的另一种解释）。
           for i in 1 2 3; do
             echo "===== apt 尝试 $i/3：update ====="
-            if timeout 120 sudo apt-get update -qq; then
+            if timeout -k 10 120 sudo apt-get update -qq; then
               echo "===== apt 尝试 $i/3：install gcc-mingw-w64-x86-64 ====="
-              if timeout 240 sudo apt-get install -y -qq gcc-mingw-w64-x86-64; then
+              if timeout -k 10 240 sudo apt-get install -y -qq gcc-mingw-w64-x86-64; then
                 ok=1; break
               fi
               echo "::warning::apt 第 $i 次 install 失败/超时"
@@ -96,7 +112,7 @@ jobs:
           if ! command -v 7z >/dev/null 2>&1; then
             # p7zip-full（老 7z）优先，装不上再试新 7zip 包；同样带硬超时
             for i in 1 2 3; do
-              if timeout 180 sudo apt-get install -y -qq p7zip-full || timeout 180 sudo apt-get install -y -qq 7zip; then break; fi
+              if timeout -k 10 180 sudo apt-get install -y -qq p7zip-full || timeout -k 10 180 sudo apt-get install -y -qq 7zip; then break; fi
               echo "::warning::7z 安装第 $i 次失败，10s 后重试"; sleep 10
             done
           fi
@@ -213,9 +229,9 @@ jobs:
     name: 真机端到端验证（windows-latest）
     needs: build
     runs-on: windows-latest
-    # 驱动安装 ~1min + 灌音取证 ~1min + R3 2×2 裁决 ~4min + 余量；40min 宽松上限。
-    # 调试窗口会拉长作业：任一插点启用时放宽到 150 分钟（3 个窗口 + 正常流程余量）。
-    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && (inputs.debug_before_d != '0' || inputs.debug_before_g != '0' || inputs.debug_after_g != '0') && 150 || 40 }}
+    # 正常 ~3min（驱动安装 + 灌音 + 2×2 裁决 + GUI）；30min 硬上限。
+    # 调试窗口会拉长作业：任一插点启用时放宽到 150 分钟。
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && (inputs.debug_before_d != '0' || inputs.debug_before_g != '0' || inputs.debug_after_g != '0') && 150 || 30 }}
     defaults:
       run:
         shell: pwsh
