@@ -16,6 +16,21 @@ name: windows-e2e
 # 触发范围：客户端源码/工具/本 workflow 变更即验证；其余情况手动触发。
 on:
   workflow_dispatch:
+    inputs:
+      # 调试窗口（分钟，0=不开）：在指定阶段把 tailnet + SSH 拉起来，
+      # 等待人（或 Agent）连进去交互排查。见 .github/actions/tailnet-debug。
+      debug_before_d:
+        description: 'd1（装驱动）之前开调试窗口，分钟数，0=不开'
+        required: false
+        default: '0'
+      debug_before_g:
+        description: 'g（2×2 权限矩阵）之前开调试窗口，分钟数，0=不开'
+        required: false
+        default: '0'
+      debug_after_g:
+        description: 'g 之后（h 之前）开调试窗口，分钟数，0=不开'
+        required: false
+        default: '0'
   push:
     paths:
       - 'client/**'
@@ -182,7 +197,8 @@ jobs:
     needs: build
     runs-on: windows-latest
     # 驱动安装 ~1min + 灌音取证 ~1min + R3 2×2 裁决 ~4min + 余量；40min 宽松上限。
-    timeout-minutes: 40
+    # 调试窗口会拉长作业：任一插点启用时放宽到 150 分钟（3 个窗口 + 正常流程余量）。
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && (inputs.debug_before_d != '0' || inputs.debug_before_g != '0' || inputs.debug_after_g != '0') && 150 || 40 }}
     defaults:
       run:
         shell: pwsh
@@ -329,6 +345,26 @@ jobs:
       #     本步骤是任务书唯一允许的 continue-on-error 例外（兜底路径），
       #     失败会打 ::warning:: 显式记录，不掩盖问题。
       # ---------------------------------------------------------------
+      # ---------------------------------------------------------------
+      # debug. 可选调试窗口（workflow_dispatch 输入 minutes>0 时启用）：
+      #   在真实流程的指定阶段把 tailnet + OpenSSH 拉起来，等人 SSH 进来
+      #   交互排查，到点自动关闭、节点注销。三个插点：
+      #     debug_before_d（装驱动前）/ debug_before_g（矩阵前）/
+      #     debug_after_g（矩阵后）
+      #   与一次性调试 workflow 的区别：这里是"真流程跑到一半"的环境，
+      #   产物、驱动、用户、探针目录都是真实上下文，不是复刻。
+      # ---------------------------------------------------------------
+      - name: debug. d1 前调试窗口（可选）
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_before_d != '' && inputs.debug_before_d != '0' }}
+        uses: ./.github/actions/tailnet-debug
+        with:
+          minutes: ${{ inputs.debug_before_d }}
+          label: before-d
+          tags: 'tag:ci'
+          oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
+          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
+
       - name: d1. 客户端自助安装驱动（记录 UAC/非交互行为）
         timeout-minutes: 10
         continue-on-error: true
@@ -645,6 +681,17 @@ jobs:
       #      缺角。e2e_probe.py 只依赖标准库且只往 --out 目录写文件，
       #      复制到 $dir 后自包含可跑。
       # ---------------------------------------------------------------
+      - name: debug. g 前调试窗口（可选）
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_before_g != '' && inputs.debug_before_g != '0' }}
+        uses: ./.github/actions/tailnet-debug
+        with:
+          minutes: ${{ inputs.debug_before_g }}
+          label: before-g
+          tags: 'tag:ci'
+          oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
+          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
+
       - name: g. R3 权限裁决：标准用户 2×2 矩阵（会话0 + 交互会话）
         timeout-minutes: 15
         run: |
@@ -966,6 +1013,17 @@ jobs:
       # h. GUI 冒烟：无参启动 6 秒后进程仍活着（-mwindows 双击不闪黑窗
       #    的形态也要在真机上验一次）。主窗口标题可选打印作参考。
       # ---------------------------------------------------------------
+      - name: debug. g 后调试窗口（可选）
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_after_g != '' && inputs.debug_after_g != '0' }}
+        uses: ./.github/actions/tailnet-debug
+        with:
+          minutes: ${{ inputs.debug_after_g }}
+          label: after-g
+          tags: 'tag:ci'
+          oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
+          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
+
       - name: h. GUI 冒烟：无参启动 6 秒进程存活
         timeout-minutes: 5
         run: |
