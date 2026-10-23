@@ -29,8 +29,10 @@ jobs:
       - name: 计划任务登录类型变体实验
         shell: pwsh
         run: |
+          # 注意：密码不得包含用户名子串（womic-diag），否则 New-LocalUser
+          # 抛 InvalidPasswordException（diag run 39926189720 实证）
           $user = 'womic-diag'
-          $pass = 'Womic-Diag-2026!'
+          $pass = 'Kx9-Probe-2026!'
           $sec  = ConvertTo-SecureString $pass -AsPlainText -Force
           if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
             try {
