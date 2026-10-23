@@ -86,7 +86,6 @@ const char *cli_help_text(void)
     "  内置的 womic.sys / womic.inf / womic.cat 版权归 " DRV_OWNER " 所有，\n"
     "  版本 " DRV_VERSION "，来源 " DRV_SOURCE_URL "。\n"
     "  本项目原样再分发：未修改、未重新签名，仅复用其已签名的虚拟声卡功能。\n"
-    "  " DRV_LICENSE_NOTE "\n"
     "\n"
     "被杀软误报时的处理:\n"
     "  1. 右键 womic.exe → 属性 → 勾选「解除锁定」（若有）\n"

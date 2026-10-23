@@ -20,13 +20,10 @@
 #define APP_VERSION     "1.1.0"
 #define APP_VERSION_Q   1, 1, 0, 0
 
-/* 内置驱动归属声明（GUI / --status / README 三处保持一致） */
+/* 内置驱动归属声明（--help / --status 输出与 NOTICE.md 保持一致） */
 #define DRV_OWNER       "Wolicheng (WO Mic)"
 #define DRV_VERSION     "2.1.0.0"
 #define DRV_SOURCE_URL  "https://www.wolicheng.com/womic/"
-#define DRV_LICENSE_NOTE \
-    "womic.sys / womic.inf / womic.cat 版权归 Wolicheng 所有，版本 " DRV_VERSION \
-    "，来源 " DRV_SOURCE_URL "。本项目原样再分发，未修改、未重新签名。"
 
 /* ------------------------------------------------------------------ 主题 */
 typedef struct {

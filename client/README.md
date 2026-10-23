@@ -9,15 +9,24 @@
 
 | 指标 | 实测值 |
 |---|---|
-| 可执行文件 | **83,456 B（81.5 KiB）**，单文件 |
+| 可执行文件 | **396,800 B（387.5 KiB）**，单文件（含内置驱动包与静态 Opus 解码器） |
 | 静态资源 | 无（图标、圆角、渐变全部代码绘制；不嵌图片、不嵌字体） |
 | 安装包 | 无（绿色单文件，双击即用） |
-| 导入的系统 DLL | `KERNEL32` `USER32` `GDI32` `SHELL32` `UxTheme` `WS2_32` `msvcrt` |
+| 导入的系统 DLL | `KERNEL32` `USER32` `GDI32` `SHELL32` `UxTheme` `WS2_32` `msvcrt` `ADVAPI32` `ole32` `SETUPAPI` `newdev` `CRYPT32`（共 12 个，全部为系统自带） |
 | 需要额外安装的运行库 | **零** |
-| 可选组件 | `opus.dll`（有则解码出声，无则只做统计与电平） |
+| 可选组件 | 无（Opus 已静态链接；见下） |
 
 关于 `msvcrt.dll`：它是 Windows 自带的 C 运行时（XP 起就在 `system32`），
 **不是** VC++ Redistributable。因此不需要装"微软常用运行库合集"这类东西。
+
+后 5 个系统 DLL（`ADVAPI32` `ole32` `SETUPAPI` `newdev` `CRYPT32`）随
+"客户端自助安装驱动"功能引入（SetupAPI/newdev 枚举安装、ole32/crypt32/
+advapi32 辅助），仍是系统自带，不构成额外运行库依赖。
+
+Opus 解码**默认静态链接**（`build.sh` 检测到 `deps/opus/lib/libopus.a` 时
+传 `-DMICLINK_HAVE_OPUS`，`-Wl,--gc-sections` 把 encoder 全部裁掉）——
+没有 `opus.dll` 也能出声；只有在没有静态库的干净环境构建时才回退到运行时
+`LoadLibrary("opus.dll")`，功能不缺。
 
 `gdiplus.dll` 与 `dwmapi.dll` 是**运行时按需加载**（`LoadLibrary`），不进导入表：
 缺失时自动退化为纯 GDI 绘制与直角窗口，不会启动失败。
@@ -28,8 +37,11 @@
 
 - **协议**：完整实现 WO Mic Wi-Fi 协议 v1 —— `101` hello → `102` 音频参数 → `103` 开始 →
   `105` 心跳（1 s/次）→ `104` 停止；UDP 解析头格式 C（`04 00` + len + seq + ts + vol + payload）。
-- **注音**：`CreateFileW(L"\\\\.\\WOMic")` + `DeviceIoControl(0x222000)`，
-  每 20 ms 灌入 1920 B（48 kHz / 16 bit / 单声道）。
+- **注音**：`CreateFileW(L"\\\\.\\WOMic")` 后走完整握手链——`0x222004` 读 1 字节
+  握手 key → `0x222008` 提交 key^0x3B → `0x222014` 设环形缓冲容量（2 B 大端，
+  钳制 [1, 11520]）→ `0x222010(1)` 启动 → 每 20 ms 灌入 1920 B（48 kHz /
+  16 bit / 单声道）→ `0x222010(0)` 停止。旧编号 `0x222000` 是 2017 驱动遗物，
+  在 2022 驱动上 51/51 失败，已删除。
 - **界面**：Fluent 风格自绘 —— 圆角卡片、分段控件、无边框窗口（DWM 圆角/阴影）、
   深浅主题、DPI 感知、手型/缩放光标、悬停与按下反馈。
 - **实时反馈**：34 段电平表 + 峰值保持、码率/帧数/丢包/延迟统计、带时间戳的事件流。
@@ -107,15 +119,18 @@ build/shots/    开发过程截图（wine + Xvfb 真实渲染，非设计稿）
 | 协议握手 | `tools/fake_server.py` 充当服务端 | 101 variant=4 / 102 codec=2 48000 / 103 全部接受 |
 | 媒体流 | 服务端按 20 ms 下发格式 C 帧 | 客户端 78 kbps、835 帧、0 丢包（见上图统计） |
 | 界面渲染 | wine 9.0 + Xvfb，真实运行 exe | 两套主题、连接/未连接态、日志时间线均正常 |
-| 体积 | `stat` + `objdump -p` | 83,456 B；导入表仅系统 DLL |
+| 体积 | `stat` + `objdump -p` | 396,800 B；导入表 12 个 DLL 全部为系统自带 |
 | 无运行库依赖 | 导入表逐项核对 | 无 MSVC/UCRT/第三方 DLL |
 
 ## 限制（如实记录）
 
-- **未在真实 Windows 上点开过**：界面是在 wine 里渲染验证的，DPI 缩放与 DWM 圆角
-  只在代码层保证；真机首跑建议先看 `--light` 与 125%/150% 缩放。
-- **驱动注音未端到端验证**：`\\.\WOMic` 只在装了官方驱动的机器上存在。
-  本轮尝试在 GitHub-hosted Windows 上装驱动，卡在"装驱动会重置控制台导致 SSH 断开"，
-  已用计划任务方式解耦（见 `../womic-recovery/`），实测尚在进行。
-- **Opus 解码依赖外部 `opus.dll`**：不内置是为了守住 80 KB 体积。
-  若确定要单文件出声，可静态链接 libopus，体积会到 300–400 KB（仍远小于 Qt/Electron）。
+- **真机覆盖范围（如实记录）**：驱动安装与注音闭环已在 GitHub Actions
+  Windows 真机端到端验证——`windows-e2e` 的 d/e/f 步：客户端自助安装驱动
+  成功（`install_state=ok`），SYSTEM 计划任务跑 `e2e_probe` 拿到
+  `RESULT=PASS`（waveIn 录到 288000 B / 1 kHz 正弦）。"装驱动会重置控制台
+  导致 SSH 断开"的早期障碍已用计划任务方式解耦（f 步的设计前提）。
+  界面渲染与 6s 进程存活此前只在 wine 9.0 + Xvfb 验证；真机 GUI 冒烟
+  （h 步）随权限裁决矩阵（g 步）跑通后补验，DPI 缩放与 DWM 圆角目前
+  仍只在代码层保证，真机首跑建议先看 `--light` 与 125%/150% 缩放。
+- **Opus 已静态链接**：默认构建（`deps/opus` 就位时）把 Opus 解码器编进
+  exe，没有 `opus.dll` 也能出声；仅在干净环境无静态库时才回退运行时加载。
