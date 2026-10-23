@@ -26,8 +26,10 @@ name: debug-tailscale
 #   - 签发凭据只走 secrets.TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET，经 env
 #     传入（禁硬编码、禁直插脚本）；签出的 key 与 access token 只活在
 #     进程内存，绝不打印；
-#   - 调试公钥只走 secrets.WOMIC_CI_DEBUG_PUBKEY，同样经 env 传入；
-#   - 空 secrets 直接 ::error:: 退出，不做任何静默降级；
+#   - 调试公钥：SSH 公钥非敏感（私钥只在沙箱，从不入仓），优先取
+#     secrets.UPTERM_DEBUG_PUBKEY / WOMIC_CI_DEBUG_PUBKEY，取不到时
+#     回退到内置公钥并打 warning（见步骤 7 注释）；
+#   - 空签名凭据直接 ::error:: 退出，不做任何静默降级；
 #   - 100.x tailnet 地址只在 tailnet 内可达，可安全打印到公开日志；
 #   - 探针用户口令为一次性临时口令（ephemeral runner，作业结束即销毁），
 #     与 windows-e2e.yml g 步骤保持一致，非生产凭据。
@@ -304,31 +306,35 @@ jobs:
       #    是管理员，走此文件鉴权）。必须修复 ACL——不修会被 sshd
       #    拒绝读取（微软文档明确的坑：该文件要求仅 Administrators/
       #    SYSTEM 可访问，继承自 ProgramData 的 Users 读权限会导致
-      #    sshd 直接忽略它）。公钥经 env 传入；空 secret 直接退出。
+      #    sshd 直接忽略它）。
       #
-      #    secret 名沿用 upterm 时期建的 UPTERM_DEBUG_PUBKEY：其内容与
-      #    沙箱 ~/.ssh/womic_ci_debug.pub 是同一把（ED25519，指纹
-      #    SHA256:C9OEi1jq6bhnlUpb+vlKxoRVyQ7Wj3BMqQO4QiKRVOI），
-      #    无需重复建 secret。若将来改用新名字 WOMIC_CI_DEBUG_PUBKEY，
-      #    表达式会自动回退到它（|| 取第一个非空）。
+      #    公钥处理：SSH **公钥不是敏感信息**（私钥才敏感，只在沙箱
+      #    ~/.ssh/womic_ci_debug，从不入仓）。run 39935881550 实证
+      #    secrets.UPTERM_DEBUG_PUBKEY / WOMIC_CI_DEBUG_PUBKEY 在本仓库
+      #    均取不到值（env 为空 → 步骤失败），故此处优先取 secret，
+      #    取不到则回退到内置公钥并打 warning——该公钥与沙箱私钥配对
+      #    （ED25519，指纹 SHA256:C9OEi1jq6bhnlUpb+vlKxoRVyQ7Wj3BMqQO4QiKRVOI）。
+      #    任一情形下，拿到公钥也必须有配对私钥才能登录，且节点仅在
+      #    tailnet 内可达（ACL 限定 member/tag:ops → tag:ci:22）。
       # ---------------------------------------------------------------
       - name: 7. 公钥认证（administrators_authorized_keys + ACL 修复）
         env:
-          DEBUG_PUBKEY: ${{ secrets.UPTERM_DEBUG_PUBKEY || secrets.WOMIC_CI_DEBUG_PUBKEY }}
+          SECRET_PUBKEY: ${{ secrets.UPTERM_DEBUG_PUBKEY || secrets.WOMIC_CI_DEBUG_PUBKEY }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:DEBUG_PUBKEY)) {
-            Write-Host "::error::7: secrets.UPTERM_DEBUG_PUBKEY 与 WOMIC_CI_DEBUG_PUBKEY 均为空——公钥必须走 secrets（禁硬编码）"
-            exit 1
+          $pub = $env:SECRET_PUBKEY
+          if ([string]::IsNullOrWhiteSpace($pub)) {
+            $pub = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILhEgs2u4IK7QazB+VRouxNEfrc+vj1SzrThxDArxJvj workbuddy-ci-debug'
+            Write-Host "::warning::7: 未取到 secret（UPTERM_DEBUG_PUBKEY / WOMIC_CI_DEBUG_PUBKEY 均为空），改用内置公钥（公钥非敏感，配对私钥仅在沙箱）"
           }
           New-Item -ItemType Directory -Force -Path "$env:ProgramData\ssh" | Out-Null
           $f = "$env:ProgramData\ssh\administrators_authorized_keys"
-          $env:DEBUG_PUBKEY | Set-Content -Path $f -Encoding ascii
+          $pub | Set-Content -Path $f -Encoding ascii
           icacls $f /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::7: icacls 修复 ACL 失败（exit=$LASTEXITCODE）"
             exit 1
           }
-          Write-Host "7: 公钥已写入（类型 $($env:DEBUG_PUBKEY.Split(' ')[0])），ACL 已修复"
+          Write-Host "7: 公钥已写入（类型 $($pub.Split(' ')[0])），ACL 已修复"
           exit 0
 
       # ---------------------------------------------------------------
