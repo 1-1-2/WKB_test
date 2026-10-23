@@ -58,29 +58,46 @@ jobs:
       # ---------------------------------------------------------------
       - name: 安装交叉编译工具链
         shell: bash
-        # Round 3 教训：apt 瞬时挂起（archive.ubuntu.com 无响应）会把整个
-        # build job 拖到 30 分钟超时取消，白烧一轮 windows 计费。加固：
-        # 缩短单次超时 + 失败自动重试，三次不过才判失败。
+        # Round 3 教训：apt 瞬时挂起会把整个 build job 拖到超时，白烧一轮
+        # windows 计费。2026-10-23 又踩一次：apt-get update 静默卡死 16 分钟
+        # （-qq 无输出，只能看到步骤不结束），最终被人工取消。
+        # 加固三层：
+        #   1) 每个 apt 调用套 timeout 硬上限（update 120s / install 240s），
+        #      卡住就杀，绝不拖死作业；
+        #   2) 强制 IPv4（runner 的 IPv6 常是黑洞，apt 会先试 v6 干等）；
+        #   3) 每步打进度标记，日志能直接看出卡在 update 还是 install。
         run: |
-          echo 'Acquire::http::Timeout "30";' | sudo tee /etc/apt/apt.conf.d/99timeout >/dev/null
-          echo 'Acquire::https::Timeout "30";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
-          echo 'Acquire::Retries "3";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
+          echo 'Acquire::http::Timeout "20";' | sudo tee /etc/apt/apt.conf.d/99timeout >/dev/null
+          echo 'Acquire::https::Timeout "20";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
+          echo 'Acquire::Retries "2";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
+          echo 'Acquire::ForceIPv4 "true";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
           ok=""
           for i in 1 2 3; do
-            if sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64; then
-              ok=1; break
+            echo "===== apt 尝试 $i/3：update ====="
+            if timeout 120 sudo apt-get update -qq; then
+              echo "===== apt 尝试 $i/3：install gcc-mingw-w64-x86-64 ====="
+              if timeout 240 sudo apt-get install -y -qq gcc-mingw-w64-x86-64; then
+                ok=1; break
+              fi
+              echo "::warning::apt 第 $i 次 install 失败/超时"
+            else
+              echo "::warning::apt 第 $i 次 update 失败/超时（exit=$?）"
             fi
-            echo "::warning::apt 第 $i 次失败，30s 后重试"
-            sleep 30
+            sleep 10
           done
-          if [ -z "$ok" ]; then echo "::error::apt 三次重试均失败"; exit 1; fi
+          if [ -z "$ok" ]; then
+            echo "::error::apt 三次重试均失败"
+            echo "连通性探针（archive.ubuntu.com）："
+            curl -sS -m 5 -o /dev/null -w 'HTTP %{http_code} in %{time_total}s\n' http://archive.ubuntu.com/ubuntu/ || true
+            exit 1
+          fi
           x86_64-w64-mingw32-gcc --version | head -1
           x86_64-w64-mingw32-objdump --version | head -1
           if ! command -v 7z >/dev/null 2>&1; then
-            # p7zip-full（老 7z）优先，装不上再试新 7zip 包；同样带重试
+            # p7zip-full（老 7z）优先，装不上再试新 7zip 包；同样带硬超时
             for i in 1 2 3; do
-              if sudo apt-get install -y -qq p7zip-full || sudo apt-get install -y -qq 7zip; then break; fi
-              echo "::warning::7z 安装第 $i 次失败，30s 后重试"; sleep 30
+              if timeout 180 sudo apt-get install -y -qq p7zip-full || timeout 180 sudo apt-get install -y -qq 7zip; then break; fi
+              echo "::warning::7z 安装第 $i 次失败，10s 后重试"; sleep 10
             done
           fi
           7z | head -2 || { echo "::error::7z 不可用"; exit 1; }
