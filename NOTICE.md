@@ -20,16 +20,19 @@
 - **官网**：https://www.wolicheng.com/womic/
 - **组件**：`womic.sys` / `womic.inf` / `womic.cat`（x64 / ARM64 / x86 三套），
   版本 2.1.0.0，微软 WHCP 签名，**未做任何修改**
-- **分发方式**：仅随**编译产物** `womic.exe` 以内嵌资源（deflate 压缩）形式分发，
-  用于首运自动安装虚拟麦克风；**源码仓库不含该驱动的任何二进制**
+- **分发方式**：仅随**编译产物** `womic-drvinst.exe` 以内嵌资源（deflate 压缩）形式分发，
+  用于按需安装虚拟麦克风；**源码仓库不含该驱动的任何二进制**
   （`client/res/drvpkg.bin` 与 `client/src/drvpkg_data.h` 已被 `.gitignore` 排除）。
+  应用本体 `womic.exe` **不含任何第三方二进制**（内嵌资源里没有驱动包），更小的
+  再分发面由此成立：凡已用官方安装器装过驱动的机器，只要 `womic.exe` 即可使用。
   要复现内置驱动构建，需自备官方驱动包并执行 `client/tools/pack_driver.py`
-  （详见 `client/README.md`「构建与驱动包」）；也可不带内置包构建，运行时用
-  `--driver-pack <dir>` 指向自备驱动目录。
+  （详见 `client/README.md`「构建与驱动包」）；也可不带内置包构建，安装器运行时用
+  `/driver-pack <dir>`（应用侧为 `--driver-pack <dir>`）指向自备驱动目录。
 - **合规状态**：WO Mic 官方 EULA 是否允许再分发，**未经法律确认**（架构评审 R8）。
-  缓解措施：① 驱动二进制只进 exe 产物、不进公开源码库；② 提供完全的外置驱动
-  通道，用户可自行从官方渠道获取；③ 客户端卸载/安装均通过系统标准机制
-  （SetupAPI/pnputil），不留私货。若后续确认不允许再分发，改为引导用户自备即可，
+  缓解措施：① 驱动二进制只进 exe 产物、不进公开源码库；② **应用与驱动安装器拆成
+  两个 exe**，第三方二进制只随按需分发的 `womic-drvinst.exe`，不随日常使用的应用本体；
+  ③ 提供完全的外置驱动通道，用户可自行从官方渠道获取；④ 客户端卸载/安装均通过系统
+  标准机制（SetupAPI/pnputil），不留私货。若后续确认不允许再分发，改为引导用户自备即可，
   代码链路已按此预留。
 
 ### microsoft/Windows-driver-samples（仅 `driver/` 参考路线）

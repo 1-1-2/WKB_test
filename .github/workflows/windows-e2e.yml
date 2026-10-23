@@ -242,10 +242,11 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/womic-driver
-          cp client/build/womic.exe client/build/test_drvpkg.exe dist/
+          cp client/build/womic.exe client/build/womic-drvinst.exe \
+             client/build/test_drvpkg.exe dist/
           cp womic-driver/* dist/womic-driver/
           ls -la dist dist/womic-driver
-          for f in dist/womic.exe dist/test_drvpkg.exe; do
+          for f in dist/womic.exe dist/womic-drvinst.exe dist/test_drvpkg.exe; do
             [ -f "$f" ] || { echo "::error::缺少产物 $f"; exit 1; }
           done
 
@@ -255,6 +256,7 @@ jobs:
           name: womic-e2e-build
           path: |
             dist/womic.exe
+            dist/womic-drvinst.exe
             dist/test_drvpkg.exe
             dist/womic-driver/
           if-no-files-found: error
@@ -423,15 +425,25 @@ jobs:
           exit 0
 
       # ---------------------------------------------------------------
-      # d1. 客户端自助安装驱动。
+      # d1. 驱动安装器自助安装驱动。
+      #
+      #     拆分后的形态：应用本体 womic.exe 不带第三方驱动二进制，装/卸/查
+      #     驱动由独立的 womic-drvinst.exe（requireAdministrator）负责。
+      #     本步骤直接调安装器 `/install`；d3 仍可用
+      #     `womic.exe --install-driver`（应用会转发给同目录的安装器）。
       #
       #     UAC 行为实录要点：GitHub windows runner 的步骤本身运行在提权
-      #     上下文里，客户端 drv_is_elevated() 通常直接返回真、不走
-      #     ShellExecute(runas) 弹窗；但若非交互 CI 下 UAC 被挂起/取消，
-      #     ShellExecuteW 仍可能返回 >32（父进程误以为成功、退出码 0），
+      #     上下文里，drv_is_elevated() 通常直接返回真、不会再弹 UAC；但若
+      #     非交互 CI 下 UAC 被挂起/取消，调用也可能"似乎成功"而实际没装，
       #     所以**退出码 0 不算数**，一律以 d2 的系统状态为准。
       #     本步骤是任务书唯一允许的 continue-on-error 例外（兜底路径），
       #     失败会打 ::warning:: 显式记录，不掩盖问题。
+      #
+      #     空包构建降级（重要）：源码树里没有官方驱动目录时 pack_driver.py
+      #     只产出 count=0 的空包，那时 `/install` 必然失败且**必须**给出
+      #     明确错误（严禁静默成功）。本作业第 4 步已用真实官方驱动打包
+      #     （不是空包），但万一退化为错误，这里只记录不失败——真正的驱动
+      #     由 d3 的 pnputil 兜底补上，后续 d2/e/f/g/h 不受影响。
       # ---------------------------------------------------------------
       # ---------------------------------------------------------------
       # debug. 可选调试窗口（workflow_dispatch 输入 minutes>0 时启用）：
@@ -453,26 +465,40 @@ jobs:
           oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
           debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
 
-      - name: d1. 客户端自助安装驱动（记录 UAC/非交互行为）
+      - name: d1. 驱动安装器自助安装驱动（记录 UAC/非交互行为）
         timeout-minutes: 10
         continue-on-error: true
         run: |
-          $exe = '.\dist\womic.exe'
+          $inst = '.\dist\womic-drvinst.exe'
           $log = 'probe-results/logs/d1-install-client.txt'
-          # cmd /c 包装：GUI 子系统程序，& 直调在真机 runner 上不可靠（见 b 注释）
-          & cmd /c "$exe --install-driver > $log 2>&1"
+          # 安装器是控制台子系统 + requireAdministrator，用 cmd /c 包一层调用：
+          # 既能把 stdio 稳定重定向到日志文件，也能正确回传退出码（见 b 步注释）。
+          if (-not (Test-Path $inst)) {
+            Write-Host "::error::d1: 找不到 $inst（构建产物缺失）"
+            Get-ChildItem .\dist -Force | Select-Object Name, Length | Out-String | Write-Host
+            "client_install_exit=missing_installer" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 1
+          }
+          # 0) 装之前先照一眼契约：安装器 /status 与应用 --status 语义必须一致
+          #    （0=已装 / 3=未装）。这里只记录不断言，让 c 步与安装器自身平行印证。
+          & cmd /c "$inst /status > probe-results/logs/d1-status-pre.txt 2>&1"
+          "pre_status_exit=$LASTEXITCODE" | Out-File probe-results/logs/d1-status-pre.txt -Append
+          Get-Content probe-results/logs/d1-status-pre.txt -ErrorAction SilentlyContinue | Write-Host
+          # 1) 真正的安装
+          & cmd /c "$inst /install > $log 2>&1"
           $rc = $LASTEXITCODE
           Get-Content $log -ErrorAction SilentlyContinue | Write-Host
-          "client_install_exit=$rc" | Out-File probe-results/logs/d1-install-client.txt -Append
+          "installer_exit=$rc" | Out-File $log -Append
           "client_install_exit=$rc" | Out-File -FilePath $env:GITHUB_ENV -Append
           if ($rc -eq 0) {
-            Write-Host "d1: 客户端自助安装退出码 0（是否真装上以 d2 系统状态为准）"
+            Write-Host "d1: 安装器退出码 0（是否真装上以 d2 系统状态为准）"
           } else {
-            Write-Host "::warning::d1: 客户端自助安装退出码 $rc —— 记录在案，由 d2/d3 兜底（UAC 非交互行为详见报告）"
+            Write-Host "::warning::d1: 安装器退出码 $rc —— 记录在案，由 d2/d3 兜底（空包构建或未提权时属预期降级，详见上方安装器输出）"
+            Write-Host "::warning::d1: 若上方出现「未内置驱动包/空包」或「需要管理员权限」，属空包构建与未提权的已知降级形态，不是本分支回归"
+          }
           # d1 是记录型步骤（continue-on-error）：无论安装退出码如何，
           # 本步骤本身以"已记录"为成功，显式 exit 0。
           exit 0
-          }
 
       # ---------------------------------------------------------------
       # d2. 以系统状态验证驱动是否真的装上（不看任何安装工具输出——
