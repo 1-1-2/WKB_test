@@ -196,6 +196,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::0: python 不可用"; exit 1 }
           "OS: $([System.Environment]::OSVersion.VersionString)" |
             Tee-Object probe-results/logs/0-env.txt
+          # 显式退出码 0：pwsh 部分版本会把脚本末尾残留的 $LASTEXITCODE
+          # 传播为进程退出码（Round 2 实测踩坑），成功路径一律显式声明。
+          exit 0
 
       # ---------------------------------------------------------------
       # a. 内置驱动包 inflate 字节级自检：9 个文件（3 架构 × inf/sys/cat）
@@ -216,6 +219,7 @@ jobs:
             exit 1
           }
           "ITEM_A=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+          exit 0
 
       # ---------------------------------------------------------------
       # b. CLI 说明书完整：--help 退出码 0，且关键选项都在。
@@ -261,6 +265,7 @@ jobs:
           }
           Write-Host "b: 帮助文本完整（退出码 $rc，$($txt.Length) 字符）"
           "ITEM_B=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+          exit 0
 
       # ---------------------------------------------------------------
       # c. 未装驱动时 --status 必须退出码 3（驱动未就绪）且带架构信息。
@@ -295,6 +300,7 @@ jobs:
           }
           Write-Host "c: 退出码 3 + 架构信息在（符合驱动未装契约）"
           "ITEM_C=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+          exit 0
 
       # ---------------------------------------------------------------
       # d1. 客户端自助安装驱动。
@@ -323,6 +329,9 @@ jobs:
             Write-Host "d1: 客户端自助安装退出码 0（是否真装上以 d2 系统状态为准）"
           } else {
             Write-Host "::warning::d1: 客户端自助安装退出码 $rc —— 记录在案，由 d2/d3 兜底（UAC 非交互行为详见报告）"
+          # d1 是记录型步骤（continue-on-error）：无论安装退出码如何，
+          # 本步骤本身以"已记录"为成功，显式 exit 0。
+          exit 0
           }
 
       # ---------------------------------------------------------------
@@ -387,6 +396,7 @@ jobs:
           }
           Write-Host "d3: 兜底安装成功（InfPath=$infPath）"
           "ITEM_D=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+          exit 0
 
       # ---------------------------------------------------------------
       # e. 安装后 --status 必须退出码 0，输出含"已就绪"且 INF 路径非空。
@@ -423,6 +433,7 @@ jobs:
           }
           Write-Host "e: 驱动已就绪，INF 路径非空（退出码 0）"
           "ITEM_E=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+          exit 0
 
       # ---------------------------------------------------------------
       # f. 【核心】端到端灌音：e2e_probe 以真实 waveIn 录音 + Goertzel
@@ -444,6 +455,7 @@ jobs:
           }
           Write-Host "f: 灌音闭环 PASS（waveIn 录到 1kHz 正弦）"
           "ITEM_F=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+          exit 0
 
       # ---------------------------------------------------------------
       # g. R3 权限裁决：建标准用户，以其身份跑同一探针，记录 PASS/FAIL。
@@ -498,6 +510,8 @@ jobs:
           } else {
             Write-Host "g: 标准用户灌音 $res —— 灌音链路在标准用户下不可用（裁决数据）"
           }
+          # g 是裁决记录步骤：探针 FAIL 不失败作业（结论写报告），显式 exit 0
+          exit 0
 
       # ---------------------------------------------------------------
       # h. GUI 冒烟：无参启动 6 秒后进程仍活着（-mwindows 双击不闪黑窗
@@ -521,6 +535,7 @@ jobs:
           Stop-Process -Id $p.Id -Force
           Write-Host "h: GUI 存活 6s（主窗口标题='$title'）"
           "ITEM_H=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+          exit 0
 
       # ---------------------------------------------------------------
       # i. 汇总：把各项结论写进 Step Summary（含 a 的判定从日志里读），
