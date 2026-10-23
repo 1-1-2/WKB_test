@@ -1,0 +1,568 @@
+name: debug-tailscale
+
+# ---------------------------------------------------------------------------
+# 临时交互调试通道（windows-e2e g 步骤 R3 2×2 权限裁决专用）
+#
+# 用途背景：
+#   windows-e2e 的 g 步骤（R3 2×2 权限裁决矩阵）连续几轮 CI 失败，每轮
+#   循环 ~10 分钟且无交互，排查效率极低。本 workflow 反其道而行——
+#   先交互调试、后固化 workflow：
+#     1. 起一个加入 tailnet 的 Windows runner（本 workflow）；
+#     2. 主理人从本地沙箱经 tailnet SSH 连进去手工调试，重点：
+#        Register-ScheduledTask 参数集修复后任务是否真的在 Session 0
+#        跑起来、marker 是否出现、探针是否 PASS；
+#     3. 试出可行命令序列后，固化回 windows-e2e.yml（本 workflow 不
+#        承担任何常规验证职责，属临时通道，调试结束后可删）。
+#
+# 连接方式（本地沙箱入口是主理人已准备好的 tsnet 端口转发，runner 侧
+# 无需配合）：
+#   ssh -o StrictHostKeyChecking=accept-new runneradmin@<tailnet-ip>
+#   <tailnet-ip> 见步骤 5 日志 / debug-connection artifact / Step Summary。
+#   tailnet ACL（已验证，照此假设）：tag:ops（沙箱节点）-> tag:ci
+#   （runner 节点）放行 22/3389；runner 入网用作业内 OAuth 现签的
+#   ephemeral key（tags=[tag:ci]），不需要任何长期 auth key。
+#
+# 安全纪律（公开仓库 1-1-2/WKB_test，极严）：
+#   - 签发凭据只走 secrets.TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET，经 env
+#     传入（禁硬编码、禁直插脚本）；签出的 key 与 access token 只活在
+#     进程内存，绝不打印；
+#   - 调试公钥只走 secrets.WOMIC_CI_DEBUG_PUBKEY，同样经 env 传入；
+#   - 空 secrets 直接 ::error:: 退出，不做任何静默降级；
+#   - 100.x tailnet 地址只在 tailnet 内可达，可安全打印到公开日志；
+#   - 探针用户口令为一次性临时口令（ephemeral runner，作业结束即销毁），
+#     与 windows-e2e.yml g 步骤保持一致，非生产凭据。
+#
+# 触发：仅 workflow_dispatch（不挂 push/schedule，避免误触发烧配额）。
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      hold_minutes:
+        description: '挂起分钟数（调试窗口保持时长；字符串经 env 传入再解析，防注入）'
+        required: true
+        default: '30'
+        type: string
+      setup_driver:
+        description: '是否预装官方 WOMic 驱动（便利设施，失败不销毁调试窗口）'
+        required: true
+        default: true
+        type: boolean
+      setup_user:
+        description: '是否创建标准用户并准备探针环境（g 步骤调试前置）'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    name: 交互调试窗口（tailnet SSH，windows-latest）
+    runs-on: windows-latest
+    # 安装/自检约 10min + hold（默认 30min，硬顶 320min）+ 余量。
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      # ---------------------------------------------------------------
+      # 1. checkout：setup 步骤要从仓库取 client/tools/e2e_probe.py
+      #    （被调试对象之一，与 windows-e2e.yml verify 作业同源）。
+      #    action 版本与 windows-e2e.yml 一致（checkout@v7）。
+      # ---------------------------------------------------------------
+      - name: 1. Checkout（取 client/tools/e2e_probe.py）
+        uses: actions/checkout@v7
+
+      # ---------------------------------------------------------------
+      # 2. 环境自检：python 路径（计划任务里跑探针必须绝对路径——任务
+      #    的 cmd 环境不继承 Actions 进程 PATH）、系统信息。
+      # ---------------------------------------------------------------
+      - name: 2. 环境自检（python / 系统信息）
+        run: |
+          python --version
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::2: python 不可用（探针依赖）"
+            exit 1
+          }
+          Write-Host "2: python = $((Get-Command python).Source)"
+          Write-Host "2: pwsh   = $($PSVersionTable.PSVersion)"
+          Write-Host "2: OS     = $([System.Environment]::OSVersion.VersionString)"
+          exit 0
+
+      # ---------------------------------------------------------------
+      # 3. 装 Tailscale：winget 优先；失败 fallback 官方静默安装包
+      #    （/S）。装完必须确认 $env:ProgramFiles\Tailscale\tailscale.exe
+      #    存在，后续所有步骤都从这个路径调用 CLI。
+      # ---------------------------------------------------------------
+      - name: 3. 安装 Tailscale（winget 优先，静默安装包兜底）
+        timeout-minutes: 10
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $ts) {
+            Write-Host "3: tailscale.exe 已存在，跳过安装"
+          } else {
+            Write-Host "3: winget install tailscale.tailscale"
+            winget install --id tailscale.tailscale --accept-source-agreements --accept-package-agreements
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::3: winget 返回 $LASTEXITCODE，转静默安装包兜底"
+            }
+          }
+          if (-not (Test-Path $ts)) {
+            $exe = "$env:RUNNER_TEMP\tailscale-setup-latest.exe"
+            try {
+              Write-Host "3: 下载 https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+              Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' `
+                -OutFile $exe -ErrorAction Stop
+              $p = Start-Process -FilePath $exe -ArgumentList '/S' -Wait -PassThru
+              Write-Host "3: 静默安装退出码 $($p.ExitCode)"
+            } catch {
+              Write-Host "::error::3: 静默安装包兜底失败: $($_.Exception.Message)"
+              exit 1
+            }
+          }
+          if (-not (Test-Path $ts)) {
+            Write-Host "::error::3: tailscale.exe 未就位: $ts"
+            exit 1
+          }
+          & $ts version
+          exit 0
+
+      # ---------------------------------------------------------------
+      # 4. 入 tailnet：OAuth 现签 ephemeral key（不存任何长期 auth key）。
+      #
+      #    为什么不用静态 TS_AUTHKEY：
+      #      run 39929035386 实证 secrets.TS_AUTHKEY 为空，通道直接断在
+      #      这一步；静态 key 还要人工轮换、泄露后需手动吊销。改为
+      #      作业内现签：凭据只存 secrets，签出的 key 用一次即废、
+      #      ephemeral 节点随 job 结束自动注销。
+      #
+      #    凭据与 tags（2026-10-23 实测定型，两个 OAuth client）：
+      #      - 签发凭据 kW8ZSULj6V…：scopes=auth_keys RW，tags 精确为
+      #        [tag:ci]——runner 只能签出 tag:ci key，而 ACL 里 tag:ci
+      #        从不出现在 src，节点入网后主动连不了任何东西；
+      #      - 管理凭据 kXkVsceiaK… 的 auth_keys 已收窄到 [tag:ops]，
+      #        只服务沙箱（沙箱侧用 tsnet-fwd，见 womic-recovery/
+      #        tools/ts-sandbox-up.sh）。
+      #
+      #    Tailscale 的 tags 是**精确集合**语义：凭据配了什么，签出的
+      #    key 就必须原样带什么，子集会被 400
+      #    "requested tags [...] are invalid or not permitted" 拒绝
+      #    （同日矩阵实测：单 tag:ci 400 / 单 tag:ops 400 / 双 tag 200）。
+      #    因此本步骤的 tags 必须与签发凭据的 tags 完全一致。
+      #
+      #    凭据引用只在 env 层出现一次，不进脚本体——公开仓库纪律。
+      #    access_token 与 authkey 都只存在于进程内存，绝不 Write-Host。
+      # ---------------------------------------------------------------
+      - name: 4. 加入 tailnet（OAuth 现签 ephemeral key，tag:ci）
+        timeout-minutes: 5
+        env:
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_OAUTH_CLIENT_ID) -or
+              [string]::IsNullOrWhiteSpace($env:TS_OAUTH_SECRET)) {
+            Write-Host "::error::4: secrets.TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET 为空——OAuth 现签是唯一入网通道（不做静态 key 兜底）"
+            exit 1
+          }
+          # 1) 换 1 小时 access token（client_credentials 由 client_id/secret 表单提交）
+          try {
+            $tok = (Invoke-RestMethod -Method Post -Uri 'https://api.tailscale.com/api/v2/oauth/token' `
+              -Body @{ client_id = $env:TS_OAUTH_CLIENT_ID; client_secret = $env:TS_OAUTH_SECRET } `
+              -ErrorAction Stop).access_token
+          } catch {
+            Write-Host "::error::4: OAuth token 交换失败: $($_.Exception.Message) $($_.ErrorDetails.Message)"
+            exit 1
+          }
+          if ([string]::IsNullOrWhiteSpace($tok)) {
+            Write-Host "::error::4: access_token 为空"
+            exit 1
+          }
+          # 2) 签 ephemeral、单次、1 小时 key；tags 必须是签发凭据的精确集合
+          $keyBody = @{
+            capabilities = @{ devices = @{ create = @{ reusable = $false; ephemeral = $true; tags = @('tag:ci') } } }
+            expirySeconds = 3600
+            description = "womic-debug-$env:GITHUB_RUN_ID"
+          } | ConvertTo-Json -Depth 8
+          try {
+            $authKey = (Invoke-RestMethod -Method Post -Uri 'https://api.tailscale.com/api/v2/tailnet/-/keys' `
+              -Headers @{ Authorization = "Bearer $tok" } -ContentType 'application/json' `
+              -Body $keyBody -ErrorAction Stop).key
+          } catch {
+            Write-Host "::error::4: 签 auth key 失败: $($_.Exception.Message) $($_.ErrorDetails.Message)"
+            exit 1
+          }
+          if ([string]::IsNullOrWhiteSpace($authKey)) {
+            Write-Host "::error::4: auth key 为空"
+            exit 1
+          }
+          # 3) 入网。hostname 带 run_id，多轮并发调试互不撞名；
+          #    --accept-dns=false 不改 runner 的 DNS，避免影响自身出网。
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey=$authKey --hostname="womic-debug-$env:GITHUB_RUN_ID" --accept-dns=false
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::4: tailscale up 失败（exit=$LASTEXITCODE），dump status 供诊断"
+            & $ts status
+            exit 1
+          }
+          Write-Host "4: 已入网（hostname=womic-debug-$env:GITHUB_RUN_ID，key=ephemeral/单次/1h，tag:ci）"
+          exit 0
+
+      # ---------------------------------------------------------------
+      # 5. 取 tailnet 地址，写连接信息文件并上传 artifact。
+      #    100.x 只在 tailnet 内可达（ACL 限定 tag:ops -> tag:ci），
+      #    可安全打印到公开日志。
+      # ---------------------------------------------------------------
+      - name: 5. 取 tailnet 地址 + 写连接信息
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $ip = (& $ts ip -4 | Select-Object -First 1)
+          if ($ip) { $ip = $ip.Trim() }
+          if (-not $ip) {
+            Write-Host "::error::5: 未取得 tailnet IPv4"
+            & $ts status
+            exit 1
+          }
+          Write-Host "5: tailnet IPv4 = $ip（仅 tailnet 内可达，可安全打印）"
+          $tsHost = "womic-debug-$env:GITHUB_RUN_ID"
+          $runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $info = @(
+            "tailnet_ip=$ip",
+            "hostname=$tsHost",
+            "port=22",
+            "user=runneradmin",
+            "ssh_cmd=ssh -o StrictHostKeyChecking=accept-new runneradmin@$ip",
+            "run_url=$runUrl"
+          )
+          $info | Set-Content -Path "$env:RUNNER_TEMP\debug-connection.txt" -Encoding ascii
+          Get-Content "$env:RUNNER_TEMP\debug-connection.txt" | Write-Host
+          "调试窗口连接信息: ssh -o StrictHostKeyChecking=accept-new runneradmin@$ip (hostname=$tsHost, port=22)" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "Run: $runUrl" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          exit 0
+
+      # ---------------------------------------------------------------
+      # 5b. 连接信息上传 artifact（版本与 windows-e2e.yml 一致：
+      #     upload-artifact@v7）。连接信息随 runner 销毁即失效，
+      #     保留 1 天足够，不拉长公开仓库的 artifact 暴露面。
+      # ---------------------------------------------------------------
+      - name: 5b. 上传连接信息 artifact（debug-connection）
+        uses: actions/upload-artifact@v7
+        with:
+          name: debug-connection
+          path: ${{ runner.temp }}\debug-connection.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      # ---------------------------------------------------------------
+      # 6. 装 OpenSSH Server 并起服务。防火墙优先只放行 tailscale
+      #    适配器入站 22（与 tailnet ACL 双保险，避免 22 暴露到
+      #    runner 的公网/内网其它接口）；取不到适配器别名则回退
+      #    所有接口入站 22 并 warning（主防线仍是 tailnet ACL）。
+      # ---------------------------------------------------------------
+      - name: 6. 安装 OpenSSH Server + 防火墙（仅放行 tailscale 适配器）
+        timeout-minutes: 10
+        run: |
+          if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+            Write-Host "6: 安装 OpenSSH.Server 能力"
+            Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+            if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+              Write-Host "::error::6: OpenSSH.Server 能力安装后 sshd 服务仍不存在"
+              exit 1
+            }
+          }
+          Set-Service sshd -StartupType Automatic
+          if ((Get-Service sshd).Status -ne 'Running') { Start-Service sshd }
+          $ruleName = 'sshd-tailscale-debug'
+          if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
+            $tsAlias = (Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*Tailscale*' } |
+              Select-Object -First 1).Name
+            if ($tsAlias) {
+              New-NetFirewallRule -Name $ruleName -DisplayName 'sshd (tailscale debug)' `
+                -InterfaceAlias $tsAlias -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow | Out-Null
+              Write-Host "6: 防火墙规则已限定到 tailscale 适配器: $tsAlias"
+            } else {
+              Write-Host "::warning::6: 未找到 Tailscale 网络适配器，回退为所有接口放行入站 22（主防线仍是 tailnet ACL）"
+              New-NetFirewallRule -Name $ruleName -DisplayName 'sshd (tailscale debug)' `
+                -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow | Out-Null
+            }
+          }
+          Write-Host "6: sshd 状态 = $((Get-Service sshd).Status)"
+          exit 0
+
+      # ---------------------------------------------------------------
+      # 7. 公钥认证：写 administrators_authorized_keys（runneradmin
+      #    是管理员，走此文件鉴权）。必须修复 ACL——不修会被 sshd
+      #    拒绝读取（微软文档明确的坑：该文件要求仅 Administrators/
+      #    SYSTEM 可访问，继承自 ProgramData 的 Users 读权限会导致
+      #    sshd 直接忽略它）。公钥经 env 传入；空 secret 直接退出。
+      # ---------------------------------------------------------------
+      - name: 7. 公钥认证（administrators_authorized_keys + ACL 修复）
+        env:
+          WOMIC_CI_DEBUG_PUBKEY: ${{ secrets.WOMIC_CI_DEBUG_PUBKEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WOMIC_CI_DEBUG_PUBKEY)) {
+            Write-Host "::error::7: secrets.WOMIC_CI_DEBUG_PUBKEY 为空——公钥必须走 secrets（禁硬编码）"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData\ssh" | Out-Null
+          $f = "$env:ProgramData\ssh\administrators_authorized_keys"
+          $env:WOMIC_CI_DEBUG_PUBKEY | Set-Content -Path $f -Encoding ascii
+          icacls $f /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::7: icacls 修复 ACL 失败（exit=$LASTEXITCODE）"
+            exit 1
+          }
+          Write-Host "7: 公钥已写入（类型 $($env:WOMIC_CI_DEBUG_PUBKEY.Split(' ')[0])），ACL 已修复"
+          exit 0
+
+      # ---------------------------------------------------------------
+      # 8. SSH 自检：22 端口确有监听 + tailscale 在网。到此主理人
+      #    即可从本地沙箱连入。
+      # ---------------------------------------------------------------
+      - name: 8. SSH 自检（22 端口监听 + tailnet 状态）
+        run: |
+          $listener = Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue
+          if (-not $listener) {
+            Write-Host "::error::8: 22 端口无监听（sshd 未起？）"
+            Get-Service sshd | Format-List Name, Status, StartType
+            exit 1
+          }
+          Write-Host "8: 22 端口监听中（$($listener.LocalAddress -join ',')）"
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts status
+          exit 0
+
+      # ---------------------------------------------------------------
+      # 9. （可选）驱动预装——从 windows-e2e.yml 的 d 步骤复刻核心逻辑：
+      #    下载 WOMicClientSetup6.3.exe 校验大小（1743456 B）→ 7z
+      #    解出驱动三件套（-aou + sha256 基线）→ certutil 导入签名者
+      #    到 TrustedPublisher+Root → pnputil 安装 → 系统状态判据。
+      #
+      #    与 windows-e2e.yml 的差异（交互调试场景的刻意选择）：
+      #    * 本 workflow 不构建 womic.exe（build 作业产物在
+      #      windows-e2e.yml），"客户端自助安装"路径由 pnputil 承接；
+      #    * 完整性闸门（大小/哈希/解包失败）保持原纪律，::error:: 退出；
+      #    * 安装路径与最终系统状态只判不罚（::warning::）——预装是
+      #      便利设施而非门禁，root devnode 创建、客户端自助安装、
+      #      Register-ScheduledTask 参数集等真正要调试的问题，由主理人
+      #      在交互会话里手工推进；预装不达标不应销毁调试窗口。
+      #    官方安装包本体与解出的驱动文件都 staged 在 RUNNER_TEMP，
+      #    主理人可在会话里直接取用。
+      # ---------------------------------------------------------------
+      - name: 9. 驱动预装（下载校验 → 解压 → 信任签名者 → pnputil → 系统状态）
+        if: ${{ inputs.setup_driver == true }}
+        timeout-minutes: 25
+        run: |
+          $drv = "$env:RUNNER_TEMP\womic-driver"
+          New-Item -ItemType Directory -Force -Path $drv | Out-Null
+
+          # ---- 9.1 下载官方安装包 + 校验大小 ----
+          # 判据同 windows-e2e.yml build 作业：大小是第一道闸，拦 CDN
+          # 劫持/占位页/版本漂移；带重试防瞬时网络抖动。
+          $pkg = "$env:RUNNER_TEMP\WOMicClientSetup6.3.exe"
+          $pkgOk = $false
+          for ($i = 1; $i -le 3; $i++) {
+            try {
+              Invoke-WebRequest -Uri 'https://wolicheng.com/womic/downloads/WOMicClientSetup6.3.exe' `
+                -OutFile $pkg -ErrorAction Stop
+              $sz = (Get-Item $pkg).Length
+              Write-Host "9: 安装包大小 $sz B（第 $i 次尝试）"
+              if ($sz -eq 1743456) { $pkgOk = $true; break }
+              Write-Host "::warning::9: 大小 $sz != 1743456，重试"
+            } catch {
+              Write-Host "::warning::9: 下载第 $i 次失败: $($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $pkgOk) {
+            Write-Host "::error::9: 官方安装包三次下载/校验均失败（完整性纪律，不降级）"
+            exit 1
+          }
+
+          # ---- 9.2 7z 解出驱动三件套（必须 -aou）----
+          # NSIS 包内 driver/womic.* 有 7 组同名文件（2022 三套
+          # x86/amd64/arm64 + 2017 四套），默认覆盖模式只剩最后一组
+          # （2017 版）；-aou 后重名按存档顺序改名 womic_1/womic_2/...：
+          # womic=2022x86、womic_1=2022amd64、womic_2=2022arm64。
+          $7z = "$env:ProgramFiles\7-Zip\7z.exe"
+          if (-not (Test-Path $7z)) { $7z = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source }
+          if (-not $7z) {
+            Write-Host "::error::9: 7z 不可用（$env:ProgramFiles\7-Zip\7z.exe 不存在且不在 PATH）"
+            exit 1
+          }
+          $x = "$env:RUNNER_TEMP\installer-extract"
+          & $7z x -aou -y $pkg "-o$x" 2>&1 |
+            Tee-Object -FilePath "$env:RUNNER_TEMP\7z.log" | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::9: 7z 解包失败（exit=$LASTEXITCODE）"
+            Get-Content "$env:RUNNER_TEMP\7z.log" -Tail 20 | Write-Host
+            exit 1
+          }
+          $need = @('womic.inf','womic.sys','womic.cat',
+                    'womic_1.inf','womic_1.sys','womic_1.cat',
+                    'womic_2.inf','womic_2.sys','womic_2.cat')
+          foreach ($f in $need) {
+            $src = "$x\driver\$f"
+            if (-not (Test-Path $src)) {
+              Write-Host "::error::9: 解出结果缺少 $f（-aou 重名改名行为异常？）"
+              Get-ChildItem "$x\driver" -ErrorAction SilentlyContinue |
+                Select-Object Name, Length | Out-String | Write-Host
+              exit 1
+            }
+            Copy-Item $src $drv -Force
+          }
+          $got = (Get-FileHash "$drv\womic_1.sys" -Algorithm SHA256).Hash
+          Write-Host "9: womic_1.sys sha256 = $got"
+          if ($got -ne '75f080f206ff0c13701ff66388c4a404529d9ec71b2ba0f1fadd4b71481c0475') {
+            Write-Host "::error::9: womic_1.sys 哈希不符（官方 2022 amd64 基线必须是 75f080f2...0475）"
+            exit 1
+          }
+          Write-Host "9: 驱动三件套已解出并校验；staged: $drv；官方安装包本体: $pkg"
+
+          # ---- 9.3 certutil 导入签名者到 TrustedPublisher + Root ----
+          # 治 0xE0000242（签名者不受信）。客户端 drvinst 自身用 crypt32
+          # API 导入（不派生进程），此处 certutil 是 workflow 侧兜底；
+          # 2022 三套驱动签名者同源，导入 womic.cat 的签名者即覆盖。
+          foreach ($store in @('Root', 'TrustedPublisher')) {
+            certutil -addstore $store "$drv\womic.cat" | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::9: certutil 导入 $store 失败（exit=$LASTEXITCODE），转交交互调试"
+            } else {
+              Write-Host "9: 签名者已导入 $store"
+            }
+          }
+
+          # ---- 9.4 pnputil 安装（windows-e2e.yml d3 同款路径）----
+          # x64 runner 上同时 stage amd64 包（womic_1.*）供 DriverStore
+          # 命中；root devnode 创建与客户端自助安装留给会话里手工执行。
+          foreach ($inf in @('womic.inf', 'womic_1.inf')) {
+            pnputil /add-driver "$drv\$inf" /install 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::9: pnputil $inf 返回 $LASTEXITCODE"
+            }
+          }
+
+          # ---- 9.5 系统状态判据（同 d2：SYS 落盘 + 注册表 InfPath 非空）----
+          $sysOnDisk = Test-Path "$env:SystemRoot\System32\drivers\womic.sys"
+          $infPath = ""
+          $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e96c-e325-11ce-bfc1-08002be10318}'
+          Get-ChildItem $classKey -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+            if ($p -and $p.MatchingDeviceId -match 'WOMic' -and $p.InfPath) { $infPath = $p.InfPath }
+          }
+          Write-Host "9: 系统状态 sys_on_disk=$sysOnDisk inf_path=$infPath"
+          if ($sysOnDisk -and $infPath) {
+            Write-Host "9: 驱动系统状态 ok（SYS 落盘 + InfPath=$infPath）"
+          } else {
+            Write-Host "::warning::9: 驱动系统状态不完整（SYS=$sysOnDisk, InfPath='$infPath'），转交交互调试"
+          }
+          exit 0
+
+      # ---------------------------------------------------------------
+      # 10. （可选）调试环境——从 windows-e2e.yml g 步骤复刻前置部分：
+      #     建标准用户 womic-e2e-probe（幂等）→ $env:TEMP\womic-stduser
+      #     授权标准用户 Modify → 复制探针到该目录（Test-Path 验证）。
+      #     标准用户进不去 workspace（各级 ACL 只允许 runneradmin/
+      #     Administrators/SYSTEM traverse），探针必须在已授权目录里跑；
+      #     New-LocalUser 而非 net user（后者在 pwsh 7 下失败且错误被
+      #     吞——run 39904485784 教训）。
+      # ---------------------------------------------------------------
+      - name: 10. 调试环境（标准用户 + 探针目录授权 + e2e_probe.py）
+        if: ${{ inputs.setup_user == true }}
+        timeout-minutes: 5
+        run: |
+          $user = 'womic-e2e-probe'
+          $pass = 'Womic-Probe-2026!'
+          $ws = $env:GITHUB_WORKSPACE
+          $sec = ConvertTo-SecureString $pass -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+            try {
+              New-LocalUser -Name $user -Password $sec `
+                -Description "WOMic E2E R3 标准用户裁决（debug-tailscale）" -ErrorAction Stop | Out-Null
+            } catch {
+              Write-Host "::error::10: 创建标准用户失败: $($_.Exception.Message)"
+              exit 1
+            }
+          } else {
+            Write-Host "10: 用户 $user 已存在（幂等跳过创建）"
+          }
+          $dir = "$env:TEMP\womic-stduser"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          # 标准用户对默认 TEMP 子目录未必有写权限，显式授权 Modify（同 g 步骤）
+          $acl = Get-Acl $dir
+          $acl.SetAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $user, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+          Set-Acl $dir $acl
+          # 复制探针：Copy-Item 会静默失败，复制后必须 Test-Path 验证
+          $probeSrc = "$ws\client\tools\e2e_probe.py"
+          $probeDst = "$dir\e2e_probe.py"
+          if (-not (Test-Path $probeSrc)) {
+            Write-Host "::error::10: 探针源文件不存在: $probeSrc"
+            exit 1
+          }
+          Copy-Item $probeSrc $probeDst -Force
+          if (-not (Test-Path $probeDst)) {
+            Write-Host "::error::10: 探针副本不存在（Copy-Item 静默失败？src=$probeSrc）"
+            exit 1
+          }
+          Write-Host "10: 探针环境就绪（$probeDst）；python = $((Get-Command python).Source)"
+          exit 0
+
+      # ---------------------------------------------------------------
+      # 11. hold 循环：挂起等待主理人交互调试。HOLD_MINUTES 经 env 从
+      #     input 传入（防脚本注入），再 [int] 解析；硬顶 320 分钟，
+      #    给安装/收尾步骤留余量，防 job 级 350 分钟超时腰斩窗口。
+      #    每 60 秒探一次 tailscale 在网状态，每 10 分钟心跳（剩余
+      #    分钟 + IP）。窗口关闭即 runner 销毁。
+      # ---------------------------------------------------------------
+      - name: 11. 挂起等待交互调试（hold）
+        timeout-minutes: 335
+        env:
+          HOLD_MINUTES: ${{ inputs.hold_minutes }}
+        run: |
+          $mins = 30
+          try { $mins = [int]$env:HOLD_MINUTES } catch {
+            Write-Host "::warning::11: HOLD_MINUTES='$env:HOLD_MINUTES' 不可解析，回退默认 30"
+          }
+          if ($mins -lt 1) { $mins = 1 }
+          if ($mins -gt 320) {
+            Write-Host "::warning::11: hold $mins 超过 320，截到 320（job timeout 350，给安装/收尾留余量）"
+            $mins = 320
+          }
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $ip = (& $ts ip -4 | Select-Object -First 1)
+          if ($ip) { $ip = $ip.Trim() }
+          Write-Host "================================================================"
+          Write-Host " 交互调试窗口已打开（$mins 分钟）"
+          Write-Host " 连接方式（主理人本地沙箱经 tailnet，tsnet 端口转发入口已备好，runner 侧无需配合）："
+          Write-Host "   ssh -o StrictHostKeyChecking=accept-new runneradmin@$ip"
+          Write-Host " 调试重点：Register-ScheduledTask 参数集修复后，任务是否真的在"
+          Write-Host "   Session 0 跑起来、marker 是否出现、探针是否 PASS"
+          Write-Host " 方法论：会话里试出可行命令序列 -> 固化回 windows-e2e.yml"
+          if (Test-Path "$env:RUNNER_TEMP\womic-driver\womic.inf") {
+            Write-Host " 驱动文件已 staged: $env:RUNNER_TEMP\womic-driver"
+            Write-Host " 官方安装包本体: $env:RUNNER_TEMP\WOMicClientSetup6.3.exe"
+          }
+          if (Test-Path "$env:TEMP\womic-stduser\e2e_probe.py") {
+            Write-Host " 探针环境: $env:TEMP\womic-stduser\e2e_probe.py（用户 womic-e2e-probe）"
+          }
+          Write-Host "================================================================"
+          $deadline = (Get-Date).AddMinutes($mins)
+          $lastBeat = Get-Date
+          while ((Get-Date) -lt $deadline) {
+            & $ts status | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::11: tailscale status 异常（窗口可能掉线，主理人会话会断）"
+            }
+            if (((Get-Date) - $lastBeat).TotalMinutes -ge 10) {
+              $lastBeat = Get-Date
+              $remain = [int]($deadline - (Get-Date)).TotalMinutes
+              Write-Host "[心跳] 剩余 $remain 分钟 | IP=$ip | hostname=womic-debug-$env:GITHUB_RUN_ID | 端口 22 | 用户 runneradmin"
+            }
+            Start-Sleep -Seconds 60
+          }
+          Write-Host "调试窗口关闭（hold $mins 分钟已到）——runner 即将销毁，未完成的结论请先落盘"
+          exit 0
