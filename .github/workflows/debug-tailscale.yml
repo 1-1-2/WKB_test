@@ -19,12 +19,13 @@ name: debug-tailscale
 #   ssh -o StrictHostKeyChecking=accept-new runneradmin@<tailnet-ip>
 #   <tailnet-ip> 见步骤 5 日志 / debug-connection artifact / Step Summary。
 #   tailnet ACL（已验证，照此假设）：tag:ops（沙箱节点）-> tag:ci
-#   （runner 节点）放行 22/3389；runner 入网用
-#   tailscale up --authkey=<reusable authkey，tag:ci>
-#   --hostname=womic-debug-<run_id>。
+#   （runner 节点）放行 22/3389；runner 入网用作业内 OAuth 现签的
+#   ephemeral key（tags=[tag:ci]），不需要任何长期 auth key。
 #
 # 安全纪律（公开仓库 1-1-2/WKB_test，极严）：
-#   - authkey 只走 secrets.TS_AUTHKEY，经 env 传入（禁硬编码、禁直插脚本）；
+#   - 签发凭据只走 secrets.TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET，经 env
+#     传入（禁硬编码、禁直插脚本）；签出的 key 与 access token 只活在
+#     进程内存，绝不打印；
 #   - 调试公钥只走 secrets.WOMIC_CI_DEBUG_PUBKEY，同样经 env 传入；
 #   - 空 secrets 直接 ::error:: 退出，不做任何静默降级；
 #   - 100.x tailnet 地址只在 tailnet 内可达，可安全打印到公开日志；
@@ -130,28 +131,83 @@ jobs:
           exit 0
 
       # ---------------------------------------------------------------
-      # 4. 入 tailnet：authkey 经 env: TS_AUTHKEY 传入（secrets 引用只在
-      #    env 层出现一次，不进脚本体——公开仓库纪律）。hostname 带
-      #    run_id，多轮并发调试互不撞名。--accept-dns=false：不改
-      #    runner 的 DNS 配置，避免影响 runner 自身出网。
+      # 4. 入 tailnet：OAuth 现签 ephemeral key（不存任何长期 auth key）。
+      #
+      #    为什么不用静态 TS_AUTHKEY：
+      #      run 39929035386 实证 secrets.TS_AUTHKEY 为空，通道直接断在
+      #      这一步；静态 key 还要人工轮换、泄露后需手动吊销。改为
+      #      作业内现签：凭据只存 secrets，签出的 key 用一次即废、
+      #      ephemeral 节点随 job 结束自动注销。
+      #
+      #    凭据与 tags（2026-10-23 实测定型，两个 OAuth client）：
+      #      - 签发凭据 kW8ZSULj6V…：scopes=auth_keys RW，tags 精确为
+      #        [tag:ci]——runner 只能签出 tag:ci key，而 ACL 里 tag:ci
+      #        从不出现在 src，节点入网后主动连不了任何东西；
+      #      - 管理凭据 kXkVsceiaK… 的 auth_keys 已收窄到 [tag:ops]，
+      #        只服务沙箱（沙箱侧用 tsnet-fwd，见 womic-recovery/
+      #        tools/ts-sandbox-up.sh）。
+      #
+      #    Tailscale 的 tags 是**精确集合**语义：凭据配了什么，签出的
+      #    key 就必须原样带什么，子集会被 400
+      #    "requested tags [...] are invalid or not permitted" 拒绝
+      #    （同日矩阵实测：单 tag:ci 400 / 单 tag:ops 400 / 双 tag 200）。
+      #    因此本步骤的 tags 必须与签发凭据的 tags 完全一致。
+      #
+      #    凭据引用只在 env 层出现一次，不进脚本体——公开仓库纪律。
+      #    access_token 与 authkey 都只存在于进程内存，绝不 Write-Host。
       # ---------------------------------------------------------------
-      - name: 4. 加入 tailnet（authkey 经 env 传入）
+      - name: 4. 加入 tailnet（OAuth 现签 ephemeral key，tag:ci）
         timeout-minutes: 5
         env:
-          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
-            Write-Host "::error::4: secrets.TS_AUTHKEY 为空——authkey 必须走 secrets（禁硬编码）"
+          if ([string]::IsNullOrWhiteSpace($env:TS_OAUTH_CLIENT_ID) -or
+              [string]::IsNullOrWhiteSpace($env:TS_OAUTH_SECRET)) {
+            Write-Host "::error::4: secrets.TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET 为空——OAuth 现签是唯一入网通道（不做静态 key 兜底）"
             exit 1
           }
+          # 1) 换 1 小时 access token（client_credentials 由 client_id/secret 表单提交）
+          try {
+            $tok = (Invoke-RestMethod -Method Post -Uri 'https://api.tailscale.com/api/v2/oauth/token' `
+              -Body @{ client_id = $env:TS_OAUTH_CLIENT_ID; client_secret = $env:TS_OAUTH_SECRET } `
+              -ErrorAction Stop).access_token
+          } catch {
+            Write-Host "::error::4: OAuth token 交换失败: $($_.Exception.Message) $($_.ErrorDetails.Message)"
+            exit 1
+          }
+          if ([string]::IsNullOrWhiteSpace($tok)) {
+            Write-Host "::error::4: access_token 为空"
+            exit 1
+          }
+          # 2) 签 ephemeral、单次、1 小时 key；tags 必须是签发凭据的精确集合
+          $keyBody = @{
+            capabilities = @{ devices = @{ create = @{ reusable = $false; ephemeral = $true; tags = @('tag:ci') } } }
+            expirySeconds = 3600
+            description = "womic-debug-$env:GITHUB_RUN_ID"
+          } | ConvertTo-Json -Depth 8
+          try {
+            $authKey = (Invoke-RestMethod -Method Post -Uri 'https://api.tailscale.com/api/v2/tailnet/-/keys' `
+              -Headers @{ Authorization = "Bearer $tok" } -ContentType 'application/json' `
+              -Body $keyBody -ErrorAction Stop).key
+          } catch {
+            Write-Host "::error::4: 签 auth key 失败: $($_.Exception.Message) $($_.ErrorDetails.Message)"
+            exit 1
+          }
+          if ([string]::IsNullOrWhiteSpace($authKey)) {
+            Write-Host "::error::4: auth key 为空"
+            exit 1
+          }
+          # 3) 入网。hostname 带 run_id，多轮并发调试互不撞名；
+          #    --accept-dns=false 不改 runner 的 DNS，避免影响自身出网。
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $ts up --authkey=$env:TS_AUTHKEY --hostname="womic-debug-$env:GITHUB_RUN_ID" --accept-dns=false
+          & $ts up --authkey=$authKey --hostname="womic-debug-$env:GITHUB_RUN_ID" --accept-dns=false
           if ($LASTEXITCODE -ne 0) {
             Write-Host "::error::4: tailscale up 失败（exit=$LASTEXITCODE），dump status 供诊断"
             & $ts status
             exit 1
           }
-          Write-Host "4: 已加入 tailnet（hostname=womic-debug-$env:GITHUB_RUN_ID）"
+          Write-Host "4: 已入网（hostname=womic-debug-$env:GITHUB_RUN_ID，key=ephemeral/单次/1h，tag:ci）"
           exit 0
 
       # ---------------------------------------------------------------
