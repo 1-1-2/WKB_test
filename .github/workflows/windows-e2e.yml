@@ -87,16 +87,37 @@ jobs:
           echo 'Acquire::Retries "2";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
           echo 'Acquire::ForceIPv4 "true";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
           # 直接换源到 Azure 内网镜像，不做探活。
-          # GitHub 托管的 runner 本身跑在 Azure 上，走内网镜像比公网
-          # archive.ubuntu.com 稳且快；公网镜像 2026-10-23 晚多次抖动
-          # （同刻不同 runner：一个 28s 过，一个静默挂 10 分钟）。
-          # 同时兼容老式 sources.list 与 Ubuntu 24.04 的 deb822 *.sources。
-          sudo sed -i \
-            -e 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
-            -e 's|https://archive.ubuntu.com/ubuntu|https://azure.archive.ubuntu.com/ubuntu|g' \
-            -e 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
-            -e 's|https://security.ubuntu.com/ubuntu|https://azure.archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          # GitHub 托管的 runner 本身跑在 Azure 上，走内网镜像比公网稳且快；
+          # 公网链路 2026-10-23 晚多次抖动（同刻不同 runner：一个 28s 过、
+          # 一个静默挂 10 分钟）。
+          #
+          # 关键（run 39981519800 实证）：GitHub 的 ubuntu-24.04 镜像里
+          # sources 写的是 "URIs: mirror+file:/etc/apt/apt-mirrors.txt"，
+          # 主机名不在 sources 里，而在 apt-mirrors.txt 这个候选列表里——
+          # 只 sed sources 是空操作。两条路都处理：
+          #   1) 有 apt-mirrors.txt → 备份后收敛成 Azure 一行；
+          #   2) 没有该文件（老镜像）→ 直接改 sources 里的主机名。
+          # 保险 2：把 ubuntu 的 deb822 sources 的 URIs 行直接钉死到 Azure，
+          # 绕过 mirror+file 选择逻辑（文件不存在/格式变化都不影响）。
+          for f in /etc/apt/sources.list.d/*ubuntu*.sources; do
+            [ -f "$f" ] || continue
+            sudo sed -i 's|^URIs: .*|URIs: http://azure.archive.ubuntu.com/ubuntu/|' "$f"
+            echo "改写 $f"
+          done
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo cp /etc/apt/apt-mirrors.txt /tmp/apt-mirrors.orig.txt
+            echo 'http://azure.archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+            echo "===== apt-mirrors.txt（已收敛，原始备份 /tmp/apt-mirrors.orig.txt）====="
+            cat /etc/apt/apt-mirrors.txt
+          else
+            sudo sed -i \
+              -e 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+              -e 's|https://archive.ubuntu.com/ubuntu|https://azure.archive.ubuntu.com/ubuntu|g' \
+              -e 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+              -e 's|https://security.ubuntu.com/ubuntu|https://azure.archive.ubuntu.com/ubuntu|g' \
+              /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+            echo "===== 无 apt-mirrors.txt，已直接改 sources 主机名 ====="
+          fi
           echo "===== sources 现状 ====="
           grep -rhE '^(deb |URIs:)' /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null | head -6 || true
           ok=""
