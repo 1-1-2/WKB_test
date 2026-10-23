@@ -63,9 +63,9 @@ static void toggle_connection(void)
         return;
     }
     {
-        wchar_t host[64] = { 0 }, port[16] = { 0 }, mp[16] = { 0 };
+        wchar_t host[64] = { 0 }, port[16] = { 0 };
         char hostA[96];
-        int cp, media = 0;
+        int cp;
         GetWindowTextW(g_ui.edit_host, host, 64);
         GetWindowTextW(g_ui.edit_port, port, 16);
         WideCharToMultiByte(CP_UTF8, 0, host, -1, hostA, sizeof(hostA), NULL, NULL);
@@ -76,19 +76,8 @@ static void toggle_connection(void)
             g_dirty = 1;
             return;
         }
-        /* 媒体端口：留空 = 随机（默认）；填了就固定，非法值当场拒绝 */
-        if (g_ui.edit_media) {
-            GetWindowTextW(g_ui.edit_media, mp, 16);
-            media = _wtoi(mp);
-            if (mp[0] && (media < 1 || media > 65535)) {
-                ui_log_add("媒体端口须留空或填 1..65535（留空=随机分配）", 1);
-                g_dirty = 1;
-                return;
-            }
-        }
         if (g_ui.drv.state != DRV_READY)
             ui_log_add("提示：驱动未就绪，将只做协议与统计，不出声", 0);
-        eng_set_media_port(media);
         g_ui.running = eng_start(hostA, cp, rate_idx_of(g_ui.seg_rate),
                                  buf_ms_of(g_ui.buf_idx), g_ui.gain);
         ui_log_add(g_ui.running ? "正在建立会话…" : "启动引擎失败",
@@ -166,10 +155,6 @@ static void place_edits(void)
         MoveWindow(g_ui.edit_port, g_lo.ed_port.left, g_lo.ed_port.top,
                    g_lo.ed_port.right - g_lo.ed_port.left,
                    g_lo.ed_port.bottom - g_lo.ed_port.top, TRUE);
-    if (g_ui.edit_media)
-        MoveWindow(g_ui.edit_media, g_lo.ed_media.left, g_lo.ed_media.top,
-                   g_lo.ed_media.right - g_lo.ed_media.left,
-                   g_lo.ed_media.bottom - g_lo.ed_media.top, TRUE);
 }
 
 static void paint(HWND hwnd)
@@ -206,17 +191,12 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_ui.edit_port = CreateWindowExW(0, L"EDIT", L"8125",
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER | ES_CENTER,
             0, 0, 10, 10, hwnd, (HMENU)101, NULL, NULL);
-        g_ui.edit_media = CreateWindowExW(0, L"EDIT", L"",
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER | ES_CENTER,
-            0, 0, 10, 10, hwnd, (HMENU)102, NULL, NULL);
         SetWindowTheme(g_ui.edit_host, L" ", L" ");
         SetWindowTheme(g_ui.edit_port, L" ", L" ");
-        SetWindowTheme(g_ui.edit_media, L" ", L" ");
         {
             HFONT f = ui_font(10, FW_NORMAL, 0);
             SendMessageW(g_ui.edit_host, WM_SETFONT, (WPARAM)f, TRUE);
             SendMessageW(g_ui.edit_port, WM_SETFONT, (WPARAM)f, TRUE);
-            SendMessageW(g_ui.edit_media, WM_SETFONT, (WPARAM)f, TRUE);
         }
         eng_set_logger(eng_log_cb);
         ui_log_add("客户端已启动，等待连接", 0);
@@ -393,12 +373,6 @@ static void on_forwarded(const wchar_t *cmdline)
     if (cli_parse(&a, argc, argv)) {
         if (a.driver_pack) drv_set_external_pack(a.driver_pack);
         if (a.host_pos) SetWindowTextW(g_ui.edit_host, a.host_pos);
-        if (a.media_port > 0 && g_ui.edit_media) {
-            wchar_t buf[16];
-            _snwprintf(buf, 16, L"%d", a.media_port);
-            buf[15] = 0;
-            SetWindowTextW(g_ui.edit_media, buf);
-        }
         if (a.connect) PostMessageW(g_ui.hwnd, WM_APP + 2, 0, 0);
     }
     LocalFree(argv);
@@ -438,12 +412,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE prev, LPSTR cmd, int show)
     argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv) {
         if (!cli_parse(&g_args, argc, argv)) {
-            char line[256];
             cli_ensure_console(1);
-            /* 具体原因优先（例如 --media-port 取值非法），不要只丢一份帮助 */
-            _snprintf(line, sizeof(line), "参数错误：%s\n\n", cli_parse_error());
-            fputs(line, stdout);
-            fflush(stdout);
             cli_print_help();
             LocalFree(argv);
             return CLI_EXIT_PARAM;
