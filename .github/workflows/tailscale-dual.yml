@@ -49,6 +49,18 @@ on:
         description: 'linux-app 等 windows-client 跑完的最长窗口（秒）。B 发现 A 后还要装驱动+录音+跑 womic，典型 8min；走 d3 兜底最坏 ~25min，默认 1200 覆盖'
         required: false
         default: '1200'
+      # 直连调试窗口（debug_hold）：主理人从沙箱 SSH 直连两台 runner 手工调试
+      # （E 步跨网 hello 探活等）。workflow_dispatch 的 boolean 输入在表达式里
+      # 是字符串 'true'/'false'，判等用 == 'true'（勿写成 inputs.debug_hold 真值）。
+      debug_hold:
+        description: 'true = 链路就绪后挂起两端 runner 并开 SSH（linux-app：socat 起来后；windows-client：E 步探活前），供主理人从 tag:ops 节点直连手工调试；窗口到点 workflow 自动继续'
+        required: false
+        default: false
+        type: boolean
+      debug_minutes:
+        description: '调试窗口时长（分钟，默认 20）。linux-app 侧 clamp ≤40、windows-client 侧 clamp ≤55（各自 job 总预算 50/65min）；空或非数字回落 20'
+        required: false
+        default: '20'
 
 # 同一分支排队执行、不自动取消：双机联调是关键路径验证，手动发起，
 # 不应被后续手动触发互相打断；同 ref 排队也避免同时占 4 台 runner /
@@ -681,6 +693,94 @@ jobs:
             || { echo "::error::socat 出口自检失败（hello 未通）"; exit 1; }
 
       # ---------------------------------------------------------------
+      # [debug_hold] 直连调试挂起窗（仅 workflow_dispatch 传 debug_hold=true
+      # 时执行）。为什么挂在这个位置：此时 A 侧链路全貌已就位——socat TCP
+      # 中继已把 tailnet:8125 暴露给 B、app 已在模拟器内运行、UDP 中继已在
+      # 往 B 转发——主理人进门即可看到完整现场并手工跑命令；而 B 尚未开始
+      # E 步探活，挂起不干扰 B 的时序。到点后本步骤正常结束，workflow 继续
+      # 往下跑（等 B 完成 → 汇总判定），语义与不挂起时完全一致。
+      # 预算：job 总 timeout 50min（前置步骤约 13min + 等 B 窗口 + 收证），
+      # 挂起分钟数在步骤内 clamp 到 ≤40；步骤 timeout 给足 46min 兜安装开销。
+      # ACL：tag:ops → tag:ci:22 已放行，tailnet 内 22 端口可达。
+      # ---------------------------------------------------------------
+      - name: A. [debug_hold] 挂起开 SSH（tailnet 直连调试窗）
+        if: ${{ github.event.inputs.debug_hold == 'true' }}
+        timeout-minutes: 46
+        shell: bash
+        env:
+          DEBUG_PUBKEY: ${{ vars.UPTERM_DEBUG_PUBKEY }}
+          DEBUG_MINUTES: ${{ inputs.debug_minutes }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          # 时长容错与 clamp：输入框是自由文本，空/非数字/<=0 一律回落 20；
+          # 超过 40 按 40（job 总预算 50min，见步骤注释）
+          mins=0
+          case "${DEBUG_MINUTES:-}" in
+            ''|*[!0-9]*) mins=20 ;;
+            *) mins="$DEBUG_MINUTES" ;;
+          esac
+          if [ "$mins" -le 0 ]; then mins=20; fi
+          if [ "$mins" -gt 40 ]; then
+            echo "::warning::debug_minutes=$DEBUG_MINUTES 超过 40，按 40 执行（linux-app job 总预算 50min）"
+            mins=40
+          fi
+          # 1) openssh-server 就绪：GitHub ubuntu runner 可能预装但未启动；
+          #    缺则 apt 兜底安装（调试窗口是显式请求的，不做静默降级）
+          if ! command -v sshd >/dev/null 2>&1; then
+            echo "[dbg] 安装 openssh-server"
+            sudo apt-get update -qq || true
+            sudo apt-get install -y -qq openssh-server \
+              || { echo "::error::openssh-server 安装失败"; exit 1; }
+          fi
+          # systemd 与 service 包装因镜像而异，两种启动方式都试
+          sudo systemctl start ssh 2>/dev/null \
+            || sudo service ssh start 2>/dev/null || true
+          # 2) 公钥写进 root 的 authorized_keys（目录 700、文件 600）
+          if [ -z "${DEBUG_PUBKEY:-}" ]; then
+            echo "::error::vars.UPTERM_DEBUG_PUBKEY 为空（仓库变量未配置）"
+            exit 1
+          fi
+          sudo mkdir -p /root/.ssh
+          sudo chmod 700 /root/.ssh
+          printf '%s\n' "$DEBUG_PUBKEY" | sudo tee /root/.ssh/authorized_keys >/dev/null
+          sudo chmod 600 /root/.ssh/authorized_keys
+          # 3) 自检 22 端口在听，不在听即失败（不带着坏窗口挂起）
+          if ! ss -tln 2>/dev/null | grep -qE ':22[[:space:]]'; then
+            echo "::error::22 端口未监听（sshd 未就绪）"
+            sudo systemctl status ssh --no-pager 2>/dev/null || true
+            exit 1
+          fi
+          # 4) 连接信息（Step Summary + 日志；100.x 仅 tailnet 内可达，可安全公开）
+          HOST="womic-dual-linux-${RUN_ID}"
+          IP="${A_IP:-<未取得>}"
+          {
+            echo "### 直连调试窗口已开启（linux-app，$mins 分钟）"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| hostname | \`$HOST\` |"
+            echo "| tailnet IP | \`$IP\` |"
+            echo "| 端口/用户 | \`22\` / \`root\` |"
+            echo "| 窗口时长 | $mins 分钟（到点 workflow 自动继续） |"
+            echo "| ssh | \`ssh -o StrictHostKeyChecking=accept-new root@$IP\` |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          # 5) 链路状态快照（主理人进门即看）
+          echo "[dbg] ===== 链路状态快照 ====="
+          echo "--- tailscale status ---"
+          sudo tailscale status || true
+          echo "--- socat / udp-relay / adb 进程 ---"
+          ps -eo pid,ppid,cmd | grep -E '[s]ocat|[u]dp-relay|[a]db' || echo "(未见相关进程)"
+          echo "--- app 进程（adb shell pidof com.miclink.open）---"
+          timeout 15 adb shell pidof com.miclink.open || echo "(pidof 无输出/失败)"
+          echo "--- 设备侧 UDP 监听（媒体端口 5004=138C / 8126=1FBE）---"
+          timeout 15 adb shell "cat /proc/net/udp /proc/net/udp6 2>/dev/null | grep -iE ':(138C|1FBE)' || echo '(设备侧未见 5004/8126 相关 UDP 行)'" || true
+          # 6) 挂起：到点后本步骤正常结束，workflow 继续往下跑
+          echo "[dbg] 挂起 $mins 分钟（到点自动继续，workflow 语义不变）"
+          sleep "$((mins * 60))"
+          echo "[dbg] 调试窗口结束（$mins 分钟），workflow 继续"
+
+      # ---------------------------------------------------------------
       # 等 B 跑完。主路径：gh api 轮询 windows-client 作业状态
       # （permissions: actions: read），完成即带出结论——B 早败则 A 快速
       # 失败并附 B 的 conclusion，不无脑等满窗口。兜底：gh 不可用
@@ -1140,6 +1240,112 @@ jobs:
             exit 1
           }
           Write-Host "D: 驱动已就绪，INF 路径非空（退出码 0）"
+          exit 0
+
+      # ---------------------------------------------------------------
+      # [debug_hold] 直连调试挂起窗（仅 workflow_dispatch 传 debug_hold=true
+      # 时执行）。为什么挂在这个位置：D 步已确认驱动安装就绪、womic.exe 就绪，
+      # 而 E 步（跨网 TCP 通路就绪探活）尚未跑——主理人进门即可在不动 workflow
+      # 时序的前提下手工跑 E 步命令定位问题（E 步历史失败被 cp1252 编码崩溃
+      # 掩盖，编码问题已在别处修复，本窗口用于验证修复并直连观察）。
+      # 为什么不复用 .github/actions/tailnet-debug composite action：B 步已经
+      # tailscale up 入网，该 action 会重新入网（重复 up 改变节点状态）；这里
+      # 内联其 2.4-2.7 段（OpenSSH + 公钥 + 防火墙 + 自检）保持实现一致。
+      # 到点后本步骤正常结束，workflow 继续跑 E→F→G→H→I，语义不变。
+      # 预算：job 总 timeout 65min，挂起分钟数在步骤内 clamp 到 ≤55；步骤
+      # timeout 给足 60min 兜 OpenSSH 能力安装开销。
+      # ACL：tag:ops → tag:ci:22 已放行，tailnet 内 22 端口可达。
+      # ---------------------------------------------------------------
+      - name: B. [debug_hold] 挂起开 SSH（tailnet 直连调试窗）
+        if: ${{ github.event.inputs.debug_hold == 'true' }}
+        timeout-minutes: 60
+        env:
+          DEBUG_PUBKEY: ${{ vars.UPTERM_DEBUG_PUBKEY }}
+          DEBUG_MINUTES: ${{ inputs.debug_minutes }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 时长容错与 clamp：输入框是自由文本，空/非数字/<=0 一律回落 20；
+          # 超过 55 按 55（job 总预算 65min，见步骤注释）
+          $mins = 0
+          if (-not [int]::TryParse("$env:DEBUG_MINUTES", [ref]$mins)) { $mins = 20 }
+          if ($mins -le 0) { $mins = 20 }
+          if ($mins -gt 55) {
+            Write-Host "::warning::debug_minutes=$env:DEBUG_MINUTES 超过 55，按 55 执行（windows-client job 总预算 65min）"
+            $mins = 55
+          }
+          if ([string]::IsNullOrWhiteSpace($env:DEBUG_PUBKEY)) {
+            Write-Host "::error::vars.UPTERM_DEBUG_PUBKEY 为空（仓库变量未配置）"
+            exit 1
+          }
+          # ---- 2.4 OpenSSH Server（幂等：sshd 服务已存在即跳过能力安装）----
+          if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+            Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+          }
+          if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+            Write-Host "::error::sshd 服务不存在（OpenSSH.Server 能力安装失败）"
+            exit 1
+          }
+          Set-Service sshd -StartupType Automatic
+          Start-Service sshd
+          Write-Host "sshd 状态 = $((Get-Service sshd).Status)"
+          # ---- 2.5 防火墙：只放行 tailscale 适配器入站 22 ----
+          $ruleName = 'sshd (tailnet debug)'
+          Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule | Out-Null
+          $tsAlias = (Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*Tailscale*' } |
+            Select-Object -First 1).Name
+          if ($tsAlias) {
+            New-NetFirewallRule -Name $ruleName -DisplayName 'sshd (tailnet debug)' `
+              -InterfaceAlias $tsAlias -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow | Out-Null
+            Write-Host "防火墙已限定到 tailscale 适配器: $tsAlias（TCP 22 入站）"
+          } else {
+            Write-Host "::warning::未找到 tailscale 适配器，回退放行所有接口 22（主防线仍是 tailnet ACL）"
+            New-NetFirewallRule -Name $ruleName -DisplayName 'sshd (tailnet debug)' `
+              -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow | Out-Null
+          }
+          # ---- 2.6 公钥（runneradmin 是管理员 → administrators_authorized_keys，必须修 ACL）----
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData\ssh" | Out-Null
+          $f = "$env:ProgramData\ssh\administrators_authorized_keys"
+          $env:DEBUG_PUBKEY | Set-Content -Path $f -Encoding ascii
+          icacls $f /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F' | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::icacls 修复 ACL 失败"; exit 1 }
+          # ---- 2.7 自检：22 端口确实在听 ----
+          $listen = (Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue) -ne $null
+          if (-not $listen) { Write-Host "::error::22 端口未监听"; exit 1 }
+          # ---- 连接信息 + B 侧状态快照（Step Summary + 日志）----
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $hostname = "womic-dual-win-$env:GITHUB_RUN_ID"
+          $cand = (& $ts ip -4 2>$null | Select-Object -First 1)
+          $ip = if ($cand) { "$cand".Trim() } else { '<未取得>' }
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'dist\womic.exe'
+          $info = @(
+            "### 直连调试窗口已开启（windows-client，$mins 分钟）",
+            "",
+            "| 项 | 值 |",
+            "|---|---|",
+            "| hostname | ``$hostname`` |",
+            "| tailnet IP | ``$ip`` |",
+            "| 端口/用户 | ``22`` / ``runneradmin`` |",
+            "| 窗口时长 | $mins 分钟（到点 workflow 自动继续 E→F→G→H→I） |",
+            "| ssh | ``ssh -o StrictHostKeyChecking=accept-new runneradmin@$ip`` |",
+            "",
+            "B 侧状态：A_IP=``$env:A_IP`` CONTROL_PORT=``$env:CONTROL_PORT`` womic.exe=``$exe``（存在=$(Test-Path $exe)）"
+          )
+          $info | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $info | Write-Host
+          Write-Host "--- tailscale status ---"
+          & $ts status
+          # ---- 挂起：每 5 分钟心跳，到点后 workflow 继续跑 E 步 ----
+          $deadline = (Get-Date).AddMinutes($mins)
+          $tick = 0
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 60
+            $tick++
+            if ($tick % 5 -eq 0) {
+              $left = [int]($deadline - (Get-Date)).TotalMinutes
+              Write-Host "debug: 窗口剩余约 $left 分钟（$ip，hostname=$hostname）"
+            }
+          }
+          Write-Host "debug: 窗口结束（$mins 分钟），workflow 继续跑 E 步"
           exit 0
 
       # ---------------------------------------------------------------

@@ -149,6 +149,34 @@ runner 与开发者机器都加入同一 **tailnet**（WireGuard 网状 VPN）�
 | 自建成本 | 零 | 需 tailnet 管理权 |
 | 适用 | 一次性人工交互 | 长期/批量/自动化操作 |
 
+### 5.5 直连调试：tailscale-dual 的 debug_hold
+
+`tailscale-dual.yml`（双机联调 workflow）内置了本文通道的一次具体应用：
+**调试窗口挂起（debug_hold）**——主理人从沙箱 SSH 直连两台 runner，在联调
+关键步骤之前手工跑命令，到点后 workflow 自动继续。设计动机：E 步（跨网 TCP
+hello 探活）的失败曾被 cp1252 编码崩溃掩盖，需要"链路原样挂在那里、人登进去
+看现场"的能力，而不是靠一轮轮 CI 试错。
+
+**触发方式**（仅 workflow_dispatch，不挂 push）：
+
+- `debug_hold=true`（boolean 输入）；
+- `debug_minutes`：窗口时长（分钟，默认 `'20'`；linux-app 侧 clamp ≤40、
+  windows-client 侧 clamp ≤55，与两个 job 的总预算 50/65min 匹配；空值或
+  非数字回落 20）。
+
+**挂起位置与语义**（到点后 workflow 正常继续往下跑，不改变任何判据）：
+
+| job | 挂起位置 | 挂起时现场 | 连接方式 |
+|---|---|---|---|
+| linux-app | socat TCP 中继就绪后、等 windows-client 之前 | socat 已起、app 在模拟器内运行、UDP 中继在转发；A 的 tailnet IP 在 Step Summary | `ssh -o StrictHostKeyChecking=accept-new root@<A_IP>` |
+| windows-client | D 步（驱动就绪）后、E 步（跨网探活）前 | 驱动已装、womic.exe 就绪、tailscale 已入网；A_IP/CONTROL_PORT/womic.exe 路径在 Step Summary | `ssh -o StrictHostKeyChecking=accept-new runneradmin@<B_IP>` |
+
+两端 SSH 均只监听 tailnet 内 22 端口（ACL：`tag:ops → tag:ci:22` 已放行），
+公钥取自仓库变量 `vars.UPTERM_DEBUG_PUBKEY`（公钥非敏感，可入库变量）；
+windows-client 侧为内联实现（不复用 `tailnet-debug` action——B 步已入网，
+重复 up 会改变节点状态），Linux 侧 apt 兜底装 openssh-server。两台 runner 都是
+ephemeral 节点，作业结束即注销，无残留攻击面。
+
 ---
 
 ## 6. 选型建议
