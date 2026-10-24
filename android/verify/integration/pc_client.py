@@ -41,6 +41,8 @@ CI 拓扑（adb forward，app 看到的 TCP 对端是设备侧 127.0.0.1）：
     --heartbeat-interval 1.0  105 心跳间隔（秒）
     --dump-packets N       把前 N 个 UDP 包以十六进制打印（调试用）
     --self-test            不连设备，用合成字节流自测解析/断言逻辑
+    --c05-tap-retries 2    C05 未收到首包时，restart tap 后重试的次数
+                          （tap 启动竞态自救；0 = 关闭；不影响 workflow 层重试）
 
 退出码：0 = 全部通过；1 = 存在失败项；2 = 环境/用法错误。
 """
@@ -83,6 +85,15 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_ENV = 2
 
+# UDP tap 的 bind 就绪探测（A 项；run 40049236444 C05 红轮根因修复）：
+# 旧实现 sleep(0.6) + proc.poll() is None 只能证明 adb shell 进程活着，不能
+# 证明 nc 已 bind 媒体端口（shell fork 慢/系统繁忙时会误判"启动成功"，随后 tap
+# 静默死亡，C05 红轮被误导向"app 没发包"）。现在以 /proc/net/udp(6) 出现媒体
+# 端口 hex 监听行为准（5004 → 138C）。
+BIND_READY_TIMEOUT = 10.0     # 累计等待上限（与 C05 首包 10s 窗口匹配）
+BIND_POLL_INTERVAL = 0.25     # 轮询间隔（adb 往返约百 ms，兼顾响应与开销）
+UDP_PROC_FILES = ("/proc/net/udp", "/proc/net/udp6")  # nc -6 时才进 udp6
+
 
 class EnvError(Exception):
     """环境/用法错误（adb 缺失、设备不在线、缺少 toybox nc 等）。"""
@@ -111,6 +122,72 @@ def encode_frame(msg_type, payload):
 
 def hexs(data):
     return " ".join("%02X" % b for b in data)
+
+
+def fmt_exit_code(code):
+    """subprocess 退出码 → 人类可读（None = 尚未收割；负数 = 被信号杀死）。"""
+    if code is None:
+        return "未知"
+    if code < 0:
+        return "%d（被信号 %d 终止）" % (code, -code)
+    return str(code)
+
+
+def udp_port_hex(port):
+    """/proc/net/udp 的 local_address 端口段：4 位十六进制（5004 → 138C）。
+
+    内核把 16 位端口按网络序原样打印成一个 hex 数（无需大小端转换）；
+    比较时大小写不敏感，防内核/toybox 版本差异。
+    """
+    return "%04X" % port
+
+
+def parse_udp_listen_lines(text, port):
+    """从 /proc/net/udp(6) 文本中挑出 local 端口 == port 的行。
+
+    列格式：sl local_address rem_address st tx_queue:rx_queue ...
+    local_address = "hexip:hexport"（如 00000000:138C；udp6 为 32 位 hex ip）。
+    返回 [(st, rx_queue, 原始行), ...]；rx_queue 解析失败记为 -1。兼容老内核
+    "tx_queue rx_queue 分列"格式。端口比较大小写不敏感（5004=138C=138c）。
+    """
+    want = udp_port_hex(port)
+    rows = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or ":" not in parts[1]:
+            continue  # 表头/畸形行
+        if parts[1].rsplit(":", 1)[1].upper() != want:
+            continue
+        try:
+            qfield = parts[4]
+            if ":" in qfield:            # 新内核：tx_queue:rx_queue 单列
+                rx = int(qfield.split(":")[1], 16)
+            else:                        # 老内核：tx_queue rx_queue 分列
+                rx = int(parts[5], 16)
+        except (IndexError, ValueError):
+            rx = -1
+        rows.append((parts[3], rx, line.rstrip()))
+    return rows
+
+
+def filter_nc_ps_lines(ps_out):
+    """从 `ps -A` 输出中挑出真正的 nc 进程行（D 项，降噪）。
+
+    裸 `grep nc` 会把 incidentd/gnss-service/launcher3 等名字含 "nc" 子串的
+    系统进程全匹配进来，真正的 nc 被噪声淹没（run 40049236444 实证：ps 里
+    "没有任何真正的 nc 进程"被一堆含 nc 子串的系统进程掩盖，误导排查方向）。
+    这里按**整词** nc（token 精确匹配）或参数里的 "nc -u"/"nc -l" 形式过滤，
+    并滤掉 grep 自身。
+    """
+    rows = []
+    for line in ps_out.splitlines():
+        s = line.strip()
+        if not s or "grep" in s:
+            continue
+        tokens = s.split()
+        if "nc" in tokens or "nc -u" in s or "nc -l" in s:
+            rows.append(s)
+    return rows
 
 
 class Results:
@@ -380,6 +457,19 @@ class AdbUdpTap:
     ICMP port-unreachable 上报给发送方，但监听就绪再 START 更接近真实场景
     （真实 PC 客户端总是先占住媒体端口）。
 
+    **bind 就绪探测（run 40049236444 根因修复）**：`sleep(0.6)` + `poll()`
+    只能证明 adb shell 进程活着，不能证明 nc 已 bind 媒体端口——shell fork
+    慢/系统繁忙时会误判"启动成功"，随后 tap 静默死亡，C05 红轮被误导向
+    "app 没发包"。`_start_process()` 现在轮询 `/proc/net/udp(6)`，直到出现
+    媒体端口的 hex 监听行（5004 → 138C）且 nc 进程存活；累计 10s 未就绪的
+    候选会被 kill 并换下一个，全部失败抛 `EnvError`（exit=2 环境错误，
+    不混为断言失败 exit=1）。
+
+    **tap 死亡监控（同一次红轮的定向修复）**：`_pump` 读到 EOF（nc 退出）时
+    置线程安全标志并记录退出码；C05 失败信息据此区分"harness 问题"（tap 已
+    死）与"app 发包但 tap 未收到"（tap 活着），不再输出误导人的"app 在跑但
+    没发包"。
+
     **已知局限（重连会话必须 restart）**：toybox `nc -u -l` 收到**首个**数据报后
     会把 socket connect 到该对端（netcat.c：recvfrom(..., MSG_PEEK) 取到对端
     地址后 xconnect），之后内核只交付该对端的包。而 app 每个会话都会新建
@@ -393,15 +483,29 @@ class AdbUdpTap:
 
     MODE = "adb"
 
-    def __init__(self, adb, media_port):
+    def __init__(self, adb, media_port, bind_timeout=BIND_READY_TIMEOUT,
+                 bind_poll_interval=BIND_POLL_INTERVAL):
         self.adb = adb
         self.media_port = media_port
         self.proc = None
+        self.cmd = None
         self.parser = FormatCParser()
         self.queue = queue.Queue()
         self.received = 0
+        self.bind_timeout = bind_timeout
+        self.bind_poll_interval = bind_poll_interval
+        # tap 死亡监控（B 项）：EOF 时置位；death_* 记录退出码与原因
+        self._dead = threading.Event()
+        self.death_reason = None
+        self.death_exit_code = None
+        # 世代号：restart() 换新进程后，旧 pump 线程的死亡上报不污染新会话
+        self._generation = 0
+        self._stopping = False
         self._pump_thread = None
+        self._last_probe_error = None
         self._start_process()
+
+    # ---- 启动：bind 就绪探测（A 项）----
 
     def _start_process(self):
         # 先做一次功能性预检：命令形式不对时进程会立即退出
@@ -409,6 +513,13 @@ class AdbUdpTap:
             "toybox nc -u -l -p %d" % self.media_port,
             "toybox nc -ulp %d" % self.media_port,
         ]
+        # 清掉可能残留的旧 nc（上一次 attempt 被 timeout 杀掉来不及收尾时，
+        # 端口被占会导致新 nc bind 失败退出）。UDP socket close 即释放端口，
+        # pkill 后立刻 bind 不会 EADDRINUSE。
+        self._kill_stale_nc()
+        started_at = time.monotonic()
+        deadline = started_at + self.bind_timeout
+        last_diag = "未尝试任何候选命令"
         for cmd in candidates:
             try:
                 proc = subprocess.Popen(
@@ -419,31 +530,164 @@ class AdbUdpTap:
                 )
             except FileNotFoundError:
                 raise EnvError("找不到 adb 可执行文件：%s" % self.adb.path)
-            time.sleep(0.6)
-            if proc.poll() is None:
+            ready, last_diag = self._wait_bind_ready(proc, cmd, deadline)
+            if ready:
+                self._generation += 1
+                self._dead.clear()
+                self.death_reason = None
+                self.death_exit_code = None
+                self._stopping = False
                 self.proc = proc
                 self.cmd = cmd
-                # proc 以参数传入：restart() 换新进程后，旧线程仍读旧管道，
-                # 不会串到新会话的字节流上
+                # proc/generation 以参数传入：restart() 换新进程后，旧线程仍读
+                # 旧管道，不会串到新会话的字节流上；旧世代的死亡上报也会因
+                # generation 不匹配被丢弃
                 self._pump_thread = threading.Thread(
-                    target=self._pump, args=(proc,), name="udp-tap", daemon=True)
+                    target=self._pump, args=(proc, self._generation),
+                    name="udp-tap", daemon=True)
                 self._pump_thread.start()
+                print("[tap] UDP 监听就绪：%s（端口 %d，hex %s）"
+                      % (cmd, self.media_port, udp_port_hex(self.media_port)),
+                      flush=True)
                 return
-            proc.kill()
+            # 未就绪：杀掉这个候选，把剩余预算给下一个
+            self._terminate(proc)
         raise EnvError(
-            "设备上无法启动 UDP 监听（已尝试：%s）。"
-            "请确认系统镜像是标准 Android 镜像（含 toybox nc）。" % " / ".join(candidates)
-        )
+            "设备上 UDP 监听未就绪（媒体端口 %d / hex %s，累计等待 %.1fs）。"
+            "已尝试命令：%s。最后状态：%s。"
+            "请确认系统镜像是标准 Android 镜像（含 toybox nc）。"
+            "此为环境错误（exit=2），不是断言失败。"
+            % (self.media_port, udp_port_hex(self.media_port),
+               time.monotonic() - started_at, " / ".join(candidates), last_diag))
 
-    def _pump(self, proc):
+    def _wait_bind_ready(self, proc, cmd, deadline):
+        """轮询 /proc/net/udp(6) 直到 nc 真的 bind 了媒体端口（A 项核心）。
+
+        就绪判据 = 出现该端口的 hex 监听行 **且** nc 进程仍活着。两个条件都
+        必要：进程死了监听行会随之消失（tap 静默死亡）；端口被别的进程占着时
+        我们的 nc 会 bind 失败退出，单靠"有监听行"会造成假就绪。
+
+        返回 (ready, diag)；diag 是人类可读的现场描述（进 EnvError 与日志，
+        探测本身也是诊断资产）。
+        """
+        port_hex = udp_port_hex(self.media_port)
+        next_log = time.monotonic() + 2.0
+        while True:
+            rows = self._probe_udp_listen()
+            if proc.poll() is not None:
+                return False, (
+                    "nc 进程已退出（exit=%s），/proc/net/udp(6)%s 端口 %s 的"
+                    "监听行（候选命令：%s）"
+                    % (fmt_exit_code(proc.poll()),
+                       "有" if rows else "无", port_hex, cmd))
+            if rows:
+                return True, "监听行已出现（%d 行，首行 st=%s rx_queue=%s）" % (
+                    len(rows), rows[0][0], rows[0][1])
+            now = time.monotonic()
+            if now >= deadline:
+                return False, (
+                    "nc 进程存活，但等待 %.1fs 后 /proc/net/udp(6) 仍无端口 %d"
+                    "（hex %s）的监听行%s"
+                    % (self.bind_timeout, self.media_port, port_hex,
+                       ("；最后探测错误：%s" % self._last_probe_error)
+                       if self._last_probe_error else ""))
+            if now >= next_log:
+                print("[tap] 仍在等待 nc bind 端口 %d（hex %s），已 %.1fs…"
+                      % (self.media_port, port_hex,
+                         now - (deadline - self.bind_timeout)), flush=True)
+                next_log = now + 2.0
+            time.sleep(self.bind_poll_interval)
+
+    def _probe_udp_listen(self):
+        """读 /proc/net/udp 与 /proc/net/udp6，返回媒体端口监听行列表。
+
+        单条 adb 失败不致命（继续轮询，交给总超时判死）；全部失败时 rows 为空。
+        """
+        rows = []
+        errors = []
+        for proc_file in UDP_PROC_FILES:
+            try:
+                text = self.adb.shell_text("cat %s" % proc_file, timeout=5,
+                                           check=False)
+            except EnvError as e:
+                errors.append("%s：%s" % (proc_file, e))
+                continue
+            rows.extend(parse_udp_listen_lines(text, self.media_port))
+        self._last_probe_error = "；".join(errors) if errors else None
+        return rows
+
+    def _kill_stale_nc(self):
+        """尽力清掉设备内残留的 nc（覆盖两种候选命令形式的匹配）。"""
+        for pattern in ("nc -u -l -p %d" % self.media_port,
+                        "nc -ulp %d" % self.media_port):
+            try:
+                self.adb.shell("pkill -f '%s'" % pattern, timeout=5,
+                               check=False)
+            except EnvError:
+                pass
+
+    @staticmethod
+    def _terminate(proc):
+        """先礼后兵终结合适进程：TERM → 等 3s → KILL。"""
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+    # ---- 数据泵：EOF 即 tap 死亡（B 项）----
+
+    def _pump(self, proc, generation):
         while True:
             try:
                 chunk = proc.stdout.read(65536)
-            except OSError:
+            except OSError as e:
+                self._mark_dead("stdout 读取错误：%s" % e, proc, generation)
                 return
             if not chunk:
+                self._mark_dead("EOF（tap 进程退出）", proc, generation)
                 return
             self.queue.put(chunk)
+
+    def _mark_dead(self, reason, proc, generation):
+        """线程安全地记录 tap 死亡：标志 + 退出码 + 原因（B 项）。
+
+        - 旧世代（restart 前）的 pump 不上报：generation 不匹配直接丢弃，
+          避免旧 tap 的死亡被算到新会话头上；
+        - close() 主动杀的记录为"主动停止"，不置死亡标志、不报警；
+        - 已意外死亡过的不重复上报。
+        """
+        if generation != self._generation or self._dead.is_set():
+            return
+        code = proc.poll()
+        if code is None:
+            # EOF 后 adb shell 可能还没退出：最多再等 1s 拿真实退出码
+            try:
+                code = proc.wait(timeout=1.0)
+            except (subprocess.TimeoutExpired, OSError, ValueError):
+                code = proc.poll()
+        if self._stopping:
+            self.death_reason = "主动停止（%s）" % reason
+            self.death_exit_code = code
+            return
+        self.death_reason = reason
+        self.death_exit_code = code
+        self._dead.set()
+        print("[TAP-DEAD] UDP tap 进程退出：%s（exit=%s）。若 app 侧 logcat 有"
+              "'首个 UDP 包已发送'，这是 harness 问题（tap 启动竞态），不是 app 问题。"
+              % (reason, fmt_exit_code(code)), flush=True)
+
+    @property
+    def dead(self):
+        """tap 是否已意外死亡（EOF/读取错误，且非主动停止）。"""
+        return self._dead.is_set()
 
     def read_packet(self, timeout):
         deadline = time.monotonic() + timeout
@@ -462,15 +706,17 @@ class AdbUdpTap:
             self.parser.feed(chunk)
 
     def restart(self, attempts=4):
-        """换一个全新的设备内监听（重连会话专用；host tap 无此问题）。
+        """换一个全新的设备内监听（重连会话 / C05 失败自救专用）。
 
         原理见类文档字符串：toybox nc 的 connect-to-first-peer 语义会让旧监听
-        丢掉 app 第二会话（新 DatagramSocket、新源端口）的全部包。这里关旧起新，
+        丢掉 app 第二会话（新 DatagramSocket、新源端口）的全部包；C05 红轮的
+        已知根因（tap 启动竞态，run 40049236444）也靠换一个新 nc 来绕过——
+        重启后必须是全新的、未 connect 的监听，绝不复用旧 socket。这里关旧起新，
         并把 parser/queue 一起换掉，杜绝把上个会话的残字节喂给新会话。
 
         调用时机：app 的 CONFIG 与 START 之间——那段时间 app 不发 UDP，
         更换监听零丢包风险。旧 nc 退出到端口释放可能有几百 ms 延迟，
-        新监听起不来时自动重试。
+        新监听起不来时自动重试（_start_process 内含 bind 就绪探测）。
         """
         self.close()
         last_err = None
@@ -488,15 +734,9 @@ class AdbUdpTap:
         raise last_err if last_err else EnvError("UDP 监听重启失败")
 
     def close(self):
+        self._stopping = True
         if self.proc is not None:
-            try:
-                self.proc.terminate()
-            except OSError:
-                pass
-            try:
-                self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+            self._terminate(self.proc)
             self.proc = None
         # 等旧读取线程自然退出（管道 EOF）：否则 restart 后两个线程会同时
         # 往 queue 里灌新旧会话的字节
@@ -505,11 +745,7 @@ class AdbUdpTap:
             t.join(timeout=3)
         self._pump_thread = None
         # 兜底：确保设备侧 nc 也退出（覆盖两种命令形式的匹配）
-        for pattern in ("nc -u -l -p %d" % self.media_port, "nc -ulp %d" % self.media_port):
-            try:
-                self.adb.shell("pkill -f '%s'" % pattern, check=False)
-            except EnvError:
-                pass
+        self._kill_stale_nc()
 
 
 class HostUdpTap:
@@ -548,6 +784,30 @@ class HostUdpTap:
             pass
 
 
+def describe_tap_health(tap):
+    """一句话描述 tap 健康态（C05 失败信息定向用，B 项）。
+
+    三种语义，杜绝旧信息"app 在跑但没发包"式误导（run 40049236444 教训）：
+      - adb tap 已意外死亡/未运行 → harness 问题（tap 启动竞态），不是 app 问题；
+      - adb tap 活着但没收到 → app 发包但 tap 未收到，指向 app 侧；
+      - host tap 是 UDP socket，没有进程生命周期可言。
+    """
+    if getattr(tap, "MODE", None) != "adb":
+        return "UDP tap 为 host socket 模式（无进程生命周期；收不到即链路/app 侧问题）"
+    if getattr(tap, "proc", None) is None:
+        return ("tap 未运行（设备内无 nc 进程）——若 app 侧 logcat 有"
+                "'首个 UDP 包已发送'，这是 harness 问题（tap 启动竞态），"
+                "不是 app 问题")
+    if getattr(tap, "dead", False):
+        return ("tap 进程已退出（exit=%s，%s）——若 app 侧 logcat 有"
+                "'首个 UDP 包已发送'，这是 harness 问题（tap 启动竞态），"
+                "不是 app 问题"
+                % (fmt_exit_code(getattr(tap, "death_exit_code", None)),
+                   getattr(tap, "death_reason", None) or "原因未知"))
+    return ("tap 进程存活（端口 %d 已 bind）但未收到数据 → app 发包但 tap 未收到："
+            "查 app 是否发包（logcat tag=MicCaptureService）" % tap.media_port)
+
+
 def capture_c05_diagnostics(adb, media_port, results):
     """C05 判定失败时抓现场（**必须在 tap.close() 之前调用**）。
 
@@ -555,51 +815,98 @@ def capture_c05_diagnostics(adb, media_port, results):
     "app 没发包"还是"tap 没收到"——收集诊断工件时设备内 nc 进程已退出、
     app 侧也没有首包日志。本函数在杀死 tap 之前抓两样东西：
 
-      1) `ps -A | grep nc`：tap（设备内 toybox nc）进程是否还活着；
-      2) `cat /proc/net/udp`：媒体端口（16 进制）的监听行与队列计数——
-         有监听行且 rx_queue 非零 = 包到达过内核但没人读（adb stdout
-         回传链路卡住）；无监听行 = tap 从未监听成功或已退出。
+      1) `ps -A | grep -E '(^| )nc( |$)|nc -u'`：tap（设备内 toybox nc）进程
+         是否还活着。**不用裸 `grep nc`**：incidentd/gnss-service/launcher3
+         等系统进程名含 "nc" 子串，噪声会淹没真正的 nc（run 40049236444
+         实证：ps 里"没有任何真正的 nc 进程"被一堆含 nc 子串的系统进程
+         掩盖，把排查引向错误方向）；
+      2) `cat /proc/net/udp` 与 `/proc/net/udp6`：媒体端口（16 进制，大小写
+         不敏感）的监听行与队列计数——有监听行且 rx_queue 非零 = 包到达过
+         内核但没人读（adb stdout 回传链路卡住）；无监听行 = tap 从未监听
+         成功或已退出。
 
     与 app 侧"首个 UDP 包已发送"logcat（MicCaptureService）互补：
-    下次 C05 变红时，两相印证即可分钟级定性是 app 侧还是 tap 侧。
+    C05 变红时，两相印证即可分钟级定性是 app 侧还是 tap 侧。
     全部为只读操作，单条失败只记录、不影响收尾流程。
     """
-    port_hex = "%04X" % media_port
     results.info("---- C05 失败现场抓取（kill tap 之前，仅 adb tap 模式）----")
 
-    # 1) tap 进程是否还活着（grep 自身也会出现在 ps 里，过滤掉）
+    # 1) tap 进程是否还活着（D 项：精确匹配，避开含 "nc" 子串的系统进程噪声）
     try:
-        ps_out = adb.shell_text("ps -A | grep nc", timeout=10, check=False)
-        ps_lines = [l.strip() for l in ps_out.splitlines()
-                    if l.strip() and "grep" not in l]
+        ps_out = adb.shell_text("ps -A | grep -E '(^| )nc( |$)|nc -u'",
+                                timeout=10, check=False)
+        ps_lines = filter_nc_ps_lines(ps_out)
         if ps_lines:
             for l in ps_lines:
                 results.info("  ps: %s" % l)
         else:
             results.info("  ps: 设备内无 nc 进程（tap 未运行或已退出 → tap 侧问题）")
     except EnvError as e:
-        results.info("  ps -A | grep nc 失败：%s" % e)
+        results.info("  ps -A | grep -E '(^| )nc( |$)|nc -u' 失败：%s" % e)
 
-    # 2) /proc/net/udp：媒体端口监听行（local_address 列为 hex ip:port）
-    try:
-        udp_out = adb.shell_text("cat /proc/net/udp", timeout=10, check=False)
-        rows = []
-        for line in udp_out.splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and parts[1].endswith(":" + port_hex):
-                rows.append(line.rstrip())
+    # 2) /proc/net/udp(6)：媒体端口监听行（local_address 列为 hex ip:port）
+    for proc_file in UDP_PROC_FILES:
+        try:
+            udp_out = adb.shell_text("cat %s" % proc_file, timeout=10,
+                                     check=False)
+        except EnvError as e:
+            results.info("  %s 读取失败：%s" % (proc_file, e))
+            continue
+        rows = parse_udp_listen_lines(udp_out, media_port)
         if rows:
-            for r in rows:
-                results.info("  udp: %s" % r)
-            results.info("  udp: 端口 %d（hex %s）有监听行；rx_queue 非零 = 包到过内核但无人读"
-                         % (media_port, port_hex))
+            for _st, _rx, line in rows:
+                results.info("  udp: %s" % line)
+            results.info("  udp: 端口 %d（hex %s）在 %s 有监听行（st=%s）；"
+                         "rx_queue 非零 = 包到过内核但无人读"
+                         "（adb stdout 回传链路卡住）"
+                         % (media_port, udp_port_hex(media_port), proc_file,
+                            rows[0][0]))
         else:
-            results.info("  udp: /proc/net/udp 无端口 %d（hex %s）的监听行"
-                         "（tap 未监听成功或已退出）" % (media_port, port_hex))
-    except EnvError as e:
-        results.info("  cat /proc/net/udp 失败：%s" % e)
+            results.info("  udp: %s 无端口 %d（hex %s）的监听行"
+                         "（tap 未监听成功或已退出）"
+                         % (proc_file, media_port, udp_port_hex(media_port)))
 
     results.info("  判定参考：app 侧是否发包见 logcat '首个 UDP 包已发送'（tag=MicCaptureService）")
+
+
+def c05_wait_first_packet(tap, adb, results, timeout, retries):
+    """C05 首包等待，未收到时 restart tap 自救后重试（C 项）。
+
+    背景（run 40049236444）：C05 红轮的已知根因是 tap 启动竞态——app 已
+    发包（logcat "首个 UDP 包已发送"）但设备内无人监听媒体端口，包被内核
+    丢弃。workflow 层的重试是重跑整个 pc_client.py（约 15s + 退避 5s）；
+    更对症的做法是这里先 restart() 换一个**全新的、未 connect 的** nc 监听
+    （toybox nc 的 connect-to-first-peer 语义要求必须是新 socket，见
+    AdbUdpTap 文档字符串），再重试首包等待。app 此刻仍在持续发包（START 已
+    发），新监听能直接收到；更换窗口内的丢包对"首包到达"断言无影响。
+    workflow 层重试保留为双保险，不删除。
+
+    返回 (pkt, healed)：healed=True 表示首包是 restart 之后才收到的——
+    tap 启动竞态自愈的信号（harness 自愈，不是 app 行为变化）。
+    """
+    pkt = tap.read_packet(timeout=timeout)
+    if pkt is not None:
+        return pkt, False
+    if getattr(tap, "MODE", None) != "adb" or retries <= 0:
+        return None, False
+    for attempt in range(1, retries + 1):
+        results.info("C05 未收到首包（tap 健康态：%s）："
+                     "第 %d/%d 次 restart tap 后重试"
+                     % (describe_tap_health(tap), attempt, retries))
+        # 先抓旧 tap 的现场（必须在 restart 杀它之前，否则 ps 看不到进程、
+        # /proc/net/udp 看不到监听行）
+        capture_c05_diagnostics(adb, tap.media_port, results)
+        try:
+            tap.restart()
+        except EnvError as e:
+            results.info("restart tap 失败（%s），停止 C05 自救" % e)
+            return None, False
+        pkt = tap.read_packet(timeout=timeout)
+        if pkt is not None:
+            results.info("C05 自救成功：restart tap 后收到首包——tap 启动竞态"
+                         "自愈，非 app 修复（详见 README『已知故障模式与自愈』）")
+            return pkt, True
+    return None, False
 
 
 def parse_format_c(pkt):
@@ -842,10 +1149,25 @@ def run_interop(args):
                      % (reply[0], len(reply[1]).to_bytes(4, "big").hex(), hexs(reply[1]))))
 
     # ---- UDP tap 必须在 config/start 之前就绪 ----
-    if args.udp_tap == "host":
-        tap = HostUdpTap(args.media_port, args.bind_host)
-    else:
-        tap = AdbUdpTap(adb, args.media_port)
+    # bind 未就绪（10s 内 /proc/net/udp 无监听行）= 环境错误 EnvError（exit=2），
+    # 不是断言失败——run 40049236444 的教训：tap 没起来时 C05 的红是假红，
+    # 会把排查引向"app 没发包"的错误方向。
+    try:
+        if args.udp_tap == "host":
+            tap = HostUdpTap(args.media_port, args.bind_host)
+        else:
+            tap = AdbUdpTap(adb, args.media_port)
+    except OSError as e:
+        raise EnvError("host UDP tap 绑定 %s:%d 失败：%s"
+                       % (args.bind_host, args.media_port, e))
+    except EnvError:
+        # tap 起不来就别把 TCP 连接和心跳线程泄漏给进程退出
+        heartbeats.stop()
+        try:
+            client.close()
+        except OSError:
+            pass
+        raise
     results.info("UDP 回收方式：%s（媒体端口 %d）" % (tap.MODE, args.media_port))
 
     # ---- config（102）----
@@ -867,21 +1189,28 @@ def run_interop(args):
 
     # ---- 首个 UDP 包：格式 C 字节级 ----
     tracker = StreamTracker(expected_volume=args.volume)
-    pkt = tap.read_packet(timeout=args.first_packet_timeout)
-    first_packet_failed = False
-    if pkt is None:
-        first_packet_failed = True
+    # C 项：C05 未收到首包时先 restart tap 再重试（tap 启动竞态自救），
+    # 比 workflow 层重跑整个脚本更对症更快；--skip-adb-setup 时没有可用
+    # adb，不试（交给 workflow 层重试兜底）。
+    c05_retries = 0 if args.skip_adb_setup else args.c05_tap_retries
+    pkt, c05_self_healed = c05_wait_first_packet(
+        tap, adb, results, args.first_packet_timeout, c05_retries)
+    first_packet_failed = pkt is None
+    if first_packet_failed:
         # 没有 UDP 流，后续断言全部失去意义：探一下 TCP 是否还活着，给出指向性诊断后收尾。
         # 注意：对端关闭时 recv_frame 抛 ConnectionClosed，必须兜住（否则整个脚本崩掉）。
         try:
             alive = client.recv_frame(timeout=1.0) is None
-            state = "仍存活（app 在跑但没发包：查 OpusEncoder/UdpSender）" \
-                if alive else "已收到帧（异常）"
+            state = "仍存活（app TCP 侧在线）" if alive else "已收到帧（异常）"
         except ConnectionClosed:
             state = "已断开（app 侧主动关闭：看门狗超时？或 app 报错退出，查 logcat）"
+        # B 项：失败信息按 tap 健康态定向——tap 已死/未运行 = harness 问题
+        # （tap 启动竞态）；tap 活着没收到 = app 发包但 tap 未收到。旧信息
+        # "app 在跑但没发包"会把排查引向错误方向（run 40049236444 教训）。
         results.check("C05", "udp_first_packet_format_c", False,
-                      "%ds 内未收到任何 UDP 包；TCP 控制通道%s"
-                      % (args.first_packet_timeout, state))
+                      "%ds 内未收到任何 UDP 包；TCP 控制通道%s；%s"
+                      % (args.first_packet_timeout, state,
+                         describe_tap_health(tap)))
         results.info("诊断建议：adb logcat -d | grep -iE 'womic|UdpSender|OpusEncoder|MicCapture'")
     else:
         hdr = tracker.observe(pkt)
@@ -899,6 +1228,9 @@ def run_interop(args):
                              hdr["payload_len"], hdr["total"]))
             if args.dump_packets > 0:
                 print("       [dump] %s" % hexs(pkt[:64]), flush=True)
+        if c05_self_healed:
+            results.info("注意：C05 首包是 restart tap 之后才收到的（tap 启动竞态自愈）——"
+                         "这是 harness 自愈，不是 app 行为变化（详见 README『已知故障模式与自愈』）")
 
     if first_packet_failed:
         # C05 失败现场抓取：必须在 tap.close()（杀 nc）之前执行，否则 ps 看不到
@@ -1090,6 +1422,9 @@ def parse_args(argv):
     p.add_argument("--connect-timeout", type=float, default=30.0, help="TCP 连接重试总时长（秒）")
     p.add_argument("--reconnect-timeout", type=float, default=15.0, help="重连等待（秒）")
     p.add_argument("--dump-packets", type=int, default=0, help="十六进制转印前 N 个 UDP 包")
+    p.add_argument("--c05-tap-retries", type=int, default=2,
+                   help="C05 未收到首包时，restart tap 后重试的次数"
+                        "（tap 启动竞态自救；0=关闭，默认 2；不影响 workflow 层重试）")
     p.add_argument("--skip-adb-setup", action="store_true",
                    help="跳过 adb 设备检查与 forward 设置（自行准备好 TCP/UDP 通路时用，"
                         "例如对 mock server 做本地干跑）")
@@ -1102,6 +1437,8 @@ def parse_args(argv):
         args.udp_tap = "adb" if args.control_host in ("127.0.0.1", "localhost") else "host"
     if args.volume not in range(0, 256):
         p.error("--volume 必须在 0..255")
+    if args.c05_tap_retries < 0:
+        p.error("--c05-tap-retries 不能为负")
     if args.hold_seconds <= WATCHDOG_MS / 1000.0:
         p.error("--hold-seconds 必须大于看门狗周期 %ds" % (WATCHDOG_MS // 1000))
     return args

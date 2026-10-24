@@ -12,6 +12,7 @@ UDP sender）跑完整会话闭环。
 | 文件 | 作用 |
 |---|---|
 | `pc_client.py` | 联调脚本。纯 Python 标准库（无第三方依赖），CI 与本机均可跑 |
+| `test_pc_client.py` | 离线单测（mock adb / mock Popen，不连设备）：bind 就绪探测、tap 死亡监控、C05 restart 自救、诊断降噪 |
 
 ## 运行方式
 
@@ -60,7 +61,7 @@ UDP 媒体流发往**设备自己的 loopback**——必须在模拟器内用
 `10.0.2.15:8125`）：此时 app 的 TCP 对端是 `10.0.2.2`，UDP 直接发到 host
 loopback，脚本在 host 侧用 UDP socket 回收即可。
 
-> **nc 的生命周期（两个实测教训）**：
+> **nc 的生命周期（三个实测教训）**：
 > 1. 必须在 CONFIG/START 之前启动：app 的 UDP socket 未 connect，虽然 Linux 不会
 >    把 ICMP port-unreachable 上报给发送方，但监听就绪再 START 更接近真实场景
 >    （真实 PC 客户端总是先占住媒体端口）。
@@ -68,6 +69,46 @@ loopback，脚本在 host 侧用 UDP socket 回收即可。
 >    `nc -u -l` 收到首个数据报后会 `xconnect()` 到该对端（netcat.c:229），之后
 >    内核只交付该对端的包；app 每个会话新建 DatagramSocket（新源端口），旧监听
 >    会丢掉第二会话的全部包（run 39473353065 实证 C15 udp=none）。
+> 3. **"启动了"不等于"bind 成功了"**：必须以 `/proc/net/udp(6)` 出现媒体端口
+>    hex 监听行为准（脚本自动做，见下节"已知故障模式与自愈"）。`sleep(0.6)` +
+>    `poll()` 只能证明 adb shell 进程活着，adb fork 慢时会误判（run 40049236444
+>    实证，C05 两次 attempt 全红的根因）。
+
+## 已知故障模式与自愈（**C05 红轮 ≠ 代码 bug**）
+
+**C05（`udp_first_packet_format_c`）失败不代表 app 有 bug。** 已钉死的根因是
+harness 侧 UDP tap 的**启动竞态**（run 40049236444，commit `eded428f`，两次
+attempt 现场完全一致）：
+
+- app 侧 logcat 齐全（"已打开 UDP -> 127.0.0.1:5004（协商媒体端口）" +
+  "首个 UDP 包已发送 seq=0 ts=39227"），证明 app 正常发包；
+- tap 侧 `/proc/net/udp` 无 5004（hex `138C`）的监听行、`ps` 里没有任何真正的
+  nc 进程，证明 tap 根本没起来；
+- app 发往 `127.0.0.1:5004` 的包被内核直接丢弃（设备内无人监听）。
+
+绿的时候 tap 是好的、红的时候 tap 没起，同代码一红一绿，历史上被误判成
+"链路抖动"——本质是 tap 启动竞态：旧实现 `sleep(0.6)` + `poll()` 只能证明
+adb shell 进程活着，不能证明 nc 已 bind 媒体端口（adb fork 慢/系统繁忙时
+误判"启动成功"，随后 tap 静默死亡）。
+
+> CI 全程调试音模式（`--ez extra.debug_tone true`，**不开 AudioRecord**），
+> "模拟器麦克风无声"是**错误**解释，不要往这个方向排查。
+
+### 内置的自愈与定向手段（`pc_client.py`）
+
+| # | 手段 | 落点 |
+|---|---|---|
+| 1 | **bind 就绪探测**：启动 nc 后轮询 `/proc/net/udp(6)`，出现媒体端口 hex 监听行（5004 → `138C`）且 nc 进程存活才算就绪；累计 10s 未就绪 → 换候选命令/抛 `EnvError`（exit=2 环境错误，不混为断言失败 exit=1） | `AdbUdpTap._start_process()` / `_wait_bind_ready()` |
+| 2 | **tap 死亡监控**：`_pump` 读到 EOF（nc 退出）即置线程安全标志并记录退出码；C05 失败信息按 tap 健康态定向——tap 已死 = "harness 问题，不是 app 问题"；tap 活着没收到 = "app 发包但 tap 未收到" | `AdbUdpTap._pump()` / `_mark_dead()` / `describe_tap_health()` |
+| 3 | **C05 失败 restart 自救**：C05 未收到首包时，先 restart tap（换一个全新的、未 connect 的 nc 监听，toybox connect-to-first-peer 语义要求新 socket）再重试首包等待（默认 2 次，`--c05-tap-retries` 可调），比重跑整个脚本更快更对症；workflow 层（`.github/workflows/android.yml`）的整脚本重试**保留**为双保险 | `c05_wait_first_packet()` |
+| 4 | **诊断降噪**：C05 现场抓取用 `ps -A \| grep -E '(^| )nc( \|$)\|nc -u'` 精确匹配 nc 进程（裸 `grep nc` 会被 incidentd/gnss-service/launcher3 等含 "nc" 子串的系统进程淹没），并同时查 `/proc/net/udp` 与 `/proc/net/udp6`（端口 hex 大小写不敏感） | `capture_c05_diagnostics()` / `filter_nc_ps_lines()` / `parse_udp_listen_lines()` |
+
+离线回归（不连设备）：
+
+```bash
+python3 pc_client.py --self-test      # 9/9
+python3 test_pc_client.py             # mock adb 单测（含上述两个 CI 实证场景）
+```
 
 ## 断言清单（C01–C15）
 
@@ -106,6 +147,7 @@ loopback，脚本在 host 侧用 UDP socket 回收即可。
 | 层级 | 状态 | 证据 |
 |---|---|---|
 | `--self-test`（9 项，合成字节流） | 全绿 | 本机 `python3 pc_client.py --self-test` |
+| mock adb 单测（26 项，`test_pc_client.py`） | 全绿 | 本机 `python3 test_pc_client.py`（覆盖"shell 活着但 nc 从未 bind""nc bind 后立刻退出"两个 CI 实证场景） |
 | mock server 干跑（15/15） | 全绿 | 本机，`docs/VERIFICATION.md` A4c(2) |
 | **CI 模拟器真 app 闭环（C01–C15）** | **全绿 15/15** | run [39523580260](https://github.com/1-1-2/WKB_test/actions/runs/39523580260)（2026-10-21T00:58:36Z，commit `58ab0f0`，job 118975309559） |
 | 真机（物理手机）联调 | 待执行 | — |
