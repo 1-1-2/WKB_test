@@ -47,9 +47,51 @@
 
     <!-- ==================== 抽屉导航（T05） ==================== -->
     <string name="nav_home">主页</string>
+    <string name="nav_capture">采集设置</string>
     <string name="nav_appearance">外观</string>
     <string name="nav_about">关于与帮助</string>
     <string name="nav_open_drawer">打开导航抽屉</string>
+
+    <!-- ==================== 采集设置（音源 / 麦克风 / 系统效果） ==================== -->
+    <string name="capture_section_source">音源模式</string>
+    <string name="capture_section_mic">麦克风</string>
+    <string name="capture_section_effects">系统降噪 / 回声 / 增益</string>
+
+    <string name="capture_source_default">默认（跟随系统）</string>
+    <string name="capture_source_default_desc">由系统与厂商决定，多数设备等价于「麦克风」。官方 app 使用此档，当前默认值即此档。</string>
+    <string name="capture_source_mic">麦克风</string>
+    <string name="capture_source_mic_desc">标准麦克风采集。系统可能附加轻量处理（因设备而异）。</string>
+    <string name="capture_source_voice_recognition">语音识别</string>
+    <string name="capture_source_voice_recognition_desc">为语音识别调校：通常不做激进降噪，保留更多原始细节。</string>
+    <string name="capture_source_voice_communication">语音通话</string>
+    <string name="capture_source_voice_communication_desc">走通话链路（AEC/NS/AGC），部分设备会强制降到 16kHz。WO Mic 是单向推流，一般不需要。</string>
+    <string name="capture_source_camcorder">摄像录音</string>
+    <string name="capture_source_camcorder_desc">为摄像场景调校（偏向远场与方向性处理），单声道下差异不明显。</string>
+    <string name="capture_source_unprocessed">原始数据（UNPROCESSED）</string>
+    <string name="capture_source_unprocessed_desc">完全不经系统处理，需要设备支持；可配合下方系统效果开关自建处理链。</string>
+    <string name="capture_source_unprocessed_unsupported">当前设备不支持 UNPROCESSED 音源（系统属性未声明），已禁用。</string>
+
+    <string name="capture_mic_auto">跟随系统（自动）</string>
+    <string name="capture_mic_auto_desc">由系统选择当前路由的输入设备（插入耳机/USB 声卡时自动切换）。</string>
+    <string name="capture_mic_routed">当前实际生效：%1$s</string>
+    <string name="capture_mic_not_recording">当前未在录音，所选设备将在下次开始推流时生效。</string>
+    <string name="capture_mic_hint">列表来自系统输入设备枚举；选中后经 AudioRecord.setPreferredDevice 应用，若设备失效会自动回退系统默认并提示。</string>
+
+    <string name="capture_effect_ns">降噪（NS）</string>
+    <string name="capture_effect_ns_desc">系统 NoiseSuppressor，抑制稳态噪声。</string>
+    <string name="capture_effect_aec">回声消除（AEC）</string>
+    <string name="capture_effect_aec_desc">系统 AcousticEchoCanceler，消除扬声器回声。单向推流一般不需要。</string>
+    <string name="capture_effect_agc">自动增益（AGC）</string>
+    <string name="capture_effect_agc_desc">系统 AutomaticGainControl，自动放大过小声级。</string>
+    <string name="capture_effect_unavailable">当前设备不支持该效果（系统未提供对应音效实现）</string>
+    <string name="capture_effect_hint">开关变更即时生效：正在推流时会自动重建录音链路（可能有半秒左右杂音）。「原始数据」音源下系统可能拒绝附加效果。</string>
+    <string name="capture_debug_tone_note">调试音模式已开启：不打开 AudioRecord，以下采集选项暂不生效。</string>
+    <string name="capture_location_hint">麦克风 / 音源 / 降噪等采集选项见抽屉「采集设置」</string>
+
+    <string name="capture_msg_settings_applied">采集选项已变更，正在重建录音链路（可能有短暂杂音）</string>
+    <string name="capture_msg_device_missing">所选输入设备当前不可用（可能已拔出），本次使用系统默认设备</string>
+    <string name="capture_msg_device_switch_failed">无法切换到所选输入设备「%1$s」（设备失效或不支持），本次使用系统默认设备</string>
+    <string name="capture_msg_effect_failed">系统%1$s启用失败：%2$s</string>
 
     <!-- ==================== 外观设置（T05） ==================== -->
     <string name="theme_section_mode">主题模式</string>

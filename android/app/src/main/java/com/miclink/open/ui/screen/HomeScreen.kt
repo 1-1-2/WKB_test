@@ -16,7 +16,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
@@ -27,7 +26,6 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -52,6 +50,10 @@ import com.miclink.open.ui.theme.WomicTheme
  * 连接状态 / 手机地址 / 统计 / 电平。原贴在底部的"使用说明"卡已移入
  * [AboutScreen]（导航重构后主页只留操作相关元素）。
  *
+ * 一次性错误/消息弹窗不在这里：已上移到 AppNav 的应用级弹窗（覆盖在当前
+ * 目的地之上），所有页面共用（同一事实一处实现）。
+ * 麦克风 / 音源 / 系统效果等采集选项在抽屉的"采集设置"页（[CaptureScreen]）。
+ *
  * @param vm 主界面状态容器；
  * @param onStartClicked 启动服务（含权限申请流程，由 Activity 实现）；
  * @param onStopClicked 停止服务。
@@ -63,21 +65,6 @@ fun HomeScreen(
     onStopClicked: () -> Unit
 ) {
     val state = vm.uiState
-
-    // 错误提示（一次性）：展示中 -> 关闭时消费
-    val error = state.error
-    if (error != null) {
-        AlertDialog(
-            onDismissRequest = { vm.consumeError() },
-            title = { Text(stringResource(R.string.app_name)) },
-            text = { Text(error) },
-            confirmButton = {
-                TextButton(onClick = { vm.consumeError() }) {
-                    Text("知道了")
-                }
-            }
-        )
-    }
 
     Column(
         modifier = Modifier
@@ -182,6 +169,13 @@ fun HomeScreen(
                 enabled = !state.isRunning
             )
         }
+
+        // 采集选项入口提示（麦克风 / 音源 / 系统效果在抽屉的"采集设置"页）
+        Text(
+            text = stringResource(R.string.capture_location_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
     }
 }
 

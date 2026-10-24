@@ -94,12 +94,19 @@ class MainActivity : ComponentActivity() {
         override fun onError(message: String) {
             vm.onError(message)
         }
+
+        override fun onMessage(message: String) {
+            vm.onMessage(message)
+        }
     }
 
     /** 定时刷新统计与监听地址。 */
     private val uiRefreshRunnable = object : Runnable {
         override fun run() {
             vm.pollStats(service)
+            // 采集选项变更即时推送给运行中的服务（500ms 内生效，见
+            // MicCaptureService.updateCaptureSettings：推流中会重建 AudioRecord）
+            vm.pushCaptureSettings(service)
             service?.let { vm.onListeningAddress(it.listeningAddress()) }
             mainHandler.postDelayed(this, UI_REFRESH_INTERVAL_MS)
         }

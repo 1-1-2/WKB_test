@@ -19,6 +19,10 @@ data class MainUiState(
     val controlPortText: String = Prefs.DEFAULT_CONTROL_PORT.toString(),
     val volume: Int = Prefs.DEFAULT_VOLUME,
     val debugTone: Boolean = false,
+    // 采集选项（音源 / 麦克风 / 系统效果）：与端口不同，录音中也可改，即时生效
+    val capture: CaptureSettings = CaptureSettings(),
+    // 当前实际生效的输入设备（AudioRecord.getRoutedDevice；未录音为 null）
+    val routedDeviceLabel: String? = null,
     // 服务状态
     val state: String = MicCaptureService.STATE_IDLE,
     val detail: String = "",
@@ -30,8 +34,10 @@ data class MainUiState(
     // 电平
     val rmsDb: Float = LevelMeter.SILENCE_DB,
     val peakDb: Float = LevelMeter.SILENCE_DB,
-    // 错误提示（一次性事件，UI 展示后应调 [consumeError]）
-    val error: String? = null
+    // 错误提示（一次性事件，UI 展示后应调 [consumeMessage]）
+    val error: String? = null,
+    // 非致命提示（一次性事件，服务仍在运行；与 error 共用同一弹窗，error 优先）
+    val message: String? = null
 ) {
     val isRunning: Boolean get() = MicCaptureService.isRunning
     val isStreaming: Boolean get() = MicCaptureService.isStreaming
@@ -60,13 +66,24 @@ class MainViewModel : ViewModel() {
     /** 主题存储（[loadTheme] 时保留引用；Prefs 持有 applicationContext，无泄漏风险）。 */
     private var themeStore: Prefs? = null
 
+    /**
+     * 配置存储（[loadConfig] 时保留引用）：采集选项每次变更即时落盘用。
+     * 与 [themeStore] 分开命名：主题与运行配置的写盘时机不同（见类注释）。
+     */
+    private var configStore: Prefs? = null
+
+    /** 有待推送给运行中服务的采集选项（下次 [pushCaptureSettings] 时同步）。 */
+    private var capturePushPending = false
+
     /** Activity 创建时从 Prefs 灌入可编辑配置。 */
     fun loadConfig(prefs: Prefs) {
+        configStore = prefs
         val config = prefs.load()
         uiState = uiState.copy(
             controlPortText = config.controlPort.toString(),
             volume = config.volume,
-            debugTone = config.debugTone
+            debugTone = config.debugTone,
+            capture = config.capture
         )
     }
 
@@ -88,7 +105,8 @@ class MainViewModel : ViewModel() {
         return Prefs.Config(
             controlPort = port,
             volume = uiState.volume,
-            debugTone = uiState.debugTone
+            debugTone = uiState.debugTone,
+            capture = uiState.capture
         )
     }
 
@@ -104,6 +122,59 @@ class MainViewModel : ViewModel() {
 
     fun onDebugToneChanged(value: Boolean) {
         uiState = uiState.copy(debugTone = value)
+    }
+
+    // ------------------------------------------------------------------
+    // 采集选项（变更即时生效 + 即时落盘，录音中也可改）
+    // ------------------------------------------------------------------
+
+    /** 音源模式变更（id 见 [AudioSourceIds]；UI 已对不支持的档位禁用）。 */
+    fun onAudioSourceChanged(id: Int) {
+        updateCapture(uiState.capture.copy(audioSource = id))
+    }
+
+    /** 输入设备变更（[CaptureSettings.MIC_DEVICE_AUTO] = 跟随系统）。 */
+    fun onMicDeviceChanged(id: Int) {
+        updateCapture(uiState.capture.copy(micDeviceId = id))
+    }
+
+    /** 系统降噪（NoiseSuppressor）开关。 */
+    fun onNoiseSuppressorChanged(value: Boolean) {
+        updateCapture(uiState.capture.copy(noiseSuppressor = value))
+    }
+
+    /** 系统回声消除（AcousticEchoCanceler）开关。 */
+    fun onEchoCancelerChanged(value: Boolean) {
+        updateCapture(uiState.capture.copy(echoCanceler = value))
+    }
+
+    /** 系统自动增益（AutomaticGainControl）开关。 */
+    fun onGainControlChanged(value: Boolean) {
+        updateCapture(uiState.capture.copy(gainControl = value))
+    }
+
+    /**
+     * 统一的采集选项变更入口：改状态（重组 UI）-> 落盘（重启后保持）-> 标记待推送
+     * （服务在推流时由 [pushCaptureSettings] 即时同步过去，重建 AudioRecord）。
+     */
+    private fun updateCapture(capture: CaptureSettings) {
+        if (capture == uiState.capture) {
+            return
+        }
+        uiState = uiState.copy(capture = capture)
+        configStore?.saveCaptureSettings(capture)
+        capturePushPending = true
+    }
+
+    /**
+     * 把待推送的采集选项同步给运行中的服务（Activity 的 500ms 刷新循环调用）。
+     * 服务未绑定/未启动时跳过：选项已落盘，下次 START 经 Intent 带入。
+     */
+    fun pushCaptureSettings(service: MicCaptureService?) {
+        if (!capturePushPending) return
+        val svc = service ?: return
+        svc.updateCaptureSettings(uiState.capture)
+        capturePushPending = false
     }
 
     // ------------------------------------------------------------------
@@ -152,15 +223,23 @@ class MainViewModel : ViewModel() {
         uiState = uiState.copy(
             packets = svc.packetsSent(),
             bytes = svc.bytesSent(),
-            failures = svc.sendFailures()
+            failures = svc.sendFailures(),
+            routedDeviceLabel = svc.routedDeviceLabel()
         )
     }
 
+    /** 错误（服务会自行停止；UI 弹一次性对话框，见 [consumeMessage]）。 */
     fun onError(message: String) {
         uiState = uiState.copy(error = message)
     }
 
-    fun consumeError() {
-        uiState = uiState.copy(error = null)
+    /** 非致命提示（服务继续运行时的明确告知，如设备切换失败）。 */
+    fun onMessage(message: String) {
+        uiState = uiState.copy(message = message)
+    }
+
+    /** 消费一次性提示（错误优先展示；两者一起清掉）。 */
+    fun consumeMessage() {
+        uiState = uiState.copy(error = null, message = null)
     }
 }

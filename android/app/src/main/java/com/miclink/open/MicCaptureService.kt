@@ -13,7 +13,6 @@ import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
-import android.media.MediaRecorder
 import android.os.Binder
 import android.os.Build
 import android.os.Handler
@@ -64,7 +63,9 @@ import kotlin.math.sin
  *   4) **硬件热切换自愈**：AudioDeviceCallback 置位后重建 AudioRecord；
  *   5) **调试音模式**：无麦克风权限（或只想验证链路）时发送 440Hz 正弦，
  *      不创建 AudioRecord；
- *   6) **协议层全部委托 :core**（帧编解码/会话/包化均有字节级单元测试），
+ *   6) **采集选项**（音源模式 / 麦克风 / 系统 NS/AEC/AGC）：见 [CaptureSettings]，
+ *      默认值 = 改动前行为；调试音模式下这些选项一律不生效（没有 AudioRecord）；
+ *   7) **协议层全部委托 :core**（帧编解码/会话/包化均有字节级单元测试），
  *      本类只负责 Android 侧的线程与资源编排。
  */
 class MicCaptureService : Service() {
@@ -79,6 +80,12 @@ class MicCaptureService : Service() {
 
         /** 出错（服务会自行停止）。 */
         fun onError(message: String)
+
+        /**
+         * 非致命提示（服务继续运行）：如"无法切换到所选麦克风，已回退系统默认设备"。
+         * 与 [onError] 的区别：本通道不停止服务，UI 弹出一次性对话框即可。
+         */
+        fun onMessage(message: String)
     }
 
     companion object {
@@ -90,6 +97,13 @@ class MicCaptureService : Service() {
         const val EXTRA_CONTROL_PORT = "extra.control_port"
         const val EXTRA_VOLUME = "extra.volume"
         const val EXTRA_DEBUG_TONE = "extra.debug_tone"
+
+        // 采集选项（CaptureSettings，均有默认值：缺省即改动前行为）
+        const val EXTRA_AUDIO_SOURCE = "extra.audio_source"
+        const val EXTRA_MIC_DEVICE_ID = "extra.mic_device_id"
+        const val EXTRA_NOISE_SUPPRESSOR = "extra.noise_suppressor"
+        const val EXTRA_ECHO_CANCELER = "extra.echo_canceler"
+        const val EXTRA_GAIN_CONTROL = "extra.gain_control"
 
         const val CHANNEL_ID = "womic_capture"
         const val CHANNEL_NAME = "WO Mic 麦克风采集"
@@ -154,6 +168,11 @@ class MicCaptureService : Service() {
                 putExtra(EXTRA_CONTROL_PORT, config.controlPort)
                 putExtra(EXTRA_VOLUME, config.volume)
                 putExtra(EXTRA_DEBUG_TONE, config.debugTone)
+                putExtra(EXTRA_AUDIO_SOURCE, config.capture.audioSource)
+                putExtra(EXTRA_MIC_DEVICE_ID, config.capture.micDeviceId)
+                putExtra(EXTRA_NOISE_SUPPRESSOR, config.capture.noiseSuppressor)
+                putExtra(EXTRA_ECHO_CANCELER, config.capture.echoCanceler)
+                putExtra(EXTRA_GAIN_CONTROL, config.capture.gainControl)
             }
         }
 
@@ -204,6 +223,13 @@ class MicCaptureService : Service() {
     @Volatile
     private var recorder: AudioRecord? = null
 
+    /** 系统效果（NS/AEC/AGC）：跟 AudioRecord 会话走，重建录音时先 release 再 attach。 */
+    @Volatile
+    private var audioEffects: SystemAudioEffects? = null
+
+    /** 输入设备枚举 / 能力查询（framework 薄封装，懒加载避免 onCreate 之外的无谓初始化）。 */
+    private val deviceManager: AudioDeviceManager by lazy { AudioDeviceManager(this) }
+
     // encoder / udpSender 由主线程创建释放、采集线程读写，必须 volatile。
     @Volatile
     private var encoder: OpusEncoder? = null
@@ -233,6 +259,16 @@ class MicCaptureService : Service() {
     private var volume: Int = Prefs.DEFAULT_VOLUME
     @Volatile
     private var debugTone: Boolean = false
+
+    /**
+     * 采集选项（主线程经 [updateCaptureSettings] 写、采集线程经 [openRecorder] 读）。
+     * 默认值 = 改动前行为：DEFAULT 音源 / 跟随系统设备 / 无系统效果。
+     */
+    @Volatile
+    private var captureSettings: CaptureSettings = CaptureSettings()
+
+    /** 采集选项变更（UI 推送）后需要重建 AudioRecord（调试音模式下忽略）。 */
+    private val captureSettingsChanged = AtomicBoolean(false)
 
     /** 协商出的编码参数（CONFIG 消息，主线程写、UI 线程读）。 */
     @Volatile
@@ -266,6 +302,7 @@ class MicCaptureService : Service() {
                 controlPort = intent.getIntExtra(EXTRA_CONTROL_PORT, Prefs.DEFAULT_CONTROL_PORT)
                 volume = intent.getIntExtra(EXTRA_VOLUME, Prefs.DEFAULT_VOLUME)
                 debugTone = intent.getBooleanExtra(EXTRA_DEBUG_TONE, false)
+                captureSettings = readCaptureSettings(intent)
                 startCapture()
             }
             else -> {
@@ -360,6 +397,63 @@ class MicCaptureService : Service() {
 
     /** 连续发送失败次数。 */
     fun sendFailures(): Int = udpSender?.failureStreak ?: 0
+
+    /**
+     * 当前实际生效的输入设备名（[AudioRecord.getRoutedDevice]，API 24+）。
+     *
+     * 与"用户选了啥"是两回事：设备可能失效/被系统改路由，UI 必须显示这个值
+     * 而不是偏好值。未在录音（无 AudioRecord）时返回 null。
+     */
+    fun routedDeviceLabel(): String? {
+        val rec = recorder ?: return null
+        return try {
+            rec.routedDevice?.let { AudioDeviceManager.deviceLabel(it) }
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "读取 routedDevice 失败：${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 更新采集选项（UI 在主线程调用，见 [MainViewModel.pushCaptureSettings]）。
+     *
+     * **变更即时生效**：正在推流时置位 [captureSettingsChanged]，采集线程走与
+     * "硬件热切换"同一条重建路径释放并重建 AudioRecord（含重新应用设备偏好与
+     * 系统效果），用户无需停止推流；未推流时只记录，下次 START 经 Intent 带入。
+     * 选择"即时生效"而非"下次录音时生效"的理由：麦克风/音源切换的典型场景就是
+     * 会话进行中（插入 USB 声卡、发现默认音源被系统改坏），要求用户先断链重来
+     * 体验更差；且重建路径本就为硬件热插拔存在，已被现有代码验证过。
+     */
+    fun updateCaptureSettings(settings: CaptureSettings) {
+        val sanitized = settings.sanitize(unprocessedSupported = deviceManager.isUnprocessedSupported())
+        if (sanitized == captureSettings) {
+            return
+        }
+        captureSettings = sanitized
+        captureSettingsChanged.set(true)
+        android.util.Log.i(
+            TAG,
+            "采集选项已更新：audioSource=${sanitized.audioSource}，" +
+                "micDeviceId=${sanitized.micDeviceId}，" +
+                "ns=${sanitized.noiseSuppressor} aec=${sanitized.echoCanceler} " +
+                "agc=${sanitized.gainControl}"
+        )
+        if (isStreaming) {
+            postMessage(getString(R.string.capture_msg_settings_applied))
+        }
+    }
+
+    /** 从 START Intent 读取采集选项并清洗（未知音源/不支持的 UNPROCESSED 回落 DEFAULT）。 */
+    private fun readCaptureSettings(intent: Intent): CaptureSettings {
+        val raw = CaptureSettings(
+            audioSource = intent.getIntExtra(EXTRA_AUDIO_SOURCE, AudioSourceIds.DEFAULT),
+            micDeviceId = intent.getIntExtra(EXTRA_MIC_DEVICE_ID, CaptureSettings.MIC_DEVICE_AUTO),
+            noiseSuppressor = intent.getBooleanExtra(EXTRA_NOISE_SUPPRESSOR, false),
+            echoCanceler = intent.getBooleanExtra(EXTRA_ECHO_CANCELER, false),
+            gainControl = intent.getBooleanExtra(EXTRA_GAIN_CONTROL, false)
+        )
+        return raw.sanitize(unprocessedSupported = deviceManager.isUnprocessedSupported())
+    }
 
     private fun isConnected(): Boolean = connection?.isClosed == false && connection != null
 
@@ -767,14 +861,29 @@ class MicCaptureService : Service() {
         val toneInc = 2.0 * PI * TONE_FREQUENCY_HZ / actualSampleRate.coerceAtLeast(1)
 
         while (!Thread.currentThread().isInterrupted) {
-            // 硬件变化（插拔耳机/USB 声卡/蓝牙）：重建 AudioRecord（调试音模式无此问题）
-            if (hardwareChanged.getAndSet(false) && !debugTone) {
-                android.util.Log.i(TAG, "检测到音频设备变化，重建 AudioRecord")
+            // 硬件变化（插拔耳机/USB 声卡/蓝牙）或采集选项变更（UI 推送）：
+            // 重建 AudioRecord（调试音模式没有 AudioRecord，无需处理）
+            val deviceChanged = hardwareChanged.getAndSet(false)
+            val settingsChanged = captureSettingsChanged.getAndSet(false)
+            if ((deviceChanged || settingsChanged) && !debugTone) {
+                android.util.Log.i(
+                    TAG,
+                    if (deviceChanged) {
+                        "检测到音频设备变化，重建 AudioRecord"
+                    } else {
+                        "采集选项变更，重建 AudioRecord"
+                    }
+                )
                 releaseRecorder()
                 SystemClock.sleep(RESTART_BACKOFF_MS)
                 val rec = openRecorder(negotiatedSampleRate, framesPerPacket)
                 if (rec == null) {
-                    mainHandler.post { fail("音频设备变化后无法重新初始化 AudioRecord") }
+                    val reason = if (settingsChanged) {
+                        "应用新采集选项时 AudioRecord 重建失败：${lastError ?: "未知原因"}"
+                    } else {
+                        "音频设备变化后无法重新初始化 AudioRecord"
+                    }
+                    mainHandler.post { fail(reason) }
                     return
                 }
                 recorder = rec
@@ -911,10 +1020,19 @@ class MicCaptureService : Service() {
     /**
      * 打开 AudioRecord。
      *
-     * 音频源用 [MediaRecorder.AudioSource.DEFAULT]：与官方 app 默认值一致
-     * （证据 V1/f.java：audioSource=0）。WO Mic 是单向推流（手机麦克风 -> PC），
-     * 手机上不存在回声环路，无需 VOICE_COMMUNICATION 的 AEC 通路；且 DEFAULT
-     * 不会像 VOICE_COMMUNICATION 那样在部分设备上强制降到 16kHz。
+     * 音源默认 [AudioSourceIds.DEFAULT]（= `MediaRecorder.AudioSource.DEFAULT`），
+     * 与官方 app 默认值一致（证据 V1/f.java：audioSource=0），用户可在"采集设置"
+     * 里改选其他档位（含需设备支持的 UNPROCESSED，读取时已清洗回落）。
+     * 选档理由：WO Mic 是单向推流（手机麦克风 -> PC），手机上不存在回声环路，
+     * 无需 VOICE_COMMUNICATION 的 AEC 通路；且 DEFAULT 不会像
+     * VOICE_COMMUNICATION 那样在部分设备上强制降到 16kHz。
+     *
+     * 输入设备：用户在"采集设置"里选定后经 [CaptureSettings.micDeviceId] 传入，
+     * 由 [applyPreferredDevice] 在 startRecording 之前应用；未选（自动）时
+     * 不调用 setPreferredDevice，与改动前行为一致。
+     *
+     * 系统效果（NS/AEC/AGC）：录音开始后由 [attachSystemEffects] 绑定到本会话，
+     * 全部由 framework 效果类实现（零自研算法）。
      *
      * 采样率：按协商值申请；部分设备仍会强制调整，此时以 [AudioRecord.getSampleRate]
      * 的**实际值**为准重新推导编码器参数并继续推流（PC 端按协商率解码，极端情况下
@@ -923,6 +1041,7 @@ class MicCaptureService : Service() {
      * @return 成功返回 AudioRecord；失败返回 null 并置 [lastError]
      */
     private fun openRecorder(sampleRate: Int, frameSize: Int): AudioRecord? {
+        val settings = captureSettings
         val minBuffer = AudioRecord.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_IN_MONO,
@@ -938,7 +1057,7 @@ class MicCaptureService : Service() {
 
         val rec = try {
             AudioRecord.Builder()
-                .setAudioSource(MediaRecorder.AudioSource.DEFAULT)
+                .setAudioSource(settings.audioSource)
                 .setAudioFormat(
                     AudioFormat.Builder()
                         .setSampleRate(sampleRate)
@@ -964,6 +1083,11 @@ class MicCaptureService : Service() {
             android.util.Log.e(TAG, lastError!!)
             return null
         }
+
+        // 输入设备偏好：必须在 startRecording 之前设置（setPreferredDevice 对已
+        // 开始录音的会话是否生效依设备而定，不赌）。失败不中止推流：回退系统
+        // 默认设备并给用户明确提示（见 [applyPreferredDevice]）。
+        applyPreferredDevice(rec)
 
         val actual = rec.sampleRate
         if (actual != sampleRate) {
@@ -1026,10 +1150,100 @@ class MicCaptureService : Service() {
             }
             return null
         }
+
+        // 系统效果（NS/AEC/AGC）绑定本次录音会话；失败只提示不中止
+        attachSystemEffects(rec)
         return rec
     }
 
+    /**
+     * 应用用户选择的输入设备（`AudioRecord.setPreferredDevice`，API 23+）。
+     *
+     * 策略（不静默失败）：
+     *  - 自动（[CaptureSettings.MIC_DEVICE_AUTO]）：清除既有偏好后交还系统路由；
+     *  - 设备已不存在（拔出）：提示 + 回退系统默认设备；
+     *  - setPreferredDevice 返回 false（设备失效/本会话不支持）：提示 + 回退。
+     * 两种情况都**继续推流**：断链比用错设备更糟，用户提示里已说明实际在用默认设备。
+     *
+     * @return 成功时返回生效的设备，否则 null。
+     */
+    private fun applyPreferredDevice(rec: AudioRecord): AudioDeviceInfo? {
+        val settings = captureSettings
+        if (settings.micDeviceId == CaptureSettings.MIC_DEVICE_AUTO) {
+            try {
+                rec.setPreferredDevice(null)
+            } catch (t: Throwable) {
+                android.util.Log.w(TAG, "清除设备偏好失败：${t.message}")
+            }
+            return null
+        }
+        val device = deviceManager.deviceById(settings.micDeviceId)
+        if (device == null) {
+            postMessage(getString(R.string.capture_msg_device_missing))
+            android.util.Log.w(TAG, "所选输入设备当前不可用：id=${settings.micDeviceId}，回退系统默认")
+            return null
+        }
+        val applied = try {
+            rec.setPreferredDevice(device)
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "setPreferredDevice 异常：${t.message}")
+            false
+        }
+        if (!applied) {
+            postMessage(
+                getString(
+                    R.string.capture_msg_device_switch_failed,
+                    AudioDeviceManager.deviceLabel(device)
+                )
+            )
+            android.util.Log.w(
+                TAG,
+                "setPreferredDevice 返回 false：${AudioDeviceManager.deviceLabel(device)}，回退系统默认"
+            )
+            return null
+        }
+        android.util.Log.i(TAG, "已偏好输入设备：${AudioDeviceManager.deviceLabel(device)}")
+        return device
+    }
+
+    /** 按当前采集选项把系统效果绑到录音会话（无效果开关时释放既有对象）。 */
+    private fun attachSystemEffects(rec: AudioRecord) {
+        // 防御：无论调用方是否已释放，先清既有对象，避免"忘了先 release"的泄漏路径
+        releaseSystemEffects()
+        val settings = captureSettings
+        if (!settings.hasAnyEffect()) {
+            return
+        }
+        val effects = SystemAudioEffects()
+        effects.attach(
+            sessionId = rec.audioSessionId,
+            settings = settings
+        ) { name, reason ->
+            postMessage(getString(R.string.capture_msg_effect_failed, name, reason))
+        }
+        audioEffects = effects
+        val active = effects.describe()
+        android.util.Log.i(
+            TAG,
+            "系统效果已绑定会话 ${rec.audioSessionId}：${active.ifEmpty { "（无效果生效）" }}"
+        )
+    }
+
+    /** 释放系统效果（必须在 AudioRecord.release 之前；可重复调用）。 */
+    private fun releaseSystemEffects() {
+        val effects = audioEffects
+        audioEffects = null
+        effects?.release()
+    }
+
+    /** 非致命提示 -> 主线程 listener（服务继续运行）。 */
+    private fun postMessage(message: String) {
+        mainHandler.post { listener?.onMessage(message) }
+    }
+
     private fun releaseRecorder() {
+        // 效果持有录音会话：必须先于 recorder.release() 释放，否则静默泄漏
+        releaseSystemEffects()
         val rec = recorder
         recorder = null
         if (rec == null) {
