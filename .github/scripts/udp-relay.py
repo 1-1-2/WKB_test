@@ -39,21 +39,23 @@ import argparse
 import json
 import os
 import signal
+import socket
+import sys
+import time
 
 # Windows 上 Python 的 stdout/stderr 默认用本地代码页（GitHub Windows runner 的
 # Python 3.12 是 cp1252），打印中文会抛 UnicodeEncodeError 把真正的失败原因吞掉
 # （run 40057271618 实证：B 侧 hello 探活本就超时，却只看到编码 traceback）。
 # 显式按 UTF-8 输出，写不出的字符用 ? 替换而不是崩溃。
+# 位置约束：必须在全部 import 之后执行——本块引用 sys，放到 import 之前会
+# NameError 启动即崩（与 emu-redir.py run 40075392632 同一事故类型）；
+# T22 用 --help 冒烟守护这个不变量。
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         try:
             _stream.reconfigure(encoding="utf-8", errors="replace")
         except (ValueError, OSError):
             pass
-
-import socket
-import sys
-import time
 
 DEFAULT_BIND = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 8126

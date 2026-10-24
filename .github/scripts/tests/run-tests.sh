@@ -541,6 +541,27 @@ out=$(FAKE_ADB_NC_STATE="$TMP/nc_state21c" FAKE_ADB_NC_EMIT_FILE="$EMIT_FILE" FA
 assert_contains "$out" "字节流被通道破坏" "T21d 毁帧原因可定位（PTY/ONLCR）"
 
 # ---------------------------------------------------------------------------
+# T22：三个 Python 脚本 --help 启动冒烟（import 期/启动期崩溃回归防护）
+#
+# 背景（run 40075392632 回归修复）：给 CI 脚本加 Windows cp1252 编码保护时，
+# UTF-8 保护块被误插到 `import sys` 之前，脚本一启动就 NameError。这类缺陷
+# py_compile 查不出（语法正确，纯运行期错误），linux-app 的 emu-redir.py
+# 因此启动崩溃，选路步骤的 redir 兜底整个失效。--help 会走完解释器启动 +
+# 全部 import + argparse 构建，是覆盖 import 期/启动期崩溃的最轻量探针；
+# 三个脚本逐个执行，断言退出码 0 且输出非空——任何同类回归都会转红。
+# ---------------------------------------------------------------------------
+echo "== T22 三脚本 --help 冒烟：import 期不崩、启动即退出码 0 =="
+t22_detail=""
+for py in emu-redir.py udp-relay.py womic-hello-probe.py; do
+  out=$(python3 "$SCRIPTS/$py" --help 2>&1); rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    t22_detail="${t22_detail}${py}: rc=$rc 输出=${out:0:200}；"
+  fi
+done
+[ -z "$t22_detail" ] && ok "T22 三脚本 --help 均退出码 0 且输出非空" \
+    || bad "T22 三脚本 --help 启动冒烟" "$t22_detail"
+
+# ---------------------------------------------------------------------------
 echo
 echo "================ 单元测试结果 ================"
 echo "  通过 $PASS，失败 $FAIL"
