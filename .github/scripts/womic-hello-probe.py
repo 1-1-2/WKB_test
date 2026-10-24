@@ -28,6 +28,18 @@ import struct
 import sys
 import time
 
+# Windows 上 Python 的 stdout/stderr 默认用本地代码页（GitHub Windows runner 的
+# Python 3.12 是 cp1252），打印中文会抛 UnicodeEncodeError 把真正的失败原因吞掉
+# （run 40057271618 实证：B 侧 hello 探活本就超时，却只看到编码 traceback）。
+# 显式按 UTF-8 输出，写不出的字符用 ? 替换而不是崩溃。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 MSG_HELLO = 101  # 0x65
 # 官方 Windows 客户端 6.3 的 hello 负载（objdump @0x4147be 实证）：
 # payload[0]=4 选 UDP 头格式 C，payload[1..5] 手机端跳过不读。

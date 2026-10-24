@@ -39,6 +39,18 @@ import argparse
 import json
 import os
 import signal
+
+# Windows 上 Python 的 stdout/stderr 默认用本地代码页（GitHub Windows runner 的
+# Python 3.12 是 cp1252），打印中文会抛 UnicodeEncodeError 把真正的失败原因吞掉
+# （run 40057271618 实证：B 侧 hello 探活本就超时，却只看到编码 traceback）。
+# 显式按 UTF-8 输出，写不出的字符用 ? 替换而不是崩溃。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
 import socket
 import sys
 import time
