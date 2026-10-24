@@ -5,6 +5,12 @@
 > **实现**：[`../tools/api_push.py`](../tools/api_push.py)（本文方法论的参考实现，已在仓库中）。
 > **关联**：各通道的完整对比见 [`tailscale-channel.md`](tailscale-channel.md)。
 
+> **⚠ 2026-10-24 结论更新（优先阅读）**：阶段 1 的"git-over-HTTPS 认证被拒"结论**已不成立**。
+> 经私有 **git 反代**（`ghgit-` 前缀）+ `oauth2:<PAT>` 内嵌 URL 可正常 push——建分支、
+> 删分支、强推均实证通过，**秒级完成**（对比 API 重放每提交约 30-60s）。
+> **当前通道分工**：git 代理（`ghgit-`）管推拉；API 代理（`ghapi-`）只管 Actions /
+> metadata 查询。API 重放降级为无 git 协议环境下的备用通道，其代价与踩坑复盘见 §7。
+
 ---
 
 ## 1. 环境约束（问题定义）
@@ -123,3 +129,42 @@ git push https://oauth2:<YOUR_PAT>@github.com/<owner>/<repo>.git
   [`tailscale-channel.md`](tailscale-channel.md) §4）；
 - 无论走哪条路：**先分清是网络问题还是凭证问题**（30 秒 curl 对照），
   **凭据永不落配置**，**推完校验远端 tree**。
+
+---
+
+## 7. 2026-10-24 复盘：API 重放的代价与通道分工
+
+一次 25 提交历史重写中，API 重放通道被完整压测，结论修正如下。
+
+### 7.1 两条通道对照（同一仓库、同一网络环境实测）
+
+| 维度 | git 反代直推（`ghgit-`） | API 重放（`ghapi-` / Git Data API） |
+|---|---|---|
+| 单次推送耗时 | **秒级**（一次 pack 上传） | 15-25 分钟（每提交 30-60s，226 次 blob POST） |
+| 原子性 | 原子（一个 ref 更新） | 非原子（每提交一次 PATCH，中途断则半途） |
+| 远端 SHA | **与本地一致**（对象原样传输） | 与本地不同（重放产生新对象，仅 tree 可比对） |
+| 失败模式 | 连接层错误自动重试即可 | 连接重置、Cloudflare 拦 UA、半途静默中断 |
+| 适用 | 常规推拉、建/删分支、force push | 无 git 协议通道时的兜底 |
+
+### 7.2 API 重放踩坑实录（均已修复，`tools/api_push.py` 内固化）
+
+1. **`diff-tree` 默认不递归**：孤儿根的全量 diff 只报目录名（`A tools`）而非其下文件，
+   目录条目（mode `040000` + type `blob`）导致 `422 InvalidObject`。修复：`--root -r`，
+   且 `local_file_mode` 对目录模式直接报错而非静默造垃圾 blob。
+2. **重放 sha 与本地史不相交**：`git fetch` 远端重放 tip 后，`rev-list remote0..HEAD`
+   **不报错**却返回整个本地史（两套对象无共同祖先），若直接推送会把全史叠在重放史上
+   形成污染历史（中间树全错、终态树却可能碰巧正确，极具迷惑性）。
+   修复：以 `merge-base --is-ancestor` 判定快进资格，非祖先一律走 tree 匹配回退。
+3. **Cloudflare 按浏览器签名拦 Python-urllib**（Error 1010）：API 走私有反代时需带
+   浏览器 UA；curl 能过不代表 urllib 能过。
+4. **直连 `api.github.com` 不稳定**：长任务中途 `RemoteDisconnected`；重试 + 换反代后消失。
+5. **长任务不能只看 tee 的退出码**：`python ... | tee log` 的退出码是 tee 的，python
+   崩溃会被掩盖；必须 `set -o pipefail` 或检查日志尾部。
+
+### 7.3 通道分工（团队约定）
+
+| 操作 | 通道 |
+|---|---|
+| push / fetch / 建删分支 / force push / 打 tag | git 反代 `https://oauth2:$PAT@gg.823333.xyz/ghgit-<key>/<owner>/<repo>.git` |
+| Actions（dispatch/取消/看 run）、refs 与 commit 元数据查询 | API 反代 `https://gg.823333.xyz/ghapi-<key>/repos/<owner>/<repo>/...`（带浏览器 UA） |
+| 无 git 协议可用时的最后兜底 | `tools/api_push.py`（Git Data API 重放） |
