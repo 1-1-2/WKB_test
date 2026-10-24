@@ -255,13 +255,41 @@ REPO_ROOT="$(cd "$SCRIPTS/../.." && pwd)"
 TAP_STUB="$TMP/bin/adb-tap"
 cat > "$TAP_STUB" <<'STUB_EOF'
 #!/usr/bin/env bash
+# 假 adb：专供 T14~T19 验证 AdbUdpTap 的启动/restart 行为契约。
+#
 # FAKE_ADB_NC_FAILS_ON: 空格分隔的调用序号列表，命中序号的 nc 调用立即退出
-# （模拟"旧 nc 还没释放端口/新 nc 绑定失败"）；其余 nc 调用常驻（sleep）。
+#   （模拟"旧 nc 还没释放端口/新 nc 绑定失败"）；其余 nc 调用常驻（sleep）。
+# FAKE_ADB_NC_COUNT: nc 调用计数文件路径（配合 FAILS_ON 使用）。
+# FAKE_ADB_NC_STATE: "已 bind 端口"状态文件路径——常驻 nc 留下的痕迹：
+#   nc 分支 exec sleep 前把端口写进去（FAILS_ON 命中而 exit 1 的分支不写）；
+#   pkill 分支（进程被杀 = 端口释放）把对应端口移除；cat /proc/net/udp 分支
+#   依据它决定是否输出媒体端口的监听行。以此保证"nc 进程活着"与"/proc/net/udp
+#   有该端口行"两个事实始终一致（pc_client 的 bind 就绪探测正是同时看这两者）。
+# FAKE_ADB_UDP_PROC_MODE: normal（默认，按状态文件输出 138C 行）|
+#   unreadable（cat 报 Permission denied 并非零退出——模拟权限收紧的
+#   ROM/SELinux，验证 pc_client 的降级兜底）| no-port（输出形态逼真但始终
+#   没有媒体端口行——验证"读得到但没 bind 上"不得误降级）。
+state_file="${FAKE_ADB_NC_STATE:-/tmp/fake_adb_tap_state}"
+
+# 端口释放（pkill 命中）：从状态文件移除该端口，与 /proc/net/udp 保持一致
+port_release() {
+  local port="$1" tmp="$state_file.tmp"
+  [ -f "$state_file" ] || return 0
+  grep -v "^${port}$" "$state_file" > "$tmp" 2>/dev/null || true
+  mv "$tmp" "$state_file"
+  [ -s "$state_file" ] || rm -f "$state_file"
+}
+
 if [ "${1:-}" = "shell" ]; then
   shift
   # pkill 的模式串里也含 "nc -u -l" 字样，必须先于 nc 匹配退出，否则挂起
   case "$*" in
-    pkill*) exit 0 ;;
+    pkill*)
+      port=""
+      for a in $*; do port="$a"; done
+      port="${port//[!0-9]/}"   # 剥掉模式串里的引号等非数字字符
+      [ -n "$port" ] && port_release "$port"
+      exit 0 ;;
   esac
   case "$*" in
     *"nc -u -l"*|*"nc -ulp"*)
@@ -273,7 +301,36 @@ if [ "${1:-}" = "shell" ]; then
           [ "$n" -eq "$bad" ] && exit 1
         done
       fi
+      # 常驻 nc = bind 成功：先留痕迹（端口进状态文件）再 exec sleep
+      port=""
+      for a in $*; do port="$a"; done
+      port="${port//[!0-9]/}"
+      [ -n "$port" ] && echo "$port" >> "$state_file"
       exec sleep 600 ;;
+    "cat /proc/net/udp"|"cat /proc/net/udp6")
+      case "${FAKE_ADB_UDP_PROC_MODE:-normal}" in
+        unreadable)
+          # 权限收紧/SELinux：cat 失败并非零退出（stderr 供 pc_client 定位原因）
+          echo "cat: ${*#cat }: Permission denied" >&2
+          exit 1 ;;
+      esac
+      # 形态逼真的假 /proc/net/udp：表头 + 无关端口噪声（含一条 st=01 的
+      # ESTABLISHED 行，模拟 toybox nc 收到首个包后的 xconnect 状态）
+      printf '%s\n' \
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode" \
+        "   0: 0100007F:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 21234 1 0000000000000000 100 0" \
+        "   1: 00000000:01BB 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 23456 1 0000000000000000 100 0" \
+        "   2: 0A00000A:EAF9 0A00000A:0035 01 00000000:00000000 00:00000000 00000000  1000        0 24567 1 0000000000000000 100 0"
+      # 当且仅当状态文件里有端口（即有常驻 nc）时，输出媒体端口的 LISTEN 行
+      if [ "${FAKE_ADB_UDP_PROC_MODE:-normal}" != "no-port" ] && [ -f "$state_file" ]; then
+        idx=3
+        while read -r p; do
+          [ -n "$p" ] || continue
+          printf '   %d: 00000000:%04X 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 34567 1 0000000000000000 100 0\n' "$idx" "$p"
+          idx=$((idx+1))
+        done < "$state_file"
+      fi
+      exit 0 ;;
     *) exit 0 ;;
   esac
 fi
@@ -309,23 +366,81 @@ finally:
 PY
 
 echo "== T14 AdbUdpTap.restart: 换新监听、旧进程退出、状态清零 =="
-out=$(python3 "$TMP/restart_test.py" "$REPO_ROOT/android/verify/integration" "$TAP_STUB" 2>&1); rc=$?
+rm -f "$TMP/nc_state14"
+out=$(FAKE_ADB_NC_STATE="$TMP/nc_state14" \
+      python3 "$TMP/restart_test.py" "$REPO_ROOT/android/verify/integration" "$TAP_STUB" 2>&1); rc=$?
 assert_eq "$rc" "0" "T14a restart 基本路径成功"
 assert_contains "$out" "RESTART-OK" "T14b 报告新旧进程 pid"
 
 echo "== T15 AdbUdpTap.restart: 前两次监听起不来时自动重试 =="
-rm -f "$TMP/nc_count15"
-out=$(FAKE_ADB_NC_FAILS_ON="2 3" FAKE_ADB_NC_COUNT="$TMP/nc_count15" \
+rm -f "$TMP/nc_count15" "$TMP/nc_state15"
+out=$(FAKE_ADB_NC_STATE="$TMP/nc_state15" FAKE_ADB_NC_FAILS_ON="2 3" FAKE_ADB_NC_COUNT="$TMP/nc_count15" \
       python3 "$TMP/restart_test.py" "$REPO_ROOT/android/verify/integration" "$TAP_STUB" 2>&1); rc=$?
 assert_eq "$rc" "0" "T15a 重试后成功"
 assert_contains "$out" "RESTART-OK" "T15b 报告新旧进程 pid"
 
 echo "== T16 AdbUdpTap.restart: 始终起不来时必须报错而不是假装成功 =="
-rm -f "$TMP/nc_count16"
-out=$(FAKE_ADB_NC_FAILS_ON="2 3 4 5 6 7 8 9" FAKE_ADB_NC_COUNT="$TMP/nc_count16" \
+rm -f "$TMP/nc_count16" "$TMP/nc_state16"
+out=$(FAKE_ADB_NC_STATE="$TMP/nc_state16" FAKE_ADB_NC_FAILS_ON="2 3 4 5 6 7 8 9" FAKE_ADB_NC_COUNT="$TMP/nc_count16" \
       python3 "$TMP/restart_test.py" "$REPO_ROOT/android/verify/integration" "$TAP_STUB" 2>&1); rc=$?
 [ "$rc" -ne 0 ] && ok "T16a 退出码非 0" || bad "T16a 退出码非 0" "实得 $rc"
-assert_contains "$out" "无法启动 UDP 监听" "T16b 报错信息可定位"
+assert_contains "$out" "设备上 UDP 监听未就绪" "T16b 报错信息可定位"
+assert_contains "$out" "hex 138C" "T16c 报错含端口/hex 定位信息"
+
+# ---------------------------------------------------------------------------
+# T17/T18/T19：bind 就绪探测读不到 /proc/net/udp 时的降级兜底
+#
+# 背景（run 40061050114 回归修复）：上一个修复给 _start_process 加了
+# /proc/net/udp 轮询探测，但权限收紧的 ROM / SELinux 策略 / 定制镜像可能
+# 根本不允许 adb shell 读它。若把"读不到内容"当成"没 bind 上"，tap 会完全
+# 起不来，比修复前更糟。pc_client 现在区分两种"无监听行"：
+#   (a) 读到了内容但没有该端口的行 → 继续等到超时失败（真的没 bind 上）；
+#   (b) 两个 proc 文件都读不到内容（blind）→ nc 连续存活超过 2s 确认窗后，
+#       按旧判据（进程活着）降级放行，并打印明确的"降级"日志（不静默）。
+# 这里用假 adb 的三种 /proc/net/udp 形态验证这条分界。
+# ---------------------------------------------------------------------------
+cat > "$TMP/tap_start_test.py" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import pc_client
+
+# argv[3] 可选：bind_timeout（T18 用它把超时压到 3s，避免干等满 10s；
+# 判据逻辑与默认 10s 完全一致，只是预算更短）
+bind_timeout = float(sys.argv[3]) if len(sys.argv) > 3 else pc_client.BIND_READY_TIMEOUT
+adb = pc_client.Adb(sys.argv[2])
+tap = pc_client.AdbUdpTap(adb, 5004, bind_timeout=bind_timeout)
+try:
+    assert tap.proc is not None and tap.proc.poll() is None, "tap 启动后应存活"
+    print("TAP-OK %d" % tap.proc.pid)
+finally:
+    tap.close()
+PY
+
+echo "== T17 /proc/net/udp 读不到（Permission denied）→ 降级成功且不静默 =="
+rm -f "$TMP/nc_state17"
+out=$(FAKE_ADB_NC_STATE="$TMP/nc_state17" FAKE_ADB_UDP_PROC_MODE=unreadable \
+      python3 "$TMP/tap_start_test.py" "$REPO_ROOT/android/verify/integration" "$TAP_STUB" 2>&1); rc=$?
+assert_eq "$rc" "0" "T17a 读不到 /proc/net/udp 时 tap 仍能启动（降级）"
+assert_contains "$out" "降级" "T17b 日志明确标注降级（不静默）"
+assert_contains "$out" "Permission denied" "T17c 降级原因可定位（含 adb stderr）"
+assert_contains "$out" "TAP-OK" "T17d 启动后 nc 进程存活"
+
+echo "== T18 /proc/net/udp 正常但始终无 138C 行 → 超时失败，不得误降级 =="
+rm -f "$TMP/nc_state18"
+out=$(FAKE_ADB_NC_STATE="$TMP/nc_state18" FAKE_ADB_UDP_PROC_MODE=no-port \
+      python3 "$TMP/tap_start_test.py" "$REPO_ROOT/android/verify/integration" "$TAP_STUB" 3.0 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "T18a 退出码非 0" || bad "T18a 退出码非 0" "实得 $rc"
+assert_contains "$out" "设备上 UDP 监听未就绪" "T18b 明确报告未就绪"
+assert_not_contains "$out" "降级" "T18c 读得到内容时不得降级（等到超时）"
+
+echo "== T19 /proc/net/udp 读不到但 nc 立即退出 → 不得降级放行死进程 =="
+rm -f "$TMP/nc_count19" "$TMP/nc_state19"
+out=$(FAKE_ADB_NC_STATE="$TMP/nc_state19" FAKE_ADB_UDP_PROC_MODE=unreadable \
+      FAKE_ADB_NC_FAILS_ON="1 2 3 4 5 6 7 8 9" FAKE_ADB_NC_COUNT="$TMP/nc_count19" \
+      python3 "$TMP/restart_test.py" "$REPO_ROOT/android/verify/integration" "$TAP_STUB" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "T19a 退出码非 0" || bad "T19a 退出码非 0" "实得 $rc"
+assert_contains "$out" "设备上 UDP 监听未就绪" "T19b 明确报告未就绪"
+assert_not_contains "$out" "降级" "T19c 进程已退出时不得降级（优先级高于 blind）"
 
 # ---------------------------------------------------------------------------
 echo

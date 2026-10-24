@@ -94,6 +94,15 @@ BIND_READY_TIMEOUT = 10.0     # 累计等待上限（与 C05 首包 10s 窗口�
 BIND_POLL_INTERVAL = 0.25     # 轮询间隔（adb 往返约百 ms，兼顾响应与开销）
 UDP_PROC_FILES = ("/proc/net/udp", "/proc/net/udp6")  # nc -6 时才进 udp6
 
+# 读不到 /proc/net/udp 时的降级确认窗（run 40061050114 回归修复）：
+# bind 就绪探测依赖读 /proc/net/udp(6)，但权限收紧的 ROM / SELinux 策略 /
+# 定制镜像可能根本不允许 adb shell 读它。此时"没有监听行"不能证明 nc 没
+# bind 上——若一律按未就绪处理，tap 会完全起不来，比修复前更糟（修复前
+# 至少 poll() 能放过大多数情况）。因此：两个 proc 文件都读不到内容
+# （blind）且 nc 进程连续存活超过本窗口时，按旧判据（进程活着）降级放行，
+# 并打印明确的"降级"日志（不静默放弃 bind 就绪探测的保护）。
+BIND_DEGRADE_CONFIRM = 2.0    # 降级确认窗（秒）；调小时须保证 < BIND_READY_TIMEOUT
+
 
 class EnvError(Exception):
     """环境/用法错误（adb 缺失、设备不在线、缺少 toybox nc 等）。"""
@@ -465,6 +474,17 @@ class AdbUdpTap:
     候选会被 kill 并换下一个，全部失败抛 `EnvError`（exit=2 环境错误，
     不混为断言失败 exit=1）。
 
+    **读不到 /proc/net/udp 时降级（run 40061050114 回归修复）**：bind 就绪
+    探测依赖读 `/proc/net/udp(6)`，但权限收紧的 ROM / SELinux 策略 / 定制
+    镜像可能根本不允许 adb shell 读它——若把"读不到"当成"没 bind 上"，
+    tap 会完全起不来，比修复前更糟（修复前至少 poll() 能放过大多数情况）。
+    `_probe_udp_listen()` 因此区分两种"无监听行"：(a) 读到了内容但没有该
+    端口的行（继续等到超时，这才是真的没 bind 上）；(b) 两个 proc 文件都
+    读不到内容（没有能见度，无法证伪 nc 是否已 bind）。属于 (b) 且 nc 进程
+    连续存活超过 `BIND_DEGRADE_CONFIRM`（2s）时，按旧判据（进程活着）降级
+    放行，并打印 `[tap] 降级：无法读取 /proc/net/udp(6)（原因：...）`——
+    降级不静默，使用者能从日志知道这次没享受到 bind 就绪探测的保护。
+
     **tap 死亡监控（同一次红轮的定向修复）**：`_pump` 读到 EOF（nc 退出）时
     置线程安全标志并记录退出码；C05 失败信息据此区分"harness 问题"（tap 已
     死）与"app 发包但 tap 未收到"（tap 活着），不再输出误导人的"app 在跑但
@@ -484,7 +504,8 @@ class AdbUdpTap:
     MODE = "adb"
 
     def __init__(self, adb, media_port, bind_timeout=BIND_READY_TIMEOUT,
-                 bind_poll_interval=BIND_POLL_INTERVAL):
+                 bind_poll_interval=BIND_POLL_INTERVAL,
+                 bind_degrade_confirm=BIND_DEGRADE_CONFIRM):
         self.adb = adb
         self.media_port = media_port
         self.proc = None
@@ -494,6 +515,11 @@ class AdbUdpTap:
         self.received = 0
         self.bind_timeout = bind_timeout
         self.bind_poll_interval = bind_poll_interval
+        # 读不到 /proc/net/udp 时的降级确认窗（秒）：blind 且 nc 连续存活
+        # 这么久 → 按进程存活判据放行（见 _wait_bind_ready）
+        self.bind_degrade_confirm = bind_degrade_confirm
+        # 本次启动是否走了降级判据（没验证端口 bind）——进 describe_tap_health
+        self.bind_degraded = False
         # tap 死亡监控（B 项）：EOF 时置位；death_* 记录退出码与原因
         self._dead = threading.Event()
         self.death_reason = None
@@ -530,13 +556,14 @@ class AdbUdpTap:
                 )
             except FileNotFoundError:
                 raise EnvError("找不到 adb 可执行文件：%s" % self.adb.path)
-            ready, last_diag = self._wait_bind_ready(proc, cmd, deadline)
+            ready, degraded, last_diag = self._wait_bind_ready(proc, cmd, deadline)
             if ready:
                 self._generation += 1
                 self._dead.clear()
                 self.death_reason = None
                 self.death_exit_code = None
                 self._stopping = False
+                self.bind_degraded = degraded
                 self.proc = proc
                 self.cmd = cmd
                 # proc/generation 以参数传入：restart() 换新进程后，旧线程仍读
@@ -546,8 +573,10 @@ class AdbUdpTap:
                     target=self._pump, args=(proc, self._generation),
                     name="udp-tap", daemon=True)
                 self._pump_thread.start()
-                print("[tap] UDP 监听就绪：%s（端口 %d，hex %s）"
-                      % (cmd, self.media_port, udp_port_hex(self.media_port)),
+                print("[tap] UDP 监听就绪：%s（端口 %d，hex %s）%s"
+                      % (cmd, self.media_port, udp_port_hex(self.media_port),
+                         "（降级：读不到 /proc/net/udp，按进程存活判据放行）"
+                         if degraded else ""),
                       flush=True)
                 return
             # 未就绪：杀掉这个候选，把剩余预算给下一个
@@ -563,29 +592,65 @@ class AdbUdpTap:
     def _wait_bind_ready(self, proc, cmd, deadline):
         """轮询 /proc/net/udp(6) 直到 nc 真的 bind 了媒体端口（A 项核心）。
 
-        就绪判据 = 出现该端口的 hex 监听行 **且** nc 进程仍活着。两个条件都
-        必要：进程死了监听行会随之消失（tap 静默死亡）；端口被别的进程占着时
-        我们的 nc 会 bind 失败退出，单靠"有监听行"会造成假就绪。
+        就绪判据（按判定顺序）：
+        1. **bind 就绪探测（正判据）**：出现该端口的 hex 监听行 **且** nc
+           进程仍活着。两个条件都必要：进程死了监听行会随之消失（tap 静默
+           死亡）；端口被别的进程占着时我们的 nc 会 bind 失败退出，单靠
+           "有监听行"会造成假就绪；
+        2. **降级判据（blind 兜底）**：/proc/net/udp(6) 读不到内容（blind，
+           见 _probe_udp_listen）且 nc 进程连续存活超过 bind_degrade_confirm
+           （或总预算耗尽）——按旧判据（进程活着）放行，打印明确的"降级"
+           日志（不静默）；
+        3. **进程退出**：未就绪（优先级高于降级：死进程不得放行）；
+        4. **总超时**：读得到内容但始终没有该端口的行，未就绪——这才是真的
+           没 bind 上。
 
-        返回 (ready, diag)；diag 是人类可读的现场描述（进 EnvError 与日志，
-        探测本身也是诊断资产）。
+        返回 (ready, degraded, diag)；degraded=True 表示本次就绪走了降级
+        判据（没享受到 bind 就绪探测的保护）。diag 是人类可读的现场描述
+        （进 EnvError 与日志，探测本身也是诊断资产）。
         """
         port_hex = udp_port_hex(self.media_port)
+        started_at = deadline - self.bind_timeout
         next_log = time.monotonic() + 2.0
         while True:
-            rows = self._probe_udp_listen()
+            rows, blind, probe_reason = self._probe_udp_listen()
             if proc.poll() is not None:
-                return False, (
+                return False, False, (
                     "nc 进程已退出（exit=%s），/proc/net/udp(6)%s 端口 %s 的"
                     "监听行（候选命令：%s）"
                     % (fmt_exit_code(proc.poll()),
                        "有" if rows else "无", port_hex, cmd))
             if rows:
-                return True, "监听行已出现（%d 行，首行 st=%s rx_queue=%s）" % (
-                    len(rows), rows[0][0], rows[0][1])
+                return True, False, (
+                    "监听行已出现（%d 行，首行 st=%s rx_queue=%s）"
+                    % (len(rows), rows[0][0], rows[0][1]))
             now = time.monotonic()
+            alive_for = now - started_at
+            if blind:
+                # (b) 根本读不到内容：没有能见度，无法证伪 nc 已 bind。nc 连续
+                # 存活超过确认窗（或总预算耗尽）→ 降级按进程存活判据放行。
+                if alive_for >= self.bind_degrade_confirm or now >= deadline:
+                    print("[tap] 降级：无法读取 /proc/net/udp(6)（原因：%s），"
+                          "nc 已连续存活 %.1fs，退回进程存活判据——本次启动未"
+                          "享受 bind 就绪探测的保护"
+                          % (probe_reason or "未知原因", alive_for), flush=True)
+                    return True, True, (
+                        "降级就绪：无法读取 /proc/net/udp(6)（原因：%s），"
+                        "nc 连续存活 %.1fs，按进程存活判据放行"
+                        % (probe_reason or "未知原因", alive_for))
+                if now >= next_log:
+                    print("[tap] 无法读取 /proc/net/udp(6)（%s），nc 已连续"
+                          "存活 %.1fs；持续读不到将在 %.1fs 后按进程存活判据"
+                          "降级放行"
+                          % (probe_reason or "未知原因", alive_for,
+                             max(self.bind_degrade_confirm - alive_for, 0.0)),
+                          flush=True)
+                    next_log = now + 2.0
+                time.sleep(self.bind_poll_interval)
+                continue
+            # (a) 读到了内容但没有该端口的行：继续等，直到超时
             if now >= deadline:
-                return False, (
+                return False, False, (
                     "nc 进程存活，但等待 %.1fs 后 /proc/net/udp(6) 仍无端口 %d"
                     "（hex %s）的监听行%s"
                     % (self.bind_timeout, self.media_port, port_hex,
@@ -593,28 +658,54 @@ class AdbUdpTap:
                        if self._last_probe_error else ""))
             if now >= next_log:
                 print("[tap] 仍在等待 nc bind 端口 %d（hex %s），已 %.1fs…"
-                      % (self.media_port, port_hex,
-                         now - (deadline - self.bind_timeout)), flush=True)
+                      % (self.media_port, port_hex, alive_for), flush=True)
                 next_log = now + 2.0
             time.sleep(self.bind_poll_interval)
 
     def _probe_udp_listen(self):
-        """读 /proc/net/udp 与 /proc/net/udp6，返回媒体端口监听行列表。
+        """读 /proc/net/udp 与 /proc/net/udp6，返回 (rows, blind, reason)。
 
-        单条 adb 失败不致命（继续轮询，交给总超时判死）；全部失败时 rows 为空。
+        区分两种"无监听行"（run 40061050114 回归修复的关键）：
+          - **blind=False**：至少一个 proc 文件读到了非空内容（rc=0）。此时
+            rows 为空 = (a)"读到了内容但没有该端口的行" → 真的没 bind 上，
+            调用方继续等到超时；
+          - **blind=True**：两个文件都读不到内容（adb 报错非零退出 / 超时 /
+            文件不存在 / 输出为空）= (b)"根本读不到内容"。可能是设备不允许
+            读 /proc/net/udp（权限收紧的 ROM、SELinux 策略、定制镜像），
+            此时"没有监听行"不能证明 nc 没 bind——调用方按降级判据处理。
+
+        reason 是 blind 时的人类可读原因：每条 adb 命令的退出码与 stderr 都
+        记录在案，足以区分"命令不存在"与"权限拒绝"；非 blind 时为 None。
         """
         rows = []
         errors = []
+        readable = False
         for proc_file in UDP_PROC_FILES:
             try:
-                text = self.adb.shell_text("cat %s" % proc_file, timeout=5,
-                                           check=False)
+                # 用 shell() 而非 shell_text()：需要退出码与 stderr 才能定位
+                # "读不到"的原因（Permission denied / No such file / ...）
+                proc = self.adb.shell("cat %s" % proc_file, timeout=5,
+                                      check=False)
             except EnvError as e:
                 errors.append("%s：%s" % (proc_file, e))
                 continue
+            if proc.returncode != 0:
+                stderr = proc.stderr.decode("utf-8", "replace").strip()
+                errors.append("%s：cat 退出码 %d%s"
+                              % (proc_file, proc.returncode,
+                                 "（%s）" % stderr if stderr else ""))
+                continue
+            text = proc.stdout.decode("utf-8", "replace")
+            if not text.strip():
+                # rc=0 但输出为空：真实 /proc/net/udp 至少有表头行，视为读不到
+                errors.append("%s：cat 退出码 0 但输出为空" % proc_file)
+                continue
+            readable = True
             rows.extend(parse_udp_listen_lines(text, self.media_port))
-        self._last_probe_error = "；".join(errors) if errors else None
-        return rows
+        blind = not readable
+        reason = "；".join(errors) if errors else None
+        self._last_probe_error = reason
+        return rows, blind, reason
 
     def _kill_stale_nc(self):
         """尽力清掉设备内残留的 nc（覆盖两种候选命令形式的匹配）。"""
@@ -804,6 +895,12 @@ def describe_tap_health(tap):
                 "不是 app 问题"
                 % (fmt_exit_code(getattr(tap, "death_exit_code", None)),
                    getattr(tap, "death_reason", None) or "原因未知"))
+    if getattr(tap, "bind_degraded", False):
+        # 读不到 /proc/net/udp 时的降级就绪：进程活着，但端口未必真 bind 上了
+        return ("tap 进程存活（降级就绪：设备读不到 /proc/net/udp，未验证端口"
+                " %d 已 bind）但未收到数据 → app 发包但 tap 未收到：查 app 是否"
+                "发包（logcat tag=MicCaptureService）；另注意本次 bind 就绪探测"
+                "已降级，端口未必真的 bind 上" % tap.media_port)
     return ("tap 进程存活（端口 %d 已 bind）但未收到数据 → app 发包但 tap 未收到："
             "查 app 是否发包（logcat tag=MicCaptureService）" % tap.media_port)
 
