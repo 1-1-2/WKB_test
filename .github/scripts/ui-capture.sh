@@ -115,7 +115,13 @@ sleep 3
 
 echo "[ui] 1/4 主页"
 snap 01-home
-assert_text 01-home "启动服务" "主页-启动按钮"
+# 主操作按钮是二态：服务由 install-app.sh 预启动（调试音）→ 显示「停止服务」；
+# 未启动时显示「启动服务」——两者其一即通过，不能写死单态（首轮曾误报 WARN）。
+if grep -qF "停止服务" "$OUT/01-home.xml" 2>/dev/null || grep -qF "启动服务" "$OUT/01-home.xml" 2>/dev/null; then
+    echo "  [PASS] 主页-主操作按钮：启动/停止服务（二态任一）"
+else
+    echo "  [WARN] 主页-主操作按钮（启动/停止服务）均未找到"
+fi
 assert_text 01-home "手机地址" "主页-手机地址"
 assert_text 01-home "推流音量" "主页-设置区"
 
