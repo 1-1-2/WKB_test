@@ -548,6 +548,60 @@ class HostUdpTap:
             pass
 
 
+def capture_c05_diagnostics(adb, media_port, results):
+    """C05 判定失败时抓现场（**必须在 tap.close() 之前调用**）。
+
+    背景（QA 2026-10-24 定性报告 §4 风险 1）：C05 红轮历来无法区分
+    "app 没发包"还是"tap 没收到"——收集诊断工件时设备内 nc 进程已退出、
+    app 侧也没有首包日志。本函数在杀死 tap 之前抓两样东西：
+
+      1) `ps -A | grep nc`：tap（设备内 toybox nc）进程是否还活着；
+      2) `cat /proc/net/udp`：媒体端口（16 进制）的监听行与队列计数——
+         有监听行且 rx_queue 非零 = 包到达过内核但没人读（adb stdout
+         回传链路卡住）；无监听行 = tap 从未监听成功或已退出。
+
+    与 app 侧"首个 UDP 包已发送"logcat（MicCaptureService）互补：
+    下次 C05 变红时，两相印证即可分钟级定性是 app 侧还是 tap 侧。
+    全部为只读操作，单条失败只记录、不影响收尾流程。
+    """
+    port_hex = "%04X" % media_port
+    results.info("---- C05 失败现场抓取（kill tap 之前，仅 adb tap 模式）----")
+
+    # 1) tap 进程是否还活着（grep 自身也会出现在 ps 里，过滤掉）
+    try:
+        ps_out = adb.shell_text("ps -A | grep nc", timeout=10, check=False)
+        ps_lines = [l.strip() for l in ps_out.splitlines()
+                    if l.strip() and "grep" not in l]
+        if ps_lines:
+            for l in ps_lines:
+                results.info("  ps: %s" % l)
+        else:
+            results.info("  ps: 设备内无 nc 进程（tap 未运行或已退出 → tap 侧问题）")
+    except EnvError as e:
+        results.info("  ps -A | grep nc 失败：%s" % e)
+
+    # 2) /proc/net/udp：媒体端口监听行（local_address 列为 hex ip:port）
+    try:
+        udp_out = adb.shell_text("cat /proc/net/udp", timeout=10, check=False)
+        rows = []
+        for line in udp_out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].endswith(":" + port_hex):
+                rows.append(line.rstrip())
+        if rows:
+            for r in rows:
+                results.info("  udp: %s" % r)
+            results.info("  udp: 端口 %d（hex %s）有监听行；rx_queue 非零 = 包到过内核但无人读"
+                         % (media_port, port_hex))
+        else:
+            results.info("  udp: /proc/net/udp 无端口 %d（hex %s）的监听行"
+                         "（tap 未监听成功或已退出）" % (media_port, port_hex))
+    except EnvError as e:
+        results.info("  cat /proc/net/udp 失败：%s" % e)
+
+    results.info("  判定参考：app 侧是否发包见 logcat '首个 UDP 包已发送'（tag=MicCaptureService）")
+
+
 def parse_format_c(pkt):
     """解析格式 C 头，返回字段 dict；结构非法抛 ValueError。"""
     if len(pkt) < FMT_C_HEADER_SIZE:
@@ -847,6 +901,11 @@ def run_interop(args):
                 print("       [dump] %s" % hexs(pkt[:64]), flush=True)
 
     if first_packet_failed:
+        # C05 失败现场抓取：必须在 tap.close()（杀 nc）之前执行，否则 ps 看不到
+        # tap 进程、/proc/net/udp 看不到监听行。与 app 侧"首个 UDP 包已发送"
+        # logcat 互补，用于区分"app 没发包"与"tap 没收到"（QA 报告 §4 风险 1）。
+        if tap.MODE == "adb" and not args.skip_adb_setup:
+            capture_c05_diagnostics(adb, args.media_port, results)
         # 提前收尾：UDP 流不存在时，推流质量/看门狗/重连断言都无从谈起
         heartbeats.stop()
         try:

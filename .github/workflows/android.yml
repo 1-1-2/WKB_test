@@ -216,14 +216,45 @@ jobs:
         run: bash ../.github/scripts/install-app.sh ../apk/app-debug.apk
 
       # 闭环联调：C01~C15 见 android/verify/integration/README.md
-      - name: Interop closed loop (pc_client.py)
+      #
+      # 失败自动重试一次（QA 2026-10-24 定性报告 §3.1）：C05"首包 10s 未到达"的
+      # 根因是模拟器采集线程饥饿 / adb UDP tap 链路抖动（同代码一次红一次绿，
+      # 非代码缺陷），单次通过率约 50%。用脚本层 for 循环重试 pc_client.py：
+      #   - 每次 attempt 的完整输出都落盘（/tmp/interop-attempt-N.out），并复制
+      #     一份到 /tmp/interop.out 供 collect-diagnostics.sh 收集——首次失败的
+      #     现场不丢，不会只留最后一次；
+      #   - 失败后退避 5s 再试，给 app 回稳的时间；
+      #   - 两次都失败时以最后一次的退出码结束（exit $rc），不吞真实失败；
+      #   - 只重试本步（正常约 +30s），不重跑整个 job：失败时模拟器已就绪、
+      #     app 已回 LISTENING，重跑 pc_client.py 全程约 15s，而重跑整 job 要
+      #     5-8 分钟。若 app 进程已死，重试会在 C01 直接失败并给出明确信号。
+      # 不引 nick-fields/retry 等第三方 action：6 行 bash 即可，且能自然满足
+      # "保留首次输出 + 退避"两个诉求，供应链零新增。
+      # 与 concurrency（run 级、cancel-in-progress）无冲突：step 内重试不产生
+      # 新 run、不改 group 语义；若期间新 push 取消本 run，重试随 run 一起取消。
+      # 单次 timeout 从 240 降为 120：两次 attempt + 5s 退避最坏 245s < 本步
+      # 360s 预算，保证两次尝试的输出都完整（QA 报告 §3.1 预算核对建议）。
+      - name: Interop closed loop (pc_client.py, retry once)
         timeout-minutes: 6
         run: |
           set +e
           set -o pipefail
-          timeout 240 python3 verify/integration/pc_client.py --hold-seconds 12 2>&1 | tee /tmp/interop.out
-          rc=$?
-          echo "pc_client exit=$rc（0=全绿，1=有断言失败，2=环境错误，124=超时）"
+          rc=1
+          for attempt in 1 2; do
+            echo "===== interop attempt $attempt/2 ====="
+            timeout 120 python3 verify/integration/pc_client.py --hold-seconds 12 2>&1 | tee "/tmp/interop-attempt-$attempt.out"
+            rc=$?
+            # 保留一份"最近一次"的完整输出（含 C05 失败现场抓取），
+            # collect-diagnostics.sh 会把 attempt-1/2 两份都收进 artifact
+            cp "/tmp/interop-attempt-$attempt.out" /tmp/interop.out
+            echo "attempt $attempt: pc_client exit=$rc（0=全绿，1=有断言失败，2=环境错误，124=超时）"
+            [ "$rc" -eq 0 ] && exit 0
+            if [ "$attempt" -eq 1 ]; then
+              echo "attempt 1 失败，退避 5s 后重试（环境抖动处置，见本步注释）…"
+              sleep 5
+            fi
+          done
+          echo "两次 attempt 均失败（exit=$rc），判定作业失败"
           exit $rc
 
       # 无论成功/失败/取消都收集：取消时 previously 什么都没留下，无法事后诊断。

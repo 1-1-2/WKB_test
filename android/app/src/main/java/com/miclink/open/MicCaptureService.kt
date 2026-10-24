@@ -830,13 +830,24 @@ class MicCaptureService : Service() {
                     mainHandler.post { fail("UDP sender 为空") }
                     return
                 }
-                if (!sender.send(packet, packet.size)) {
+                // 发送（逻辑不变：仍只调一次 send，仅把返回值留给下面的埋点分支）
+                val sent = sender.send(packet, packet.size)
+                if (!sent) {
                     if (sender.failureStreak >= MAX_SEND_FAILURES) {
                         mainHandler.post {
                             fail("连续 ${sender.failureStreak} 次发送失败，已停止：${sender.lastError}")
                         }
                         return
                     }
+                } else if (frameSeq == 0) {
+                    // 诊断埋点（每个会话仅一条，不逐包打）：C05 联调失败时可直接从
+                    // logcat 确认"app 到底发没发首包"，与 pc_client.py C05 失败路径
+                    // 的 nc/ps、/proc/net/udp 抓取互补，区分 app 侧未发包与 tap 侧
+                    // 未收到。调试音模式同样经过这里（该模式不打开 AudioRecord）。
+                    android.util.Log.i(
+                        TAG,
+                        "首个 UDP 包已发送 seq=$frameSeq ts=$ts 目标=${sender.targetDescription()}"
+                    )
                 }
 
                 if (now - lastNotifyMs >= NOTIFY_INTERVAL_MS) {

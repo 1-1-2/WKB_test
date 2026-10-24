@@ -56,7 +56,13 @@ adbd "$DIAG_DIR/props.txt" shell getprop
 adbd "$DIAG_DIR/ps.txt" shell "ps -A"
 adbd "$DIAG_DIR/net-tcp.txt" shell "cat /proc/net/tcp"
 
+# 联调输出：/tmp/interop.out 是"最近一次 attempt"的完整输出；
+# /tmp/interop-attempt-*.out 是每一次 attempt 的完整输出（workflow 的
+# interop 步骤带失败重试，首次失败的现场必须保留，不能只留最后一次）。
 [ -f /tmp/interop.out ] && cp /tmp/interop.out "$DIAG_DIR/interop.out"
+for f in /tmp/interop-attempt-*.out; do
+    [ -f "$f" ] && cp "$f" "$DIAG_DIR/$(basename "$f")"
+done
 
 echo "===== $DIAG_DIR 内容 ====="
 ls -la "$DIAG_DIR"
