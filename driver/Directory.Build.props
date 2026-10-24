@@ -1,0 +1,92 @@
+<Project>
+  <!--
+    WDK NuGet 构建接入（对齐 microsoft/Windows-driver-samples 的官方模式）。
+
+    导入顺序很重要：WDK.x64 的 props 会把 WindowsSdkDir 指向包内 c 目录
+    （含 km 头/库与 WindowsKernelModeDriver10.0 工具集），SDK.CPP 系列
+    再补上 CRT/UCRT 的编译与库路径。三个 Import 均带 Exists 条件——
+    没有 restore 过包时静默跳过，工程可正常打开（只是无法编译内核目标）。
+
+    还原命令（CI 与本地一致）：
+        nuget restore driver\packages.config -PackagesDirectory driver\packages
+
+    版本变更时：同步改本文件里的三段版本号目录名、packages.config 的
+    version、以及 CI 的 _NT_TARGET_VERSION（NTDDI 码）。
+  -->
+  <Import Project="packages\Microsoft.Windows.WDK.x64.10.0.28000.2526\build\native\Microsoft.Windows.WDK.x64.props" Condition="Exists('packages\Microsoft.Windows.WDK.x64.10.0.28000.2526\build\native\Microsoft.Windows.WDK.x64.props') and '$(Platform)' == 'x64'" />
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.x64.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'" />
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('packages\Microsoft.Windows.SDK.CPP.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.props')" />
+
+  <!--
+    NuGet 布局的 INF 工具链路径修复（纯 NuGet 环境必需；有机器 WDK 时无害）。
+
+    根因（CI run d89417f 实测）：WDK 的 WindowsDriver.x64.props 只把
+    $(WDKBinRoot_x86)（= 包内 c\bin\<ver>\x86，其中只有 Inf2Cat.exe）
+    加入 ExecutablePath；而 stampinf.exe / drvcat.exe 只存在于 x64 目录。
+    纯 NuGet 环境下 PATH 里没有这些工具，StampInf 以
+    "TRACKER : error TRK0005: Failed to locate: stampinf.exe" 失败。
+    官方 samples 的 CI 靠 VS DevShell 中机器 WDK 的 PATH 兜底；本项目
+    不依赖机器 WDK，因此显式给三个任务指定 ToolPath。
+
+    实现要点（均经本地 dotnet msbuild 实测验证）：
+    1. 用 glob 定位包内 x64/x86 工具目录，避免硬编码 bin 版本号——
+       Directory.Build.props 求值早于 WDK 的 WindowsDriver.Default.props，
+       那时 $(TargetPlatformVersion) 仍为空，$(WDKBinRoot_x64) 不可用；
+    2. glob 与路径统一用正斜杠（MSBuild 在 Windows 上同样接受反/正斜杠，
+       但 Unix 下反斜杠不被当作目录分隔符，正斜杠双平台安全）；
+    3. 目录提取用项转换 @(Item->'%(RootDir)%(Directory)')——
+       实测 %(Item.Metadata) 在 PropertyGroup 中不求值（会残留字面量
+       "%(_MicLinkWdkStampInf.RootDir)..."），属性函数
+       $([System.IO.Path]::GetDirectoryName(@(Item))) 返回空，均不可用；
+    4. 未 restore 包时 WDK_NuGet 为空，本段整体跳过，不产生任何垃圾值。
+
+    ⚠️ 踩坑记录（CI run 39334408777）：本文件绝不要给 ExecutablePath 赋值。
+    C++ 编译目标只在 ExecutablePath 为空时，才把 VC 工具目录
+    （cl.exe / link.exe 所在，由 VsDevShell/VS 安装信息推导）填进去。
+    Directory.Build.props 求值早于 C++ 目标，提前赋值会堵掉该填充，
+    CL/Link 退化为裸名查找，全部以 TRK0005 失败。
+  -->
+  <ItemGroup Condition="'$(WDK_NuGet)' == 'true'">
+    <_MicLinkWdkStampInf Include="$(WDKContentRoot)/bin/**/x64/stampinf.exe" />
+    <_MicLinkWdkInf2Cat Include="$(WDKContentRoot)/bin/**/x86/Inf2Cat.exe" />
+    <_MicLinkWdkDrvCat Include="$(WDKContentRoot)/bin/**/x64/drvcat.exe" />
+  </ItemGroup>
+  <PropertyGroup Condition="'$(WDK_NuGet)' == 'true'">
+    <InfToolPath Condition="'$(InfToolPath)' == ''">@(_MicLinkWdkStampInf->'%(RootDir)%(Directory)')</InfToolPath>
+    <Inf2CatToolPath Condition="'$(Inf2CatToolPath)' == ''">@(_MicLinkWdkInf2Cat->'%(RootDir)%(Directory)')</Inf2CatToolPath>
+    <DrvCatToolPath Condition="'$(DrvCatToolPath)' == ''">@(_MicLinkWdkDrvCat->'%(RootDir)%(Directory)')</DrvCatToolPath>
+  </PropertyGroup>
+
+  <!--
+    MSVC 14.4x+ 与 WDK km CRT 的已知头文件冲突（微软已知缺陷，
+    https://developercommunity.visualstudio.com/t/Freestanding-C-facilities-broken-in-KM/10877920 ，
+    自 VS2022 14.43 起未修复；CI run 39335899536 实证于 MSVC 14.51 + WDK 28000）：
+
+    1. 跨平台共享头（shared/core/include/miclink/*.h）使用 <stdint.h>；
+       WDK km/crt 无 stdint.h/vcruntime.h，必解析到 MSVC 版；
+    2. _VCRUNTIME_DISABLED_WARNINGS 只由 MSVC vadefs.h 定义，但 WDK
+       km\crt\vadefs.h（内核版）按 include 顺序将其遮蔽 →
+       vcruntime.h(61)/stdint.h(16) 的 pragma 报 C4083；
+    3. MSVC vcruntime.h 与 WDK km\crt\crtdefs.h 重复定义
+       _CRT_STRINGIZE/_CRT_WIDE/__CRTDECL → C4005。
+
+    Main.vcxproj 为 /W4 /WX，上述 warning 被升级为 C2220 error。
+    处置：屏蔽 C4083/C4005（社区标准做法；Utilities 带同样 warning 已成功
+    产出 .lib，实证无害）。
+
+    实现要点（本地 dotnet msbuild 实测）：必须用 ItemDefinitionGroup 而非
+    PropertyGroup——WDK 的 WindowsDriver.Common.props 同样以
+    ItemDefinitionGroup 设置 <DisableSpecificWarnings>4603;4627;4986;4987;
+    %(DisableSpecificWarnings)</DisableSpecificWarnings>，项元数据按导入顺序
+    组合；Directory.Build.props 求值早于 WDK props，此处定义的值会成为基底，
+    被 WDK 默认值与 vcxproj 的单文件元数据（如 miclinkctl.cpp 的
+    "4100;...;4996;%(DisableSpecificWarnings)"）依次追加，实测最终
+    adapter.cpp = "4603;4627;4986;4987;4083;4005"、
+    miclinkctl.cpp = "4100;...;4996;4603;4627;4986;4987;4083;4005"，组合正确。
+  -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <DisableSpecificWarnings>4083;4005</DisableSpecificWarnings>
+    </ClCompile>
+  </ItemDefinitionGroup>
+</Project>
