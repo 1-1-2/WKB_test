@@ -22,12 +22,18 @@
 static int g_exit_code = CLI_EXIT_OK;
 static int g_has_console;
 
+/* cli_parse 失败时的具体原因（给用户看的，不是「参数错误」四个字） */
+static const char *g_parse_err = "未知参数";
+
 int cli_exit_code(void) { return g_exit_code; }
+
+const char *cli_parse_error(void) { return g_parse_err ? g_parse_err : "未知参数"; }
 
 void cli_set_defaults(CliArgs *a)
 {
     memset(a, 0, sizeof(*a));
     a->port = 8125;
+    a->media_port = 0;      /* 0 = 媒体端口由系统随机分配（默认行为） */
     a->rate = 48000;
     a->rate_idx = 2;
     a->buffer_ms = 60;
@@ -41,7 +47,7 @@ const char *cli_help_text(void)
     "WO Mic Link " APP_VERSION " — 把 Android 手机麦克风变成 Windows 虚拟麦克风\n"
     "\n"
     "用法:\n"
-    "  womic.exe [--host <IP|主机名>] [--port <1..65535>]\n"
+    "  womic.exe [--host <IP|主机名>] [--port <1..65535>] [--media-port <1..65535>]\n"
     "            [--rate 48000|16000|8000] [--buffer 26|60|120] [--gain 0..200]\n"
     "            [--connect] [--no-gui] [--status]\n"
     "            [--install-driver] [--uninstall-driver] [--driver-pack <dir>]\n"
@@ -50,7 +56,12 @@ const char *cli_help_text(void)
     "\n"
     "选项:\n"
     "  --host <IP>            手机在局域网里的地址；--connect 时必填\n"
-    "  --port <n>             TCP 控制端口，默认 8125（媒体端口由本机随机分配）\n"
+    "  --port <n>             TCP 控制端口，默认 8125\n"
+    "  --media-port <n>       UDP 媒体端口，默认由本机随机分配。\n"
+    "                         跨网段/过防火墙时必须指定：手机端要把音频发到\n"
+    "                         「本机 IP : 这个端口」，随机端口无法预先放行。\n"
+    "                         取值 1..65535；0 与负数非法（要随机就不写本选项）。\n"
+    "                         端口被占用时不回退，直接报错退出（详见退出码 2）\n"
     "  --rate 48000|16000|8000\n"
     "                         向手机请求的采样率，默认 48000。\n"
     "                         无论协商到多少，灌给驱动的一律是 48000（驱动不重采样）\n"
@@ -71,14 +82,15 @@ const char *cli_help_text(void)
     "\n"
     "退出码:\n"
     "  0  成功\n"
-    "  1  参数错误\n"
-    "  2  连接失败\n"
+    "  1  参数错误（含 --media-port 取值非法：非数字 / 0 / 负数 / >65535）\n"
+    "  2  连接失败（含 --media-port 指定的端口被占用，错误串里带 WSA 错误码）\n"
     "  3  驱动不可用（--status 检测到驱动未就绪时也返回 3）\n"
     "  4  驱动安装/卸载失败\n"
     "\n"
     "示例:\n"
     "  womic.exe --host 192.168.1.20 --connect\n"
     "  womic.exe --host 192.168.1.20 --rate 16000 --buffer 26 --gain 130 --connect\n"
+    "  womic.exe --host 192.168.1.20 --media-port 5004 --connect   # 固定媒体端口\n"
     "  womic.exe --status\n"
     "  womic.exe --install-driver\n"
     "  womic.exe --driver-pack D:\\drivers\\womic2022 --install-driver\n"
@@ -192,8 +204,23 @@ int cli_parse(CliArgs *a, int argc, wchar_t **argv)
             a->host_pos = argv[++i]; continue;
         }
         if (!_wcsicmp(s, L"port")) {
-            if (!need_value(argc, argv, i)) return 0;
-            if (!parse_int(argv[++i], &a->port)) return 0;
+            if (!need_value(argc, argv, i)) { g_parse_err = "--port 缺少取值"; return 0; }
+            if (!parse_int(argv[++i], &a->port)) { g_parse_err = "--port 需要十进制端口号"; return 0; }
+            continue;
+        }
+        if (!_wcsicmp(s, L"media-port") || !_wcsicmp(s, L"mediaport")) {
+            int v;
+            if (!need_value(argc, argv, i)) { g_parse_err = "--media-port 缺少取值"; return 0; }
+            ++i;
+            if (!parse_int(argv[i], &v)) {
+                g_parse_err = "--media-port 需要十进制端口号（非数字）";
+                return 0;
+            }
+            if (v < 1 || v > 65535) {
+                g_parse_err = "--media-port 取值须在 1..65535（0/负数非法；要随机分配就不写本选项）";
+                return 0;
+            }
+            a->media_port = v;
             continue;
         }
         if (!_wcsicmp(s, L"rate")) {
@@ -245,6 +272,7 @@ int cli_parse(CliArgs *a, int argc, wchar_t **argv)
             else return 0;
             continue;
         }
+        g_parse_err = "未知参数";
         return 0;                            /* 未知参数 */
     }
     return 1;
@@ -388,6 +416,14 @@ int cli_run(CliArgs *a)
         WideCharToMultiByte(CP_UTF8, 0, a->host_pos, -1, host, sizeof(host), NULL, NULL);
         if (a->driver_pack) drv_set_external_pack(a->driver_pack);
         drv_detect(&g_ui.drv, 1);
+        if (a->media_port > 0) {
+            char line[128];
+            eng_set_media_port(a->media_port);
+            _snprintf(line, sizeof(line), "媒体端口固定为 UDP %d\n", a->media_port);
+            out(line);
+        } else {
+            eng_set_media_port(0);
+        }
         if (!eng_start(host, a->port, a->rate_idx, a->buffer_ms, a->gain)) {
             out("引擎启动失败\n");
             g_exit_code = CLI_EXIT_CONNECT;
@@ -404,10 +440,11 @@ int cli_run(CliArgs *a)
             char line[256];
             _snprintf(line, sizeof(line),
                       "OK  帧=%llu 字节=%llu 注入=%llu 电平=%.3f dB=%.1f "
-                      "解码=%s 设备=%s\n",
+                      "解码=%s 设备=%s 媒体端口=%d(%s)\n",
                       (unsigned long long)st.frames, (unsigned long long)st.bytes,
                       (unsigned long long)st.injected, (double)st.level,
-                      (double)st.db, st.opus_src, st.device_ok ? "就绪" : "未就绪");
+                      (double)st.db, st.opus_src, st.device_ok ? "就绪" : "未就绪",
+                      st.media_port, st.media_fixed ? "固定" : "随机");
             out(line);
             g_exit_code = CLI_EXIT_OK;
         } else {
@@ -426,6 +463,12 @@ int cli_run(CliArgs *a)
 void cli_apply_to_ui(const CliArgs *a)
 {
     if (a->host_pos) SetWindowTextW(g_ui.edit_host, a->host_pos);
+    if (a->media_port > 0 && g_ui.edit_media) {
+        wchar_t buf[16];
+        _snwprintf(buf, 16, L"%d", a->media_port);
+        buf[15] = 0;
+        SetWindowTextW(g_ui.edit_media, buf);
+    }
     if (a->rate_idx != 2 || a->rate != 48000) g_ui.seg_rate = (a->rate_idx == 2 ? 0 : a->rate_idx == 1 ? 1 : 2);
     if (a->buffer_ms == 26) g_ui.buf_idx = 0;
     else if (a->buffer_ms == 120) g_ui.buf_idx = 2;
