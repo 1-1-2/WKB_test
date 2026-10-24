@@ -1539,13 +1539,16 @@ jobs:
             Write-Host "::error::G: 注入字节为 0——解码音没灌进驱动"
             exit 1
           }
-          {
-            "womic_frames=$frames"
-            "womic_bytes=$bytes"
-            "womic_injected=$injected"
-            "womic_device=$device"
-            "womic_mport=$mport($mode)"
-          } | Out-File -FilePath $env:GITHUB_ENV -Append
+          # ⚠ 必须逐行字符串直排 Out-File：pwsh 里 `{ "k=$v" } | Out-File` 会把
+          # scriptblock 当对象 ToString（写进去的是带引号/不插值的源码文本，
+          # run 40082681621 实证：GITHUB_ENV 落下字面量 "womic_frames=$frames"，
+          # I 步 $env:womic_frames 读空 → 汇总判定误败）。同 workflow 的
+          # B_IP/install_state/record_result 都是这个直排写法，一直正常。
+          "womic_frames=$frames" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "womic_bytes=$bytes" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "womic_injected=$injected" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "womic_device=$device" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "womic_mport=$mport($mode)" | Out-File -FilePath $env:GITHUB_ENV -Append
           exit 0
 
       # ---------------------------------------------------------------
