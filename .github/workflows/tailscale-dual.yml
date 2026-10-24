@@ -543,6 +543,10 @@ jobs:
       # （APK 构建之后）B 必然已在网内 → 只做确认式轮询，不等长。
       # 用 tailscale status --json 互相发现，不需要 devices API scope
       # （tailnet-debug action 同款思路，见 docs/tailscale-channel.md）。
+      # ⚠ 必须按 run_id 精确匹配 + 要求 Online：ephemeral 节点退网后不会
+      # 秒删，会以 offline 状态滞留设备列表（run 40079093854 实证：B 抓到
+      # 上一轮 40075392632 的残留节点 IP，E 步 180s 全 timeout）。前缀
+      # 匹配在串行 run 下必踩雷，精确匹配才是确定性的。
       # ---------------------------------------------------------------
       - name: A. 发现 windows-client 的 tailnet IP
         timeout-minutes: 4
@@ -552,10 +556,11 @@ jobs:
           B_IP=""
           for i in $(seq 1 24); do
             B_IP=$(sudo tailscale status --json 2>/dev/null \
-              | jq -r '.Peer[] | select(.HostName | startswith("womic-dual-win-")) | .TailscaleIPs[0]' \
+              | jq -r --arg host "womic-dual-win-${{ github.run_id }}" \
+                '.Peer[] | select(.HostName == $host and .Online) | .TailscaleIPs[0]' \
               2>/dev/null | head -1 || true)
             if [ -n "$B_IP" ] && [ "$B_IP" != "null" ]; then break; fi
-            echo "[discover] 第 $i 次：tailnet 内尚未看到 windows-client 节点"
+            echo "[discover] 第 $i 次：tailnet 内尚未看到本 run 的 windows-client 在线节点"
             sleep 5
           done
           if [ -z "$B_IP" ] || [ "$B_IP" = "null" ]; then
@@ -1096,6 +1101,10 @@ jobs:
       #    （270×10s=45min deadline，与 A 的最慢成功出现时间对齐；
       #    再慢就意味着 build-apk 已超时失败，B 带着明确报错失败即可）。
       #    发现即写 A_IP 供后续步骤用；超时带 tailscale status 失败。
+      # ⚠ 必须按 run_id 精确匹配 + 要求 Online：ephemeral 节点退网后不会
+      # 秒删，会以 offline 状态滞留设备列表（run 40079093854 实证：B 在
+      # 08:44 用前缀匹配抓到上一轮 40075392632 的残留节点 100.67.130.51，
+      # 真 A 09:0x 入网后也不再重发现，E 步 180s×24 次全 timeout）。
       # ---------------------------------------------------------------
       - name: B. 发现 linux-app 的 tailnet IP（长轮询）
         timeout-minutes: 50
@@ -1110,7 +1119,7 @@ jobs:
               $st = & $ts status --json 2>$null | ConvertFrom-Json
               if ($st -and $st.Peer) {
                 foreach ($p in $st.Peer.PSObject.Properties) {
-                  if ("$($p.Value.HostName)" -like 'womic-dual-linux-*') {
+                  if ("$($p.Value.HostName)" -eq "womic-dual-linux-$env:GITHUB_RUN_ID" -and $p.Value.Online) {
                     $A_IP = "$($p.Value.TailscaleIPs[0])"
                     Write-Host "发现 linux-app 节点：$($p.Value.HostName) → $A_IP"
                   }
@@ -1121,7 +1130,7 @@ jobs:
             }
             if ([string]::IsNullOrWhiteSpace($A_IP)) {
               $left = [int]($deadline - (Get-Date)).TotalMinutes
-              Write-Host "wait: 尚未发现 linux-app（剩余约 $left 分钟）"
+              Write-Host "wait: 尚未发现本 run 的 linux-app 在线节点（剩余约 $left 分钟）"
             }
           }
           if ([string]::IsNullOrWhiteSpace($A_IP)) {
