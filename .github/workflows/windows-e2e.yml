@@ -1163,6 +1163,100 @@ jobs:
           exit 0
 
       # ---------------------------------------------------------------
+      # h2. GUI 界面取证：主窗口标题断言 + 窗口截图（此前只有"6s 存活"，
+      #     没有任何画面证据）。截图两条路：
+      #       PrintWindow(PW_RENDERFULLCONTENT) —— 抓窗口自身，DWM 合成也可用；
+      #       CopyFromScreen 整屏 —— PrintWindow 偶发黑图时的兜底。
+      #     判据：拿不到窗口句柄 → FAIL；标题不含 "WO Mic" → FAIL；
+      #     截图失败只 WARN（headless 会话下可能无桌面，不因此卡验收）。
+      # ---------------------------------------------------------------
+      - name: h2. GUI 界面截图（标题断言 + 窗口截图）
+        timeout-minutes: 5
+        run: |
+          $dir = "probe-results/screenshots"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $p = Start-Process -FilePath "$env:GITHUB_WORKSPACE\dist\womic.exe" `
+            -WorkingDirectory "$env:GITHUB_WORKSPACE\dist" -PassThru
+
+          # 等主窗口就绪（最多 10s，每 0.5s 轮询一次）
+          $hwnd = [IntPtr]::Zero
+          for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Milliseconds 500
+            $p.Refresh()
+            if ($p.MainWindowHandle -ne [IntPtr]::Zero) { $hwnd = $p.MainWindowHandle; break }
+          }
+          $title = if ($p.MainWindowTitle) { $p.MainWindowTitle } else { '' }
+          "hwnd=$($hwnd.ToInt64()) title='$title'" | Tee-Object "$dir/h2-gui-info.txt"
+
+          if ($hwnd -eq [IntPtr]::Zero) {
+            Write-Host "::error::h2: 10 秒内未拿到主窗口句柄（GUI 未起）"
+            "ITEM_H2=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          if ($title -notlike '*WO Mic*') {
+            Write-Host "::error::h2: 主窗口标题不含 'WO Mic'（实得 '$title'）"
+            "ITEM_H2=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+
+          Add-Type -AssemblyName System.Drawing
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class W32 {
+            [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+            [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+            [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+          }
+          "@
+          [W32]::SetForegroundWindow($hwnd) | Out-Null
+          Start-Sleep -Milliseconds 800
+          $r = New-Object W32+RECT
+          [W32]::GetWindowRect($hwnd, [ref]$r) | Out-Null
+          $w = $r.R - $r.L
+          $h = $r.B - $r.T
+          "rect=${w}x${h}" | Out-File -Append "$dir/h2-gui-info.txt"
+          $shotOk = $false
+          if ($w -gt 0 -and $h -gt 0) {
+            $bmp = New-Object System.Drawing.Bitmap($w, $h)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $hdc = $g.GetHdc()
+            $ok = [W32]::PrintWindow($hwnd, $hdc, 2)
+            $g.ReleaseHdc($hdc)
+            $g.Dispose()
+            $bmp.Save("$dir/gui-main.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmp.Dispose()
+            "printwindow=$ok" | Out-File -Append "$dir/h2-gui-info.txt"
+            $shotOk = Test-Path "$dir/gui-main.png"
+          }
+          # 整屏兜底：PrintWindow 在个别会话下会出全黑，留一张屏幕截图对照
+          try {
+            Add-Type -AssemblyName System.Windows.Forms
+            $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            $bmp2 = New-Object System.Drawing.Bitmap($vs.Width, $vs.Height)
+            $g2 = [System.Drawing.Graphics]::FromImage($bmp2)
+            $g2.CopyFromScreen($vs.X, $vs.Y, 0, 0, $bmp2.Size)
+            $g2.Dispose()
+            $bmp2.Save("$dir/screen-full.png", [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmp2.Dispose()
+            $shotOk = $true
+          } catch {
+            Write-Host "::warning::h2: 整屏兜底截图失败：$($_.Exception.Message)"
+          }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          if ($shotOk) {
+            Write-Host "h2: 截图完成（$dir）"
+            "ITEM_H2=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 0
+          }
+          Write-Host "::warning::h2: 截图未产出（窗口存在但抓图失败，可能无桌面会话）"
+          "ITEM_H2=WARN" | Out-File -FilePath $env:GITHUB_ENV -Append
+          exit 0
+
+      # ---------------------------------------------------------------
       # i. 汇总：把各项结论写进 Step Summary（含 a 的判定从日志里读），
       #    所有文本输出与 e2e_probe 的 JSON/wav 由下面的上传步骤收进
       #    artifact（失败也传，便于诊断）。
@@ -1187,6 +1281,7 @@ jobs:
             'g1 标准用户×会话0 灌音'   = $(if ($env:ITEM_G1) { $env:ITEM_G1 } else { 'n/a' })
             'g2 标准用户×交互会话 灌音' = $(if ($env:ITEM_G2) { $env:ITEM_G2 } else { 'n/a' })
             'h GUI 冒烟（6s 存活）'   = $(if ($env:ITEM_H) { $env:ITEM_H } else { 'n/a' })
+            'h2 GUI 界面截图（标题+画面）' = $(if ($env:ITEM_H2) { $env:ITEM_H2 } else { 'n/a' })
           }
           $md = @()
           $md += '## Windows E2E 验证结论'

@@ -215,6 +215,23 @@ jobs:
         timeout-minutes: 10
         run: bash ../.github/scripts/install-app.sh ../apk/app-debug.apk
 
+      # 界面取证：主页/抽屉/外观/采集设置四屏截图 + uiautomator 控件断言。
+      # 此前 CI 只验协议闭环（能收流），界面长什么样没有任何证据。
+      # 脚本内断言失败只 WARN（截图与 dump 全量上传供人工复核），不卡 interop。
+      - name: UI screenshots (4 screens + control asserts)
+        timeout-minutes: 5
+        run: bash ../.github/scripts/ui-capture.sh /tmp/ui-shots
+
+      - name: Upload UI screenshots
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-screenshots
+          path: /tmp/ui-shots/
+          if-no-files-found: warn
+          retention-days: 7
+
       # 闭环联调：C01~C15 见 android/verify/integration/README.md
       #
       # 失败自动重试一次（QA 2026-10-24 定性报告 §3.1）：C05"首包 10s 未到达"的

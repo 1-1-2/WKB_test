@@ -562,6 +562,75 @@ done
     || bad "T22 三脚本 --help 启动冒烟" "$t22_detail"
 
 # ---------------------------------------------------------------------------
+# T23：ui-capture.sh 界面取证脚本——控件解析、可点击优先、导航序列、复原
+#
+# 背景：CI 此前只验协议闭环不验界面。ui-capture.sh 在模拟器上按控件文本导航
+# 并截图断言。本测试用有状态 stub adb + 手写 uiautomator fixture 验证：
+#   1) 同名文本（顶栏标题 vs 抽屉项）必须点中 clickable="true" 的那个；
+#   2) 四屏导航顺序（主页→抽屉→外观→抽屉→采集设置）；
+#   3) 走完四屏后能复原回主页（不影响后续 interop）。
+# ---------------------------------------------------------------------------
+echo "== T23 ui-capture.sh：stub adb 下四屏取证 + 可点击优先 + 复原 =="
+T23="$TMP/t23"; mkdir -p "$T23/bin" "$T23/fx"
+cat > "$T23/bin/adb" <<STUB_EOF
+#!/usr/bin/env bash
+S="$T23/state"; F="$T23/fx"; ST=\$(cat "\$S")
+case "\$1" in
+  shell)
+    case "\$2" in
+      am) exit 0 ;;
+      uiautomator) cp "\$F/\$ST.xml" /tmp/_t23_ui.xml; exit 0 ;;
+      input)
+        if [ "\$3" = "tap" ]; then
+          echo "tap \$4 \$5" >> "$T23/taps"
+          case "\$4,\$5" in
+            100,200) echo drawer > "\$S" ;;
+            300,600) echo appearance > "\$S" ;;
+            300,800) echo capture > "\$S" ;;
+            300,400) echo home > "\$S" ;;
+          esac
+        elif [ "\$3" = "swipe" ]; then
+          echo capture-effects > "\$S"
+        fi
+        exit 0 ;;
+    esac
+    exit 0 ;;
+  exec-out)
+    case "\$2" in
+      cat) cat /tmp/_t23_ui.xml ;;
+      screencap) printf '\x89PNG\r\n\x1a\nFAKEPNG' ;;
+    esac
+    exit 0 ;;
+esac
+exit 0
+STUB_EOF
+chmod +x "$T23/bin/adb"
+cat > "$T23/fx/home.xml" <<'X'
+<hierarchy rotation="0"><node text="" content-desc="打开导航抽屉" clickable="true" bounds="[60,160][140,240]"/><node text="启动服务" content-desc="" clickable="true" bounds="[300,1600][780,1700]"/><node text="手机地址" content-desc="" clickable="false" bounds="[100,900][300,950]"/><node text="推流音量" content-desc="" clickable="false" bounds="[100,1200][300,1250]"/></hierarchy>
+X
+cat > "$T23/fx/drawer.xml" <<'X'
+<hierarchy rotation="0"><node text="主页" content-desc="" clickable="false" bounds="[100,100][500,150]"/><node text="主页" content-desc="" clickable="true" bounds="[200,350][400,450]"/><node text="采集设置" content-desc="" clickable="true" bounds="[200,750][400,850]"/><node text="外观" content-desc="" clickable="true" bounds="[200,550][400,650]"/><node text="关于与帮助" content-desc="" clickable="true" bounds="[200,950][400,1050]"/></hierarchy>
+X
+cat > "$T23/fx/appearance.xml" <<'X'
+<hierarchy rotation="0"><node text="" content-desc="打开导航抽屉" clickable="true" bounds="[60,160][140,240]"/><node text="主题模式" content-desc="" clickable="false" bounds="[100,500][300,550]"/><node text="配色" content-desc="" clickable="false" bounds="[100,800][200,850]"/></hierarchy>
+X
+cat > "$T23/fx/capture.xml" <<'X'
+<hierarchy rotation="0"><node text="" content-desc="打开导航抽屉" clickable="true" bounds="[60,160][140,240]"/><node text="音源模式" content-desc="" clickable="false" bounds="[100,400][300,450]"/><node text="麦克风" content-desc="" clickable="false" bounds="[100,700][200,750]"/><node text="跟随系统（自动）" content-desc="" clickable="true" bounds="[100,800][600,850]"/></hierarchy>
+X
+cat > "$T23/fx/capture-effects.xml" <<'X'
+<hierarchy rotation="0"><node text="" content-desc="打开导航抽屉" clickable="true" bounds="[60,160][140,240]"/><node text="降噪（NS）" content-desc="" clickable="true" bounds="[100,600][400,650]"/></hierarchy>
+X
+echo home > "$T23/state"
+PATH="$T23/bin:$PATH" bash "$SCRIPTS/ui-capture.sh" "$T23/out" > "$T23/run.log" 2>&1
+t23_pass=$(grep -c '\[PASS\]' "$T23/run.log")
+assert_eq "$t23_pass" "13" "T23 四屏断言 13 项全 PASS"
+assert_eq "$(tr '\n' ' ' < "$T23/taps" 2>/dev/null | sed 's/ $//')" \
+          "tap 100 200 tap 300 600 tap 100 200 tap 300 800 tap 100 200 tap 300 400" \
+          "T23 导航序列正确（首页→外观→采集设置→复原主页，全程点中可点击项）"
+assert_eq "$(cat "$T23/state")" "home" "T23 走完四屏后复原回主页"
+assert_eq "$(ls "$T23/out" | grep -c '\.png$')" "5" "T23 产出 5 张截图"
+
+# ---------------------------------------------------------------------------
 echo
 echo "================ 单元测试结果 ================"
 echo "  通过 $PASS，失败 $FAIL"
