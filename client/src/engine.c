@@ -46,6 +46,10 @@ static int           g_buf_ms   = 60;
 static int           g_gain     = 100;
 static DevFeedMode   g_mode     = DEV_FEED_IOCTL;
 
+/* 媒体（UDP）端口：0 = 随机分配（默认）；1..65535 = 固定。
+ * 由 eng_set_media_port() 设置，必须在 eng_start() 之前调用。 */
+static int           g_media_port_req;
+
 static int16_t       g_decbuf[DEV_SAMPLES_20MS];
 static int16_t       g_feedbuf[DEV_SAMPLES_20MS];
 static int           g_short_writes;
@@ -162,6 +166,11 @@ static int do_handshake(int rate_idx)
         return 0;
     }
     mport = ntohs(ua.sin_port);
+
+    EnterCriticalSection(&g_cs);
+    g_st.media_port = mport;
+    g_st.media_fixed = (g_media_port_req != 0);
+    LeaveCriticalSection(&g_cs);
 
     /* 101：payload[0]=4 表示 UDP 头格式 C；其余 5 字节原样复刻官方 6.3 */
     unsigned char hello[6] = { 0x04, 0x06, 0x03, 0x00, 0x00, 0x00 };
@@ -296,17 +305,40 @@ static unsigned __stdcall worker(void *arg)
     colon = strrchr(host, ':');
     if (colon) { *colon = 0; port = atoi(colon + 1); }
 
-    /* 1) 先建 UDP 并 bind，拿到真实端口 */
+    /* 1) 先建 UDP 并 bind，拿到真实端口
+     * g_media_port_req == 0 → 端口 0，由系统随机分配（默认行为，向后兼容）；
+     * 否则绑到 --media-port 指定的固定端口（跨网络/过防火墙时必须固定）。 */
     g_udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_udp == INVALID_SOCKET) { strcpy(g_st.last_error, "UDP socket 失败"); g_st.state = ST_ERROR; goto out; }
     memset(&local, 0, sizeof(local));
     local.sin_family = AF_INET;
     local.sin_addr.s_addr = INADDR_ANY;
-    local.sin_port = 0;
+    local.sin_port = htons((u_short)(g_media_port_req > 0 ? g_media_port_req : 0));
     if (bind(g_udp, (SOCKADDR *)&local, sizeof(local)) != 0) {
-        sprintf(g_st.last_error, "UDP bind 失败 WSA=%d", WSAGetLastError());
+        int e = WSAGetLastError();
+        if (g_media_port_req > 0) {
+            /* 固定端口绑不上：绝大多数是端口被占用（WSAEADDRINUSE=10048）。
+             * 明确带出端口与 WSA 错误码，且不静默回退到随机端口 —— 回退会让
+             * "已放行防火墙"的假设悄悄失效，排查成本极高。 */
+            sprintf(g_st.last_error,
+                    "UDP 无法绑定固定媒体端口 %d，WSA=%d（10048=端口被占用，"
+                    "10013=权限不足）；换一个 --media-port 或先释放该端口",
+                    g_media_port_req, e);
+        } else {
+            sprintf(g_st.last_error, "UDP bind 失败 WSA=%d", e);
+        }
         g_st.state = ST_ERROR;
         goto out;
+    }
+    {
+        SOCKADDR_IN ba;
+        int bal = sizeof(ba);
+        int bound = 0;
+        if (getsockname(g_udp, (SOCKADDR *)&ba, &bal) == 0) bound = ntohs(ba.sin_port);
+        g_st.media_port = bound;
+        g_st.media_fixed = (g_media_port_req > 0);
+        elog("UDP 已绑定媒体端口 %d（%s）", bound,
+             g_media_port_req > 0 ? "--media-port 指定" : "系统随机分配");
     }
 
     /* 2) 再连 TCP */
@@ -393,6 +425,19 @@ out:
     if (g_st.state != ST_ERROR) g_st.state = ST_IDLE;
     return 0;
 }
+
+/* ------------------------------------------------- 媒体（UDP）端口 */
+/* 0 = 随机（默认，与加这个开关之前完全一致）；1..65535 = 固定端口。
+ * 非法值（<=0 或 >65535）一律按 0 处理 —— 真正的取值范围校验在
+ * cli.c 的 --media-port 解析里做（那里要给出明确报错 + 退出码 1）。
+ * 必须在 eng_start() 之前调用；返回实际生效值。 */
+int eng_set_media_port(int port)
+{
+    g_media_port_req = (port > 0 && port <= 65535) ? port : 0;
+    return g_media_port_req;
+}
+
+int eng_media_port(void) { return g_media_port_req; }
 
 /* --------------------------------------------------------- 对外 API */
 void eng_set_logger(LogFn fn) { g_log = fn; }

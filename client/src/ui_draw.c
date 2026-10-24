@@ -487,8 +487,18 @@ void ui_draw_conn_card(HDC dc)
         RECT box = { r.left + sd(14), r.top + sd(32), r.right - sd(14), r.top + sd(66) };
         ui_stroke_round(dc, box, sd(8), g_th.stroke, 255, 1);
     }
+    /* 第二行：UDP 媒体端口。留空 = 随机分配（默认，与加输入框之前一致）；
+     * 跨网段/过防火墙时填固定端口，等价于命令行 --media-port。 */
     {
-        RECT hint = { r.left + sd(16), r.top + sd(70), r.right - sd(16), r.top + sd(88) };
+        RECT box2 = { r.left + sd(14), r.top + sd(68), r.right - sd(14), r.top + sd(102) };
+        RECT lab = { r.left + sd(24), r.top + sd(68),
+                     g_lo.ed_media.left - sd(8), r.top + sd(102) };
+        ui_stroke_round(dc, box2, sd(8), g_th.stroke, 255, 1);
+        ui_text(dc, lab, L"媒体端口（留空=随机）", ui_font(9, FW_NORMAL, 0),
+                g_th.text_dim, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    {
+        RECT hint = { r.left + sd(16), r.top + sd(106), r.right - sd(16), r.top + sd(124) };
         ui_text(dc, hint, L"手机与电脑需在同一局域网；手机端打开 WO Mic 选 Wi-Fi",
                 ui_font(8, FW_NORMAL, 0), g_th.text_mute, DT_LEFT | DT_SINGLELINE);
     }

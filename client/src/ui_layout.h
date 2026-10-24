@@ -12,7 +12,7 @@
 
 typedef struct {
     RECT title, btn_min, btn_close, btn_theme;
-    RECT card_conn, ed_host, ed_port, btn_conn;
+    RECT card_conn, ed_host, ed_port, ed_media, btn_conn;
     RECT card_drv, btn_install, btn_uninstall, btn_help;
     RECT card_meter;
     RECT card_audio, hdr_audio, seg_rate[3], seg_buf[3], slider;

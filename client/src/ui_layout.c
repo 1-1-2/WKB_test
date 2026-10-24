@@ -30,16 +30,21 @@ static void layout_once(void)
     g_lo.btn_theme = cs(g_ui.w - sd(8) - sd(92) - sd(2) - sd(6) - sd(34), sd(12),
                         g_ui.w - sd(8) - sd(92) - sd(2) - sd(6), sd(42));
 
-    /* ---- 连接区（常驻） ---- */
-    g_lo.card_conn = cs(x0, y, x1, y + sd(144));
+    /* ---- 连接区（常驻） ----
+     * 两行输入：第一行 地址 + TCP 控制端口；第二行 UDP 媒体端口（留空=随机）。
+     * --media-port 只影响第二行，GUI 默认留空即沿用随机分配（向后兼容）。 */
+    g_lo.card_conn = cs(x0, y, x1, y + sd(180));
     {
         int ey = y + sd(34);
+        int ey2 = y + sd(70);
         int portw = sd(88);
+        int mediaw = sd(110);
         g_lo.ed_host = cs(x0 + inner, ey, x1 - inner - portw - sd(8), ey + sd(30));
         g_lo.ed_port = cs(x1 - inner - portw, ey, x1 - inner, ey + sd(30));
-        g_lo.btn_conn = cs(x0 + inner, y + sd(90), x1 - inner, y + sd(132));
+        g_lo.ed_media = cs(x1 - inner - mediaw, ey2, x1 - inner, ey2 + sd(30));
+        g_lo.btn_conn = cs(x0 + inner, y + sd(126), x1 - inner, y + sd(168));
     }
-    y += sd(144) + gap;
+    y += sd(180) + gap;
 
     /* ---- 驱动状态卡（常驻） ---- */
     g_lo.card_drv = cs(x0, y, x1, y + sd(116));
