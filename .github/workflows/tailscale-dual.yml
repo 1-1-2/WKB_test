@@ -1,0 +1,1440 @@
+name: tailscale-dual
+
+# =====================================================================
+# tailscale-dual —— 双机联调：真 womic.exe（Windows）↔ 真 app（Android 模拟器）
+#
+# 为什么有这条 workflow：主理人没有 Android 真机。无真机前提下，这是 Android 侧
+# 能拿到的最高档证据——不是 Python 模拟 app，而是**真实的 womic.exe 二进制**与
+# **真实的 app** 跨网段跑完整链路，四段全走真链路：
+#   1) 控制面：womic.exe 经 Tailscale → socat → slirp → app TCP 8125 握手
+#      （101 hello → 102 config → 103 start → 105 心跳）；
+#   2) 媒体面：app 按协议把 UDP 发往 TCP 对端（10.0.2.2:8126）→ host loopback
+#      → UDP 中继 → Tailscale → womic.exe 解码；
+#   3) 驱动侧：womic.exe 把解码音灌进 womic.sys（真驱动，官方安装包解出）；
+#   4) 音频取证：Windows 侧 waveIn 录到 440Hz 调试音（RMS/主峰/SNR 硬判据）。
+#
+# 拓扑（任务书给定形态）：
+#   job A linux-app（ubuntu-latest）
+#     · 模拟器内 app TCP server :8125（slirp 地址 10.0.2.15）
+#     · socat 把 A 的 tailnet IP:8125 暴露给 B（后端 = 10.0.2.15 或 redir 兜底）
+#     · Python UDP 中继：0.0.0.0:8126（收 app 发往 10.0.2.2 的媒体流）→ B:8126
+#   job B windows-client（windows-latest）
+#     · womic.exe --media-port 8126 连 <A 的 tailnet IP>:8125
+#     · 解码 → 灌进 womic.sys → 出声；waveIn 录音取证
+#
+# IP 交换顺序（为什么是这个时序）：
+#   build / build-apk 先完成 → B（needs: build）立即入网，然后长轮询等 A 出现
+#   → A（needs: build + build-apk，APK 构建是长pole）入网时 B 早已在网内，
+#     A 直接从 tailscale status 拿到 B 的 IP 即可（无需等待）。
+#   即：**B 先入网等 A，A 后入网即取 B**。B 的发现 deadline 45min 覆盖 A 的
+#   最慢成功构建路径（build-apk 30min 超时内的任何成功 + 模拟器 + 入网）；
+#   A 无需发现等待，因为 B 的入网点在时间上必然早于 A。
+#
+# 为什么只开 workflow_dispatch（不挂 push）：
+#   一次完整联调要占 2 台 runner 约 30-50 分钟（最慢路径 ~65min）并签
+#   2 个 ephemeral tailnet 节点，成本高且属于"关键路径抽查"而非每次提交
+#   都要跑的回归——客户端回归由 windows-e2e.yml 承担、app 回归由
+#   android.yml 承担。手动触发 + 输入窗口时长，由主理人按需发起；
+#   concurrency 另行兜底同 ref 排队。
+#
+# 纪律：不引第三方 action（官方件 + 仓库内 .github/actions/tailnet-debug 除外，
+# 本 workflow 甚至不复用该 action——它只支持 Windows 且带 SSH 挂起，联调不需要）；
+# 不改 android.yml / windows-e2e.yml / android / client / driver 任何源码。
+# =====================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_window_seconds:
+        description: 'linux-app 等 windows-client 跑完的最长窗口（秒）。B 发现 A 后还要装驱动+录音+跑 womic，典型 8min；走 d3 兜底最坏 ~25min，默认 1200 覆盖'
+        required: false
+        default: '1200'
+
+# 同一分支排队执行、不自动取消：双机联调是关键路径验证，手动发起，
+# 不应被后续手动触发互相打断；同 ref 排队也避免同时占 4 台 runner /
+# 4 个 ephemeral 节点。hostname 带 run_id，即使并发也不会在 tailnet 撞名。
+concurrency:
+  group: tailscale-dual-${{ github.ref }}
+  cancel-in-progress: false
+
+# actions: read —— linux-app 用 gh api 轮询 windows-client 的作业状态
+# （判 B 是否跑完/结论，替代无脑 sleep）；contents: read —— checkout。
+permissions:
+  contents: read
+  actions: read
+
+env:
+  # 与 ACL（tag:ci → tag:ci: ["8125","8126"]）、install-app.sh 的
+  # extra.control_port、 negotiated 媒体端口严格一致，改这里等于改协议面。
+  CONTROL_PORT: '8125'
+  MEDIA_PORT: '8126'
+  # slirp 直连不通时，模拟器控制台 redir 的 host 侧端口（见 emu-redir.py）
+  REDIR_PORT: '18125'
+
+jobs:
+  # ==================================================================
+  # 1) 交叉构建 womic.exe（Linux → Windows x64）。
+  #    步骤与判据同 windows-e2e.yml build 作业（mingw 硬化 / 官方安装包
+  #    大小+sha256 锚定 / pack_driver / build_opus / build.sh），不重新发明；
+  #    只改产物名，避免与 windows-e2e 的 womic-e2e-build 混淆。
+  # ==================================================================
+  build:
+    name: 交叉构建 womic.exe
+    runs-on: ubuntu-latest
+    # 正常 3-6min（2026-10-23 实证 apt 顺利时约 2.5min + opus 静态编 ~1min）。
+    # 25min 硬上限：apt/opus 卡死时整个 job 必死，不无限等。
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      # ---------------------------------------------------------------
+      # 交叉编译工具链（apt 硬化范式同 windows-e2e.yml，注释勿删）：
+      #   Azure 内网镜像 + timeout -k 硬上限 + 3 次重试 + ForceIPv4。
+      #   2026-10-23 实证：公网 archive 同刻不同 runner 一个 28s 过、
+      #   一个静默挂 10 分钟——不探活，直接换源。
+      # ---------------------------------------------------------------
+      - name: 安装交叉编译工具链
+        shell: bash
+        run: |
+          echo 'Acquire::http::Timeout "20";' | sudo tee /etc/apt/apt.conf.d/99timeout >/dev/null
+          echo 'Acquire::https::Timeout "20";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
+          echo 'Acquire::Retries "2";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
+          echo 'Acquire::ForceIPv4 "true";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
+          # run 39981519800 实证：ubuntu-24.04 镜像的 sources 是
+          # "URIs: mirror+file:/etc/apt/apt-mirrors.txt"，主机名在候选列表
+          # 文件里——只 sed sources 是空操作。两条路都处理。
+          for f in /etc/apt/sources.list.d/*ubuntu*.sources; do
+            [ -f "$f" ] || continue
+            sudo sed -i 's|^URIs: .*|URIs: http://azure.archive.ubuntu.com/ubuntu/|' "$f"
+            echo "改写 $f"
+          done
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo cp /etc/apt/apt-mirrors.txt /tmp/apt-mirrors.orig.txt
+            echo 'http://azure.archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          else
+            sudo sed -i \
+              -e 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+              -e 's|https://archive.ubuntu.com/ubuntu|https://azure.archive.ubuntu.com/ubuntu|g' \
+              -e 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+              -e 's|https://security.ubuntu.com/ubuntu|https://azure.archive.ubuntu.com/ubuntu|g' \
+              /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          fi
+          ok=""
+          for i in 1 2 3; do
+            echo "===== apt 尝试 $i/3：update ====="
+            if timeout -k 10 120 sudo apt-get update -qq; then
+              echo "===== apt 尝试 $i/3：install gcc-mingw-w64-x86-64 ====="
+              if timeout -k 10 240 sudo apt-get install -y -qq gcc-mingw-w64-x86-64; then
+                ok=1; break
+              fi
+              echo "::warning::apt 第 $i 次 install 失败/超时"
+            else
+              echo "::warning::apt 第 $i 次 update 失败/超时"
+            fi
+            sleep 10
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::apt 三次重试均失败"
+            curl -sS -m 5 -o /dev/null -w 'HTTP %{http_code} in %{time_total}s\n' http://archive.ubuntu.com/ubuntu/ || true
+            exit 1
+          fi
+          x86_64-w64-mingw32-gcc --version | head -1
+          x86_64-w64-mingw32-objdump --version | head -1
+          if ! command -v 7z >/dev/null 2>&1; then
+            for i in 1 2 3; do
+              if timeout -k 10 180 sudo apt-get install -y -qq p7zip-full || timeout -k 10 180 sudo apt-get install -y -qq 7zip; then break; fi
+              echo "::warning::7z 安装第 $i 次失败，10s 后重试"; sleep 10
+            done
+          fi
+          7z | head -2 || { echo "::error::7z 不可用"; exit 1; }
+
+      - name: 下载官方安装包并校验大小
+        shell: bash
+        run: |
+          curl -sSL --retry 3 -o WOMicClientSetup6.3.exe \
+            https://wolicheng.com/womic/downloads/WOMicClientSetup6.3.exe
+          sz=$(stat -c %s WOMicClientSetup6.3.exe)
+          echo "安装包大小: $sz B"
+          if [ "$sz" != "1743456" ]; then
+            echo "::error::官方安装包大小 $sz ≠ 1743456（下载不完整或被篡改）"
+            exit 1
+          fi
+
+      # -aou 必须加：NSIS 包里 driver/womic.* 有 7 组同名文件，默认覆盖
+      # 只剩最后一组（2017 版），实证见 windows-e2e.yml 同步骤注释。
+      - name: 解出官方驱动并校验 sha256
+        shell: bash
+        run: |
+          rm -rf installer-extract womic-driver
+          mkdir -p womic-driver
+          7z x -aou -y WOMicClientSetup6.3.exe -oinstaller-extract >7z.log 2>&1 || {
+            echo "::error::7z 解包失败"; tail -20 7z.log; exit 1; }
+          for f in womic.inf womic.sys womic.cat \
+                   womic_1.inf womic_1.sys womic_1.cat \
+                   womic_2.inf womic_2.sys womic_2.cat; do
+            src="installer-extract/driver/$f"
+            if [ ! -f "$src" ]; then
+              echo "::error::解出结果缺少 $f（-aou 重名改名行为异常？）"
+              ls -la installer-extract/driver/ || true
+              exit 1
+            fi
+            cp "$src" womic-driver/
+          done
+          got=$(sha256sum womic-driver/womic_1.sys | cut -d' ' -f1)
+          echo "womic_1.sys sha256: $got"
+          if [ "$got" != "75f080f206ff0c13701ff66388c4a404529d9ec71b2ba0f1fadd4b71481c0475" ]; then
+            echo "::error::womic_1.sys 哈希不符（官方 2022 amd64 基线必须是 75f080f2...0475）"
+            exit 1
+          fi
+          ls -la womic-driver/
+
+      - name: 生成内置驱动包
+        shell: bash
+        working-directory: client
+        run: python3 tools/pack_driver.py --driver-dir ../womic-driver
+
+      - name: 静态构建 libopus
+        shell: bash
+        working-directory: client
+        timeout-minutes: 15
+        run: bash tools/build_opus.sh
+
+      - name: 交叉编译 womic.exe 与解压自检程序
+        shell: bash
+        working-directory: client
+        run: |
+          bash build.sh
+          bash build.sh test
+
+      - name: 整理构建产物
+        shell: bash
+        run: |
+          mkdir -p dist/womic-driver
+          cp client/build/womic.exe client/build/womic-drvinst.exe \
+             client/build/test_drvpkg.exe dist/
+          cp womic-driver/* dist/womic-driver/
+          ls -la dist dist/womic-driver
+          for f in dist/womic.exe dist/womic-drvinst.exe dist/test_drvpkg.exe; do
+            [ -f "$f" ] || { echo "::error::缺少产物 $f"; exit 1; }
+          done
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: womic-dual-build
+          path: |
+            dist/womic.exe
+            dist/womic-drvinst.exe
+            dist/test_drvpkg.exe
+            dist/womic-driver/
+          if-no-files-found: error
+          retention-days: 3
+
+  # ==================================================================
+  # 2) 构建 app APK。步骤同 android.yml build-apk 作业（SDK 组件 /
+  #    fetch-opus / assembleDebug）。为什么不直接下载 android.yml 的
+  #    app-debug-apk：跨 workflow 取产物要把被验 APK 和另一个 run 的
+  #    历史状态耦合（可能拿到过期/分支不一致的包）；本 job 自包含构建，
+  #    保证 APK 与本次 dispatch 的 app 源码严格一致。与 build 并行跑，
+  #    两台 job 同时结束，linux-app 的等待时间最小化。
+  # ==================================================================
+  build-apk:
+    name: 构建 app APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # ubuntu-latest 镜像不再把 cmdline-tools 放进 PATH（run 39408485677
+      # 实证 sdkmanager: command not found），自行定位并写入 GITHUB_PATH。
+      - name: Set up Android SDK tools
+        timeout-minutes: 5
+        run: bash ../.github/scripts/setup-android-sdk.sh
+
+      # compileSdk 37（platforms;android-37.0 次版本命名）/ build-tools 36 /
+      # CMake 3.22.1（app/build.gradle.kts 固定）/ NDK 28.2.13676358（AGP 9.1 默认）
+      - name: Install Android SDK components
+        timeout-minutes: 20
+        run: |
+          sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platforms;android-37.0" "build-tools;36.0.0" \
+            "cmake;3.22.1" "ndk;28.2.13676358"
+
+      # libopus 源码不入库，CI 现场下载（见 .github/scripts/fetch-opus.sh）
+      - name: Fetch Opus source
+        timeout-minutes: 8
+        run: bash ../.github/scripts/fetch-opus.sh
+
+      - name: Assemble debug APK
+        timeout-minutes: 25
+        run: ./gradlew :app:assembleDebug --no-daemon
+
+      - name: Upload APK
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-debug-apk-dual
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 3
+
+  # ==================================================================
+  # 3) linux-app（job A）：真 app + tailnet A 端 + TCP/UDP 中继。
+  #
+  #    关键未知数的处置（设计依据，勿猜）：
+  #    a) app 的 UDP 目标 = TCP 对端地址。slirp 下 host 侧发起连接时，
+  #       guest 看到对端是 10.0.2.2 → UDP 发往 10.0.2.2:8126 → host
+  #       loopback。依据：android/verify/integration/README.md「直连拓扑」
+  #       段 + pc_client.py HostUdpTap + media_port_check.py case_real
+  #       docstring（三处文档一致）。
+  #    b) 但 QEMU 官方文档称 slirp "behaves as if behind a firewall"
+  #       （阻断入站）——host→10.0.2.15:8125 直连是否成立，runner 上
+  #       无历史实证。处置：hello 探针先测直连；失败走模拟器控制台
+  #       redir 兜底（连接由 slirp 网关代为发起，guest 侧对端仍是
+  #       10.0.2.2，UDP 目标不变）；两条都失败即带原始错误失败，不猜。
+  #    c) wine 预检（--no-fake）在 B 之前本地验证「slirp 面 + 媒体端口
+  #       协商 + UDP→host loopback」三个未知数，continue-on-error 只作
+  #       定位档；硬判据始终是 B 侧的 womic.exe + 录音取证。
+  # ==================================================================
+  linux-app:
+    name: linux-app
+    needs: [build, build-apk]
+    runs-on: ubuntu-latest
+    # 预算拆解：APK 已在 build-apk 并行完成；本 job  SDK+模拟器 ~8min、
+    # 装 app+wine+预检 ~3min、入网+中继 ~2min、等 B 窗口 20min（默认）、
+    # 收证 ~2min ≈ 35min；50min 硬上限覆盖 d3 兜底等慢路径。
+    timeout-minutes: 50
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v7
+
+      # 只需要 adb/emulator/系统镜像（不构建 APK），但 sdkmanager 要 JVM
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK tools
+        timeout-minutes: 5
+        run: bash ../.github/scripts/setup-android-sdk.sh
+
+      - name: Install emulator components
+        timeout-minutes: 15
+        run: |
+          sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager "platform-tools" "emulator" "system-images;android-34;default;x86_64"
+          echo "--- 已安装组件 ---"
+          ls "$ANDROID_HOME/system-images/android-34/default/" 2>/dev/null || true
+
+      # uses 步骤的 path 相对 workspace 根，不受 job 级 working-directory 影响
+      # （android.yml 同款注释），落点 <repo>/apk 与 <repo>/dist
+      - name: Download APK from build-apk
+        timeout-minutes: 5
+        uses: actions/download-artifact@v8
+        with:
+          name: app-debug-apk-dual
+          path: apk
+
+      # womic.exe 供本 job 的 wine 预检用（不重复交叉编译）
+      - name: Download womic.exe build artifact
+        timeout-minutes: 5
+        uses: actions/download-artifact@v8
+        with:
+          name: womic-dual-build
+          path: dist
+
+      # ---------------------------------------------------------------
+      # 模拟器系统依赖 + socat（TCP 中继）。apt 硬化同 build 作业：
+      # libpulse0 缺失时 qemu 起不来（run 39459335348 实证），
+      # 公网 archive 抖动（windows-e2e 实证）→ Azure 镜像 + 硬超时 + 重试。
+      # 不要用裸 ldd qemu 判断缺库（run 39461011547 实证误杀）。
+      # ---------------------------------------------------------------
+      - name: Install emulator system dependencies (+ socat)
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          echo 'Acquire::http::Timeout "20";' | sudo tee /etc/apt/apt.conf.d/99timeout >/dev/null
+          echo 'Acquire::https::Timeout "20";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
+          echo 'Acquire::Retries "2";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
+          echo 'Acquire::ForceIPv4 "true";' | sudo tee -a /etc/apt/apt.conf.d/99timeout >/dev/null
+          for f in /etc/apt/sources.list.d/*ubuntu*.sources; do
+            [ -f "$f" ] || continue
+            sudo sed -i 's|^URIs: .*|URIs: http://azure.archive.ubuntu.com/ubuntu/|' "$f"
+          done
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            echo 'http://azure.archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          else
+            sudo sed -i \
+              -e 's|http://archive.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+              -e 's|https://archive.ubuntu.com/ubuntu|https://azure.archive.ubuntu.com/ubuntu|g' \
+              -e 's|http://security.ubuntu.com/ubuntu|http://azure.archive.ubuntu.com/ubuntu|g' \
+              -e 's|https://security.ubuntu.com/ubuntu|https://azure.archive.ubuntu.com/ubuntu|g' \
+              /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          fi
+          ok=""
+          for i in 1 2 3; do
+            echo "===== apt 尝试 $i/3：update ====="
+            if timeout -k 10 120 sudo apt-get update -qq; then
+              echo "===== apt 尝试 $i/3：install（libpulse0 等 + socat）====="
+              if timeout -k 10 300 sudo apt-get install -y -qq --no-install-recommends \
+                  libpulse0 libnss3 libxdamage1 libxcomposite1 libxcursor1 \
+                  libxi6 libxtst6 libglu1-mesa socat; then
+                ok=1; break
+              fi
+              echo "::warning::apt 第 $i 次 install 失败/超时"
+            else
+              echo "::warning::apt 第 $i 次 update 失败/超时"
+            fi
+            sleep 10
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::apt 三次重试均失败（模拟器依赖/socat）"
+            exit 1
+          fi
+          echo "--- 系统依赖安装完成 ---"
+          dpkg -l libpulse0 2>/dev/null | tail -2 || true
+          socat -V | head -1 || { echo "::error::socat 不可用"; exit 1; }
+
+      # ---------------------------------------------------------------
+      # wine 兜底（任务书指定形态）：镜像可能自带 wine；没有就 apt 装。
+      # 只用于 job A 的本地诊断档（media_port_check --no-fake），
+      # 硬判据在 job B 的真 Windows 上。如实记录实际版本。
+      # ---------------------------------------------------------------
+      - name: Ensure wine (diagnostic only) + record version
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/probe-results/logs"
+          if wine --version > "$GITHUB_WORKSPACE/probe-results/logs/wine-version.txt" 2>&1; then
+            echo "[wine] 镜像自带 wine：$(cat "$GITHUB_WORKSPACE/probe-results/logs/wine-version.txt")"
+          else
+            echo "::warning::镜像无 wine，apt 兜底安装（任务书指定形态，如实记录版本）"
+            ok=""
+            for i in 1 2 3; do
+              if timeout -k 10 120 sudo apt-get update -qq; then
+                if timeout -k 10 600 sudo apt-get install -y wine; then ok=1; break; fi
+              fi
+              echo "::warning::wine 安装第 $i 次失败/超时"; sleep 10
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::wine 三次安装重试均失败"
+              exit 1
+            fi
+            wine --version | tee "$GITHUB_WORKSPACE/probe-results/logs/wine-version.txt"
+          fi
+          wine --version || { echo "::error::wine 仍不可用"; exit 1; }
+
+      - name: Verify KVM and AVD prerequisites
+        timeout-minutes: 3
+        run: bash ../.github/scripts/verify-kvm.sh
+
+      # 三重轮询 + 每 10s 进度 + 失败自动打 emulator.log 尾部（脚本内预算 480s）
+      - name: Start emulator
+        timeout-minutes: 12
+        run: bash ../.github/scripts/start-emulator.sh womic_interop android-34
+
+      # 调试音模式启动采集服务：app 发 440Hz 正弦（TONE_FREQUENCY_HZ=440.0，
+      # TONE_AMPLITUDE=0.3），CI 无麦克风也能跑通媒体链路；控制端口 8125。
+      - name: Install and launch app (debug tone)
+        timeout-minutes: 10
+        run: bash ../.github/scripts/install-app.sh ../apk/app-debug.apk
+
+      # ---------------------------------------------------------------
+      # A 端入网。范式同 .github/actions/tailnet-debug（OAuth → ephemeral
+      # key，tags=[tag:ci]、expiry 3600 → tailscale up --accept-dns=false
+      # → 轮询 IP），去掉 SSH 挂起部分；Bash + jq 版（action 只支持 Windows）。
+      # ACL 已放行 tag:ci → tag:ci 的 8125/8126（任务书给定）。
+      # ---------------------------------------------------------------
+      - name: A. Tailscale 入网（linux-app）
+        timeout-minutes: 8
+        shell: bash
+        env:
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+        run: |
+          set -uo pipefail
+          WS="$GITHUB_WORKSPACE"
+          mkdir -p "$WS/probe-results/logs"
+          if ! command -v tailscale >/dev/null 2>&1; then
+            echo "[ts] 安装 Tailscale（官方 install.sh）"
+            curl -fsSL https://tailscale.com/install.sh | sudo bash \
+              || echo "::warning::install.sh 返回非 0，下面验证是否可用"
+          fi
+          if ! command -v tailscale >/dev/null 2>&1; then
+            echo "[ts] install.sh 未落地，尝试 apt universe 包兜底"
+            for i in 1 2 3; do
+              if timeout -k 10 120 sudo apt-get update -qq; then
+                if timeout -k 10 300 sudo apt-get install -y tailscale; then break; fi
+              fi
+              echo "::warning::apt tailscale 第 $i 次失败"; sleep 10
+            done
+          fi
+          if ! command -v tailscale >/dev/null 2>&1; then
+            echo "::error::Tailscale 不可用（install.sh 与 apt 均失败）"
+            exit 1
+          fi
+          tailscale version | tee "$WS/probe-results/logs/tailscale-version.txt"
+          if [ -z "${TS_OAUTH_CLIENT_ID:-}" ] || [ -z "${TS_OAUTH_SECRET:-}" ]; then
+            echo "::error::secrets.TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET 为空"
+            exit 1
+          fi
+          # OAuth 现签 ephemeral 单次 key（tags 精确集合 = 签发凭据配置）
+          TOK=$(curl -sS -X POST 'https://api.tailscale.com/api/v2/oauth/token' \
+            -d "client_id=$TS_OAUTH_CLIENT_ID" \
+            -d "client_secret=$TS_OAUTH_SECRET" | jq -r '.access_token')
+          if [ -z "$TOK" ] || [ "$TOK" = "null" ]; then
+            echo "::error::OAuth access_token 换取失败"
+            exit 1
+          fi
+          DESC="womic-dual-linux-${{ github.run_id }}"
+          KEY_JSON=$(jq -n --arg d "$DESC" \
+            '{capabilities:{devices:{create:{reusable:false,ephemeral:true,tags:["tag:ci"]}}},expirySeconds:3600,description:$d}')
+          KEY=$(curl -sS -X POST 'https://api.tailscale.com/api/v2/tailnet/-/keys' \
+            -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
+            -d "$KEY_JSON" | jq -r '.key')
+          if [ -z "$KEY" ] || [ "$KEY" = "null" ]; then
+            echo "::error::ephemeral key 签发失败"
+            exit 1
+          fi
+          # up 只等后端启动、不等地址分配（run 39934585851 实证）→ 轮询最多 60s
+          sudo tailscale up --authkey="$KEY" --hostname="$DESC" --accept-dns=false \
+            || { echo "::error::tailscale up 失败"; sudo tailscale status; exit 1; }
+          A_IP=""
+          for i in $(seq 1 30); do
+            A_IP=$(sudo tailscale ip -4 2>/dev/null | head -1 || true)
+            [ -n "$A_IP" ] && break
+            sleep 2
+          done
+          if [ -z "$A_IP" ]; then
+            echo "::error::60s 内未取得 tailnet IPv4"
+            sudo tailscale status
+            exit 1
+          fi
+          echo "[ts] linux-app 已入网：hostname=$DESC ip=$A_IP"
+          sudo tailscale status | tee "$WS/probe-results/logs/tailscale-status.txt"
+          echo "A_IP=$A_IP" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # 发现 B（windows-client）。B 在 build 完成后立即入网，本步骤执行时
+      # （APK 构建之后）B 必然已在网内 → 只做确认式轮询，不等长。
+      # 用 tailscale status --json 互相发现，不需要 devices API scope
+      # （tailnet-debug action 同款思路，见 docs/tailscale-channel.md）。
+      # ---------------------------------------------------------------
+      - name: A. 发现 windows-client 的 tailnet IP
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -uo pipefail
+          B_IP=""
+          for i in $(seq 1 24); do
+            B_IP=$(sudo tailscale status --json 2>/dev/null \
+              | jq -r '.Peer[] | select(.HostName | startswith("womic-dual-win-")) | .TailscaleIPs[0]' \
+              2>/dev/null | head -1 || true)
+            if [ -n "$B_IP" ] && [ "$B_IP" != "null" ]; then break; fi
+            echo "[discover] 第 $i 次：tailnet 内尚未看到 windows-client 节点"
+            sleep 5
+          done
+          if [ -z "$B_IP" ] || [ "$B_IP" = "null" ]; then
+            echo "::error::120s 内未在 tailnet 发现 windows-client（B 应已先入网）"
+            sudo tailscale status
+            exit 1
+          fi
+          echo "[discover] windows-client → $B_IP"
+          echo "B_IP=$B_IP" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # 选择 TCP 通路（socat 后端）。先测 slirp 直连 10.0.2.15:8125
+      # （README「直连拓扑」+ pc_client.py 的历史形态）；失败走模拟器
+      # 控制台 redir 兜底（adb emu redir 优先，裸 console 回退，见
+      # emu-redir.py）。两条路都让 app 看到 TCP 对端 10.0.2.2，
+      # UDP 目标不变；都失败即带原始错误失败，不猜。
+      # ---------------------------------------------------------------
+      - name: A. 选择 TCP 通路（slirp 直连优先，redir 兜底）
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -uo pipefail
+          WS="$GITHUB_WORKSPACE"
+          PATH_HOST="10.0.2.15"; PATH_PORT="$CONTROL_PORT"; PATH_DESC="slirp 直连 10.0.2.15:$CONTROL_PORT"
+          if python3 "$WS/.github/scripts/womic-hello-probe.py" \
+              --host 10.0.2.15 --port "$CONTROL_PORT" \
+              --timeout 30 --interval 2 --io-timeout 3 \
+              2>&1 | tee "$WS/probe-results/logs/hello-direct.txt"; then
+            echo "[path] 直连通路 OK：$PATH_DESC"
+          else
+            echo "::warning::直连 10.0.2.15:$CONTROL_PORT 不通，走 redir 兜底"
+            if ! python3 "$WS/.github/scripts/emu-redir.py" \
+                --add "tcp:${REDIR_PORT}:${CONTROL_PORT}" --verify \
+                2>&1 | tee "$WS/probe-results/logs/emu-redir-add.txt"; then
+              echo "::error::redir 兜底失败（adb emu 与裸 console 两条通道均失败）"
+              exit 1
+            fi
+            if ! python3 "$WS/.github/scripts/womic-hello-probe.py" \
+                --host 127.0.0.1 --port "$REDIR_PORT" \
+                --timeout 30 --interval 2 --io-timeout 3 \
+                2>&1 | tee "$WS/probe-results/logs/hello-redir.txt"; then
+              echo "::error::redir 后 127.0.0.1:$REDIR_PORT 仍不通"
+              exit 1
+            fi
+            PATH_HOST="127.0.0.1"; PATH_PORT="$REDIR_PORT"; PATH_DESC="console redir 127.0.0.1:$REDIR_PORT→$CONTROL_PORT"
+          fi
+          echo "[path] socat 后端 = $PATH_DESC"
+          {
+            echo "PATH_HOST=$PATH_HOST"
+            echo "PATH_PORT=$PATH_PORT"
+            echo "PATH_DESC=$PATH_DESC"
+          } >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # wine 预检（本地诊断档，continue-on-error）：在 B 之前用真 app 验证
+      # 「slirp 面 + 媒体端口协商 + UDP→host loopback」三个未知数。
+      # 必须在 UDP 中继启动之前跑——wine 的 womic.exe 要绑 8126，
+      # 中继先起来会把它挤掉（engine.c 固定端口绑失败不静默回退）。
+      # 判据同 media_port_check case_real：退出码 0 + OK 行 + 帧>0 + 端口固定。
+      # ---------------------------------------------------------------
+      - name: A. wine 预检（真 app 本地诊断档，continue-on-error）
+        timeout-minutes: 5
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          WS="$GITHUB_WORKSPACE"
+          # pkill 自杀陷阱（VERIFICATION.md 教训 #4）：模式串会匹配自己所在
+          # shell —— 用 [.] 正则技巧让模式不匹配自身命令行。
+          pkill -f 'womic[.]exe' 2>/dev/null || true
+          sleep 1
+          set -o pipefail
+          python3 "$WS/client/verify/media_port_check.py" \
+            --no-fake --wine --exe "$WS/dist/womic.exe" \
+            --host "$PATH_HOST" --control-port "$PATH_PORT" \
+            --media-port "$MEDIA_PORT" --timeout 60 \
+            2>&1 | tee "$WS/probe-results/logs/wine-precheck.txt"
+          rc=$?
+          echo "[precheck] media_port_check --no-fake exit=$rc（0=三未知数全过）"
+          echo "WINEPRECHECK_RC=$rc" >> "$GITHUB_ENV"
+          pkill -f 'womic[.]exe' 2>/dev/null || true
+          exit 0
+
+      # ---------------------------------------------------------------
+      # UDP 中继（单向）：app → 10.0.2.2:8126 → host loopback →
+      # 本中继 → B 的 tailnet IP:8126。PC 侧只收不发（engine.c 只有
+      # recv，无 sendto）→ 严格单向，无需回程 NAT 表（设计依据）。
+      # 统计原子落盘，A 的最终判定以 forwarded>0 为流量硬证据。
+      # ---------------------------------------------------------------
+      - name: A. 启动 UDP 中继（app → windows-client）
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -uo pipefail
+          WS="$GITHUB_WORKSPACE"
+          nohup python3 "$WS/.github/scripts/udp-relay.py" \
+            --listen-port "$MEDIA_PORT" \
+            --target "$B_IP" --target-port "$MEDIA_PORT" \
+            --stats "$WS/probe-results/relay-stats.json" \
+            > "$WS/probe-results/relay.log" 2>&1 &
+          echo $! > "$WS/probe-results/relay.pid"
+          sleep 2
+          echo "[relay] pid=$(cat "$WS/probe-results/relay.pid") listen=0.0.0.0:$MEDIA_PORT target=$B_IP:$MEDIA_PORT"
+          cat "$WS/probe-results/relay-stats.json" 2>/dev/null || echo "(统计文件尚未生成)"
+          kill -0 "$(cat "$WS/probe-results/relay.pid")" 2>/dev/null \
+            || { echo "::error::UDP 中继进程退出"; cat "$WS/probe-results/relay.log"; exit 1; }
+
+      # ---------------------------------------------------------------
+      # socat TCP 中继（B -facing 入口）：把 A 的 tailnet IP:8125 暴露给
+      # B，后端 = 上步选定的通路。socat 出站连接由 host 发起，slirp 网关
+      # 代为建连 → guest 侧对端仍是 10.0.2.2 → app 的 UDP 目标不变。
+      # fork：B 的多次连接（hello 探活 + womic.exe）各自独立转发。
+      # ---------------------------------------------------------------
+      - name: A. 启动 socat TCP 中继（tailnet:8125 → app）
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -uo pipefail
+          WS="$GITHUB_WORKSPACE"
+          nohup socat \
+            "TCP-LISTEN:${CONTROL_PORT},fork,reuseaddr" \
+            "TCP:${PATH_HOST}:${PATH_PORT}" \
+            > "$WS/probe-results/socat.log" 2>&1 &
+          echo $! > "$WS/probe-results/socat.pid"
+          sleep 2
+          echo "[socat] pid=$(cat "$WS/probe-results/socat.pid") listen=0.0.0.0:$CONTROL_PORT backend=$PATH_HOST:$PATH_PORT"
+          kill -0 "$(cat "$WS/probe-results/socat.pid")" 2>/dev/null \
+            || { echo "::error::socat 进程退出"; cat "$WS/probe-results/socat.log"; exit 1; }
+          # 自检 socat 出口：走 127.0.0.1:8125 → socat → app（B 将走同一入口，
+          # 只是外层包 tailnet）。不过即失败——这正是 B 的就绪判据同款探针。
+          python3 "$WS/.github/scripts/womic-hello-probe.py" \
+            --host 127.0.0.1 --port "$CONTROL_PORT" \
+            --timeout 30 --interval 2 --io-timeout 3 \
+            2>&1 | tee "$WS/probe-results/logs/hello-socat.txt" \
+            || { echo "::error::socat 出口自检失败（hello 未通）"; exit 1; }
+
+      # ---------------------------------------------------------------
+      # 等 B 跑完。主路径：gh api 轮询 windows-client 作业状态
+      # （permissions: actions: read），完成即带出结论——B 早败则 A 快速
+      # 失败并附 B 的 conclusion，不无脑等满窗口。兜底：gh 不可用
+      # （权限/网络）时退化为固定窗口 sleep，判定降级为「B 结论未知」。
+      # ---------------------------------------------------------------
+      - name: A. 等待 windows-client 完成（gh 轮询 + 窗口兜底）
+        timeout-minutes: 25
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          WINDOW_SECONDS: ${{ inputs.test_window_seconds }}
+        run: |
+          set -uo pipefail
+          WS="$GITHUB_WORKSPACE"
+          WIN="${WINDOW_SECONDS:-1200}"
+          case "$WIN" in (*[!0-9]*|"") WIN=1200;; esac
+          B_STATUS="unknown"; B_CONCLUSION=""
+          GH_OK=1
+          gh api "repos/$GH_REPO/actions/runs/$RUN_ID/jobs" --jq '.jobs | length' \
+            >/dev/null 2>"$WS/probe-results/logs/gh-precheck.txt" || GH_OK=0
+          if [ "$GH_OK" != "1" ]; then
+            echo "::warning::gh api 预检失败（见 gh-precheck.txt），退化为固定窗口 ${WIN}s"
+            cat "$WS/probe-results/logs/gh-precheck.txt" || true
+          fi
+          if [ "$GH_OK" = "1" ]; then
+            DEADLINE=$(( $(date +%s) + WIN ))
+            while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+              J=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/jobs" --jq \
+                '.jobs[] | select(.name=="windows-client") | "\(.status) \(.conclusion)"' \
+                2>/dev/null || echo "")
+              echo "[wait] $(date -u +%H:%M:%S) windows-client: ${J:-<查询失败>}"
+              S=$(printf '%s' "$J" | awk '{print $1}')
+              if [ "$S" = "completed" ]; then
+                B_STATUS="completed"
+                B_CONCLUSION=$(printf '%s' "$J" | awk '{print $2}')
+                break
+              fi
+              sleep 15
+            done
+            [ "$B_STATUS" = "completed" ] || B_STATUS="timeout"
+          else
+            sleep "$WIN"
+          fi
+          echo "[wait] 结果：B_STATUS=$B_STATUS B_CONCLUSION=$B_CONCLUSION"
+          {
+            echo "B_STATUS=$B_STATUS"
+            echo "B_CONCLUSION=$B_CONCLUSION"
+          } >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # 汇总判定（A 侧）。硬证据链：
+      #   hello 通路已过（前面步骤失败即中断，到这里必然过）；
+      #   B 结论 = success（gh 可用时）；
+      #   UDP 中继 forwarded > 0（媒体流真的跨网到达了 B）。
+      # gh 不可用 → B 结论未知，此时以 forwarded>0 为据并 ::warning::
+      # （B 的最终判据在 B 自己的作业里，workflow 整体颜色不受此降级影响）。
+      # ---------------------------------------------------------------
+      - name: A. 汇总判定
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -uo pipefail
+          WS="$GITHUB_WORKSPACE"
+          FORWARDED=-1
+          if [ -f "$WS/probe-results/relay-stats.json" ]; then
+            FORWARDED=$(python3 -c \
+              "import json;d=json.load(open('$WS/probe-results/relay-stats.json'));print(d.get('forwarded',0))" \
+              2>/dev/null || echo -1)
+          fi
+          echo "[verdict] B_STATUS=$B_STATUS B_CONCLUSION=$B_CONCLUSION relay_forwarded=$FORWARDED"
+          cat "$WS/probe-results/relay-stats.json" 2>/dev/null || true
+          VERDICT=FAIL; REASON=""
+          if [ "$B_STATUS" = "completed" ]; then
+            if [ "$B_CONCLUSION" = "success" ] && [ "$FORWARDED" -gt 0 ] 2>/dev/null; then
+              VERDICT=PASS; REASON="B 成功且 UDP 中继转发 $FORWARDED 包"
+            elif [ "$B_CONCLUSION" != "success" ]; then
+              REASON="windows-client 结论=$B_CONCLUSION（详见 B 作业日志/dual-evidence-windows）"
+            else
+              REASON="B 成功但中继转发量=$FORWARDED（矛盾：B 收到音频必有转发）"
+            fi
+          else
+            if [ "$FORWARDED" -gt 0 ] 2>/dev/null; then
+              VERDICT=PASS
+              REASON="B 结论未知（gh 不可用/窗口超时 status=$B_STATUS），但中继转发 $FORWARDED 包"
+              echo "::warning::$REASON —— B 的最终判据以 windows-client 作业为准"
+            else
+              REASON="B 结论未知（status=$B_STATUS）且中继转发量=$FORWARDED，无跨网流量证据"
+            fi
+          fi
+          {
+            echo "DUAL_VERDICT_A=$VERDICT"
+            echo "DUAL_REASON_A=$REASON"
+          } >> "$GITHUB_ENV"
+          {
+            echo "### linux-app（job A）判定：$VERDICT"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| A tailnet IP | ``$A_IP`` |"
+            echo "| B tailnet IP | ``$B_IP`` |"
+            echo "| TCP 通路 | ``$PATH_DESC`` |"
+            echo "| wine 预检 exit | ``$WINEPRECHECK_RC``（诊断档，非硬判据） |"
+            echo "| B 作业状态 | ``$B_STATUS`` / ``$B_CONCLUSION`` |"
+            echo "| UDP 中继转发 | ``$FORWARDED`` 包 |"
+            echo "| 理由 | $REASON |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$VERDICT" != "PASS" ]; then
+            echo "::error::A 侧判定失败：$REASON"
+            exit 1
+          fi
+          echo "[verdict] PASS：$REASON"
+          exit 0
+
+      # ---------------------------------------------------------------
+      # 收证（无论成败/取消）：relay 统计与日志、socat 日志、两条通路
+      # 的 hello 原始字节、wine 预检全文、tailscale 状态、app 侧状态。
+      # ---------------------------------------------------------------
+      - name: A. 收集证据
+        if: always()
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -uo pipefail
+          WS="$GITHUB_WORKSPACE"
+          cd "$WS"
+          mkdir -p probe-results/logs
+          cp -f relay.log probe-results/ 2>/dev/null || true
+          cp -f socat.log probe-results/ 2>/dev/null || true
+          sudo tailscale status --json > probe-results/logs/tailscale-status-final.json 2>/dev/null || true
+          timeout 20 adb devices > probe-results/logs/adb-devices.txt 2>&1 || true
+          timeout 20 adb logcat -d -t 60 > probe-results/logs/app-logcat.txt 2>&1 || true
+          timeout 20 adb shell "cat /proc/net/tcp | awk 'NR>1 {print \$2}' | grep -i ':1FBD' || echo '(8125 未监听)'" \
+            > probe-results/logs/app-listen.txt 2>&1 || true
+          echo "[evidence] A 侧收证完成"
+          ls -la probe-results probe-results/logs | head -40
+
+      - name: A. 上传证据（dual-evidence-linux）
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v7
+        with:
+          name: dual-evidence-linux
+          path: probe-results/
+          if-no-files-found: warn
+          retention-days: 7
+
+      # 收尾：先杀后台中继（PID 文件，不用 pkill 模式串），再退网
+      # （ephemeral 节点随后由控制面自动删除，不残留长期 auth key）。
+      - name: A. 收尾（停中继 + 退网）
+        if: always()
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -uo pipefail
+          WS="$GITHUB_WORKSPACE"
+          for name in relay socat; do
+            if [ -f "$WS/probe-results/$name.pid" ]; then
+              PID=$(cat "$WS/probe-results/$name.pid")
+              kill "$PID" 2>/dev/null && echo "[cleanup] 已停 $name (pid=$PID)" || true
+            fi
+          done
+          sudo tailscale down 2>/dev/null || true
+          echo "[cleanup] A 侧收尾完成"
+          exit 0
+
+  # ==================================================================
+  # 4) windows-client（job B）：真 womic.exe + 真驱动 + 录音取证。
+  #
+  #    时序：B 只 needs build（不等 APK）→ 尽早入网 → 长轮询等 A 出现
+  #    → 装驱动（d1/d2/d3 复刻 windows-e2e，e 步 --status 硬门禁）
+  #    → hello 探活确认跨网 TCP 通路 → SYSTEM 计划任务录音（会话隔离
+  #    实证：交互会话 waveInOpen rc=1，必须 Session 0）
+  #    → womic.exe --connect --no-gui（10s 推流窗口）→ 录音判据。
+  # ==================================================================
+  windows-client:
+    name: windows-client
+    needs: build
+    runs-on: windows-latest
+    # 预算：环境+入网 ~4min；等 A 出现 deadline 45min（覆盖 A 的 APK 最慢
+    # 成功构建 + 模拟器 + 入网）；驱动最坏 ~25min（d1/d2/d3 各自超时）+
+    # 测试 ~8min。65min 硬上限。ephemeral key expiry 3600s 自入网起算，
+    # 本 job 必先于到期结束（节点已加入后 key 过期不影响在线，双保险）。
+    timeout-minutes: 65
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # checkout：womic-record-probe.py / womic-hello-probe.py 从仓库取
+      - uses: actions/checkout@v7
+
+      - name: 下载构建产物
+        uses: actions/download-artifact@v8
+        with:
+          name: womic-dual-build
+          path: dist
+
+      # ---------------------------------------------------------------
+      # 0. 环境自检 + 收证目录 + MOTW 解锁（artifact 下载的文件带
+      #    Zone.Identifier，SmartScreen 会拦会话 0 里的静默执行）。
+      #    成功路径显式 exit 0（pwsh 会把末尾残留 $LASTEXITCODE 传播为
+      #    进程退出码——windows-e2e Round 2 实测踩坑）。
+      # ---------------------------------------------------------------
+      - name: 0. 环境自检（python / 系统信息 / 解锁产物）
+        timeout-minutes: 5
+        run: |
+          New-Item -ItemType Directory -Force -Path probe-results/logs | Out-Null
+          Get-ChildItem .\dist -Recurse -File | ForEach-Object {
+            Unblock-File $_.FullName -ErrorAction SilentlyContinue
+          }
+          python --version
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::0: python 不可用"
+            exit 1
+          }
+          "OS: $([System.Environment]::OSVersion.VersionString)" |
+            Tee-Object probe-results/logs/0-env.txt
+          exit 0
+
+      # ---------------------------------------------------------------
+      # B. Tailscale 安装 + 入网 + 媒体面防火墙。
+      #    安装范式同 tailnet-debug action（winget → 静默安装包兜底）；
+      #    入网参数同款（OAuth → ephemeral key tags=[tag:ci] expiry 3600
+      #    → up --accept-dns=false → 轮询 IP 60s）。
+      #    防火墙只放行入站 UDP 8126 于 tailscale 适配器（womic.exe 的
+      #    媒体口；主防线仍是 tailnet ACL）。TCP 8125 是 B 出站，不需入站规则。
+      # ---------------------------------------------------------------
+      - name: B. Tailscale 入网（windows-client）+ UDP 8126 入站放行
+        timeout-minutes: 10
+        env:
+          TS_OAUTH_CLIENT_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+            winget install --id tailscale.tailscale --accept-source-agreements --accept-package-agreements
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $ts)) {
+              Write-Host "::warning::winget 未成功（exit=$LASTEXITCODE），转静默安装包"
+              $exe = "$env:RUNNER_TEMP\tailscale-setup-latest.exe"
+              Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' `
+                -OutFile $exe -ErrorAction Stop
+              Start-Process -FilePath $exe -ArgumentList '/S' -Wait
+            }
+          }
+          if (-not (Test-Path $ts)) {
+            Write-Host "::error::tailscale.exe 未就位: $ts"
+            exit 1
+          }
+          & $ts version | Tee-Object probe-results/logs/tailscale-version.txt
+          if ([string]::IsNullOrWhiteSpace($env:TS_OAUTH_CLIENT_ID) -or `
+              [string]::IsNullOrWhiteSpace($env:TS_OAUTH_SECRET)) {
+            Write-Host "::error::OAuth 凭据为空（secrets.TS_OAUTH_CLIENT_ID / TS_OAUTH_SECRET）"
+            exit 1
+          }
+          $tok = (Invoke-RestMethod -Method Post -Uri 'https://api.tailscale.com/api/v2/oauth/token' `
+            -Body @{ client_id = $env:TS_OAUTH_CLIENT_ID; client_secret = $env:TS_OAUTH_SECRET }).access_token
+          if ([string]::IsNullOrWhiteSpace($tok)) {
+            Write-Host "::error::access_token 为空"; exit 1
+          }
+          $hostname = "womic-dual-win-$env:GITHUB_RUN_ID"
+          $kb = @{
+            capabilities = @{ devices = @{ create = @{ reusable = $false; ephemeral = $true; tags = @('tag:ci') } } }
+            expirySeconds = 3600
+            description = $hostname
+          } | ConvertTo-Json -Depth 8
+          $key = (Invoke-RestMethod -Method Post -Uri 'https://api.tailscale.com/api/v2/tailnet/-/keys' `
+            -Headers @{ Authorization = "Bearer $tok" } -ContentType 'application/json' -Body $kb).key
+          if ([string]::IsNullOrWhiteSpace($key)) {
+            Write-Host "::error::auth key 为空"; exit 1
+          }
+          & $ts up --authkey=$key --hostname=$hostname --accept-dns=false
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::tailscale up 失败（exit=$LASTEXITCODE）"
+            & $ts status
+            exit 1
+          }
+          $ip = ''
+          for ($i = 0; $i -lt 30 -and [string]::IsNullOrWhiteSpace($ip); $i++) {
+            Start-Sleep -Seconds 2
+            $cand = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if ($cand) { $ip = "$cand".Trim() }
+          }
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            Write-Host "::error::60s 内未取得 tailnet IPv4"
+            & $ts status
+            exit 1
+          }
+          Write-Host "windows-client 已入网：hostname=$hostname ip=$ip"
+          # 入站 UDP 8126（中继 → womic.exe 媒体口）：优先只放行 tailscale 适配器
+          $ruleName = 'womic-dual media udp'
+          Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule | Out-Null
+          $tsAlias = (Get-NetAdapter | Where-Object { $_.InterfaceDescription -like '*Tailscale*' } |
+            Select-Object -First 1).Name
+          if ($tsAlias) {
+            New-NetFirewallRule -Name $ruleName -DisplayName 'womic-dual media udp' `
+              -InterfaceAlias $tsAlias -Direction Inbound -Protocol UDP `
+              -LocalPort $env:MEDIA_PORT -Action Allow | Out-Null
+            Write-Host "防火墙已限定到 tailscale 适配器: $tsAlias（UDP $env:MEDIA_PORT 入站）"
+          } else {
+            Write-Host "::warning::未找到 tailscale 适配器，回退放行所有接口 UDP $env:MEDIA_PORT"
+            New-NetFirewallRule -Name $ruleName -DisplayName 'womic-dual media udp' `
+              -Direction Inbound -Protocol UDP -LocalPort $env:MEDIA_PORT -Action Allow | Out-Null
+          }
+          & $ts status | Tee-Object probe-results/logs/tailscale-status.txt
+          "B_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          exit 0
+
+      # ---------------------------------------------------------------
+      # B. 发现 A（linux-app）。A 要等 APK 构建（build-apk timeout 30min）
+      #    + 模拟器启动 + 入网，最慢成功路径 ~run+48min → 这里长轮询
+      #    （270×10s=45min deadline，与 A 的最慢成功出现时间对齐；
+      #    再慢就意味着 build-apk 已超时失败，B 带着明确报错失败即可）。
+      #    发现即写 A_IP 供后续步骤用；超时带 tailscale status 失败。
+      # ---------------------------------------------------------------
+      - name: B. 发现 linux-app 的 tailnet IP（长轮询）
+        timeout-minutes: 50
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $A_IP = ''
+          $deadline = (Get-Date).AddMinutes(45)
+          while ((Get-Date) -lt $deadline -and [string]::IsNullOrWhiteSpace($A_IP)) {
+            Start-Sleep -Seconds 10
+            try {
+              $st = & $ts status --json 2>$null | ConvertFrom-Json
+              if ($st -and $st.Peer) {
+                foreach ($p in $st.Peer.PSObject.Properties) {
+                  if ("$($p.Value.HostName)" -like 'womic-dual-linux-*') {
+                    $A_IP = "$($p.Value.TailscaleIPs[0])"
+                    Write-Host "发现 linux-app 节点：$($p.Value.HostName) → $A_IP"
+                  }
+                }
+              }
+            } catch {
+              Write-Host "::warning::解析 tailscale status 失败：$_"
+            }
+            if ([string]::IsNullOrWhiteSpace($A_IP)) {
+              $left = [int]($deadline - (Get-Date)).TotalMinutes
+              Write-Host "wait: 尚未发现 linux-app（剩余约 $left 分钟）"
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($A_IP)) {
+            Write-Host "::error::45 分钟内未发现 linux-app 节点（A 侧构建/入网是否失败？）"
+            & $ts status
+            exit 1
+          }
+          "A_IP=$A_IP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          exit 0
+
+      # ---------------------------------------------------------------
+      # C. 驱动安装。完整复刻 windows-e2e.yml 的 d1→d2→d3 链：
+      #   d1 安装器 /install（continue-on-error：UAC/非交互下"似乎成功"
+      #      可能没装上，退出码 0 不算数，一律以 d2 系统状态为准）；
+      #   d2 系统状态（SYS 落盘 + 注册表 InfPath），不判失败只写状态；
+      #   d3 pnputil /add-driver 兜底（仅 d2 未过时）：先把 INF+CAT 登进
+      #      DriverStore，再重试客户端安装；最终仍以系统状态硬门禁。
+      # 本 workflow 不改 windows-e2e.yml——这里是同款判据的复用。
+      # ---------------------------------------------------------------
+      - name: C1. 驱动安装器自助安装驱动（记录 UAC/非交互行为）
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          $inst = '.\dist\womic-drvinst.exe'
+          $log = 'probe-results/logs/c1-install-client.txt'
+          if (-not (Test-Path $inst)) {
+            Write-Host "::error::C1: 找不到 $inst（构建产物缺失）"
+            Get-ChildItem .\dist -Force | Select-Object Name, Length | Out-String | Write-Host
+            exit 1
+          }
+          & cmd /c "$inst /status > probe-results/logs/c1-status-pre.txt 2>&1"
+          "pre_status_exit=$LASTEXITCODE" | Out-File probe-results/logs/c1-status-pre.txt -Append
+          Get-Content probe-results/logs/c1-status-pre.txt -ErrorAction SilentlyContinue | Write-Host
+          & cmd /c "$inst /install > $log 2>&1"
+          $rc = $LASTEXITCODE
+          Get-Content $log -ErrorAction SilentlyContinue | Write-Host
+          "installer_exit=$rc" | Out-File $log -Append
+          if ($rc -eq 0) {
+            Write-Host "C1: 安装器退出码 0（是否真装上以 C2 系统状态为准）"
+          } else {
+            Write-Host "::warning::C1: 安装器退出码 $rc —— 记录在案，由 C2/C3 兜底"
+          }
+          exit 0
+
+      - name: C2. 验证驱动系统状态（SYS 落盘 + 注册表 InfPath）
+        timeout-minutes: 5
+        run: |
+          $sysOnDisk = Test-Path "$env:SystemRoot\System32\drivers\womic.sys"
+          $infPath = ""
+          $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e96c-e325-11ce-bfc1-08002be10318}'
+          Get-ChildItem $classKey -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+            if ($p -and $p.MatchingDeviceId -match 'WOMic' -and $p.InfPath) {
+              $infPath = $p.InfPath
+            }
+          }
+          $state = if ($sysOnDisk -and $infPath) { 'ok' } else { 'bad' }
+          "sys_on_disk=$sysOnDisk inf_path=$infPath state=$state" |
+            Tee-Object probe-results/logs/c2-system-state.txt
+          "install_state=$state" | Out-File -FilePath $env:GITHUB_ENV -Append
+          if ($state -eq 'ok') {
+            Write-Host "C2: 驱动已就位（SYS 落盘 + InfPath=$infPath）"
+          } else {
+            Write-Host "::warning::C2: 系统状态不完整（SYS=$sysOnDisk, InfPath='$infPath'），转 C3 兜底"
+          }
+          exit 0
+
+      - name: C3. pnputil 兜底安装（仅 C2 未通过时）
+        if: env.install_state != 'ok'
+        timeout-minutes: 10
+        run: |
+          Write-Host "C3: 走兜底路径（pnputil /add-driver + 重试客户端安装）"
+          pnputil /add-driver "$env:GITHUB_WORKSPACE\dist\womic-driver\womic.inf" /install 2>&1 |
+            Tee-Object -FilePath probe-results/logs/c3-pnputil.txt
+          & cmd /c ".\dist\womic.exe --install-driver > probe-results/logs/c3-install-retry.txt 2>&1"
+          $rc = $LASTEXITCODE
+          Get-Content probe-results/logs/c3-install-retry.txt -ErrorAction SilentlyContinue | Write-Host
+          "retry_exit=$rc" | Out-File probe-results/logs/c3-install-retry.txt -Append
+          $sysOnDisk = Test-Path "$env:SystemRoot\System32\drivers\womic.sys"
+          $infPath = ""
+          $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e96c-e325-11ce-bfc1-08002be10318}'
+          Get-ChildItem $classKey -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+            if ($p -and $p.MatchingDeviceId -match 'WOMic' -and $p.InfPath) { $infPath = $p.InfPath }
+          }
+          if (-not $sysOnDisk -or -not $infPath) {
+            Write-Host "::error::C3: 兜底后驱动仍未就位（SYS=$sysOnDisk, InfPath='$infPath'）"
+            exit 1
+          }
+          Write-Host "C3: 兜底安装成功（InfPath=$infPath）"
+          exit 0
+
+      - name: D. 安装后 --status 退出码 0 + 驱动就绪（硬门禁）
+        timeout-minutes: 5
+        run: |
+          $exe = '.\dist\womic.exe'
+          $log = 'probe-results/logs/d-status-postinstall.txt'
+          if (-not (Test-Path $exe)) {
+            Write-Host "::error::D: 找不到 $exe"
+            exit 1
+          }
+          & cmd /c "$exe --status > $log 2>&1"
+          $rc = $LASTEXITCODE
+          $txt = if (Test-Path $log) { Get-Content $log -Raw -Encoding utf8 } else { '' }
+          Get-Content $log -ErrorAction SilentlyContinue | Write-Host
+          if ($rc -ne 0) {
+            Write-Host "::error::D: 安装后 --status 退出码 $rc ≠ 0"
+            exit 1
+          }
+          if ($txt -notmatch '已就绪') {
+            Write-Host "::error::D: --status 未报告驱动已就绪"
+            exit 1
+          }
+          if ($txt -match 'INF 路径\s*:\s*\(无\)') {
+            Write-Host "::error::D: --status 的 INF 路径为空"
+            exit 1
+          }
+          Write-Host "D: 驱动已就绪，INF 路径非空（退出码 0）"
+          exit 0
+
+      # ---------------------------------------------------------------
+      # E. 跨网就绪探活：hello 探针连 A_IP:8125（外层 tailnet → socat →
+      #    slirp → app）。整条 TCP 通路就绪的二元判据；不过即失败，
+      #    避免把"通路没就绪"误判成客户端缺陷。预算 180s 覆盖 A 侧
+      #    socat 刚起来的窗口（A 入网 → socat 就绪约 1-2min）。
+      # ---------------------------------------------------------------
+      - name: E. 跨网 TCP 通路就绪探活（hello）
+        timeout-minutes: 5
+        run: |
+          python "$env:GITHUB_WORKSPACE\.github\scripts\womic-hello-probe.py" `
+            --host $env:A_IP --port $env:CONTROL_PORT `
+            --timeout 180 --interval 5 --io-timeout 3 `
+            2>&1 | Tee-Object -FilePath probe-results/logs/e-hello-readiness.txt
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::E: 跨网 TCP 通路未就绪（$env:A_IP`:$env:CONTROL_PORT hello 失败）"
+            exit 1
+          }
+          Write-Host "E: 跨网 TCP 通路就绪（hello 收到 102 应答）"
+          exit 0
+
+      # ---------------------------------------------------------------
+      # F. 录音取证（只录不喂，灌音由真 womic.exe 负责——避免把探针的
+      #    1kHz 测试音和 app 的 440Hz 调试音混成一锅）。
+      #    为什么必须 SYSTEM 计划任务：waveIn 会话隔离实证（run
+      #    39901322823：交互会话 waveInOpen rc=1；SYSTEM/Session 0 从未
+      #    复现，见 womic-recovery/diagnostics/diagnosis.md §8.1/§9.2）。
+      #    范式完整复刻 windows-e2e f 步：bat（chcp 65001 +
+      #    PYTHONIOENCODING=utf-8 防 cp1252 UnicodeEncodeError 崩）+
+      #    UTF-16 XML + marker 轮询 + try/finally 删任务。
+      #    判据（womic-record-probe.py）：WO Mic 设备存在 + 录音成功 +
+      #    RMS>500 + 主峰 440Hz±15% + snr>3 → RESULT=PASS。
+      # ---------------------------------------------------------------
+      - name: F. 启动 SYSTEM 录音计划任务（440Hz 取证，30s）
+        timeout-minutes: 5
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          $py = (Get-Command python).Source
+          if (-not $py) {
+            Write-Host "::error::F: 解析 python 绝对路径失败"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path "$ws\probe-results\logs" | Out-Null
+          $bat = "$ws\probe-results\run_f.cmd"
+          $marker = "$ws\probe-results\rec_exit.txt"
+          if (Test-Path $marker) { Remove-Item $marker -Force }
+          # 不用 here-string（结束标记顶行首会截断 YAML 块标量）；
+          # 不用 @(...) 逗号后 + 拼接（会被解析成数组元素）——统一插值 + 反引号转义。
+          $batLines = @(
+            '@echo off',
+            'chcp 65001 >nul 2>&1',
+            'set PYTHONIOENCODING=utf-8',
+            "cd /d `"$ws`"",
+            "`"$py`" .github\scripts\womic-record-probe.py --seconds 30 --out `"$ws\probe-results\record`" > `"$ws\probe-results\logs\f-record-probe.txt`" 2>&1",
+            "echo PROBE_EXIT=%ERRORLEVEL% > `"$marker`""
+          )
+          $batLines | Set-Content -Path $bat -Encoding ascii
+          $xmlPath = "$ws\probe-results\WomicDualRec.xml"
+          $xmlLines = @(
+            '<?xml version="1.0" encoding="UTF-16"?>',
+            '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
+            '  <RegistrationInfo>',
+            '    <Description>WO Mic dual 录音取证（SYSTEM/Session 0，脱离交互会话）</Description>',
+            '    <URI>\WomicDualRec</URI>',
+            '  </RegistrationInfo>',
+            '  <Triggers>',
+            '    <BootTrigger><Enabled>false</Enabled></BootTrigger>',
+            '  </Triggers>',
+            '  <Principals>',
+            '    <Principal id="Author">',
+            '      <UserId>S-1-5-18</UserId>',
+            '      <RunLevel>HighestAvailable</RunLevel>',
+            '    </Principal>',
+            '  </Principals>',
+            '  <Settings>',
+            '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>',
+            '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>',
+            '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>',
+            '    <AllowHardTerminate>true</AllowHardTerminate>',
+            '    <StartWhenAvailable>true</StartWhenAvailable>',
+            '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>',
+            '    <IdleSettings>',
+            '      <StopOnIdleEnd>false</StopOnIdleEnd>',
+            '      <RestartOnIdle>false</RestartOnIdle>',
+            '    </IdleSettings>',
+            '    <AllowStartOnDemand>true</AllowStartOnDemand>',
+            '    <Enabled>true</Enabled>',
+            '    <Hidden>false</Hidden>',
+            '    <RunOnlyIfIdle>false</RunOnlyIfIdle>',
+            '    <WakeToRun>false</WakeToRun>',
+            '    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>',
+            '    <Priority>4</Priority>',
+            '  </Settings>',
+            '  <Actions Context="Author">',
+            '    <Exec>',
+            '      <Command>cmd.exe</Command>',
+            "      <Arguments>/c `"$bat`"</Arguments>",
+            "      <WorkingDirectory>$ws</WorkingDirectory>",
+            '    </Exec>',
+            '  </Actions>',
+            '</Task>'
+          )
+          [IO.File]::WriteAllText($xmlPath, ($xmlLines -join "`r`n"), [Text.Encoding]::Unicode)
+          # $ran=false 时不删（创建/触发失败要清掉定义，别留孤儿任务）；
+          # 成功触发后定义留给 H 步轮询完 marker 再删（windows-e2e f 步同款次序）
+          $ran = $false
+          try {
+            & schtasks /create /tn WomicDualRec /xml $xmlPath /f 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::F: 创建计划任务 WomicDualRec 失败"
+              exit 1
+            }
+            & schtasks /run /tn WomicDualRec 2>&1 | Out-String | Write-Host
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::F: 触发计划任务 WomicDualRec 失败"
+              exit 1
+            }
+            $ran = $true
+            Write-Host "F: 录音任务已触发（30s 窗口），等 G 步启动 womic.exe"
+          } finally {
+            if (-not $ran) {
+              & schtasks /delete /tn WomicDualRec /f 2>&1 | Out-Null
+            }
+          }
+          exit 0
+
+      # ---------------------------------------------------------------
+      # G. 启动真 womic.exe（跨网）：连 A 的 tailnet IP:8125，固定媒体
+      #    端口 8126（--media-port 上线于 8f0a165，本联调的前置条件）。
+      #    --connect --no-gui：连上跑 10s（100×Sleep(100)，2s 未进推流
+      #    即失败），打印 OK 行后退出。
+      #    调用方式：cmd /c 包装——womic.exe 是 -mwindows GUI 子系统，
+      #    pwsh & 直调在真机 runner 上不可靠（Round 1 实证：步骤 0.4s
+      #    结束、输出为空、退出码为空；cmd.exe 控制台子系统作中间层才稳）。
+      #    时序：F 步录音已先跑 5s（预滚静音），本步推流 ~10s 落在录音
+      #    窗口中后段，录音还有 ~15s 余量，440Hz 调试音必然被采到。
+      # ---------------------------------------------------------------
+      - name: G. 启动真 womic.exe（跨网 + 固定媒体端口 8126）
+        timeout-minutes: 5
+        run: |
+          $exe = '.\dist\womic.exe'
+          $log = 'probe-results/logs/g-womic-run.txt'
+          if (-not (Test-Path $exe)) {
+            Write-Host "::error::G: 找不到 $exe"
+            Get-ChildItem .\dist -Force | Select-Object Name, Length | Out-String | Write-Host
+            exit 1
+          }
+          Start-Sleep -Seconds 5
+          & cmd /c "$exe --host $env:A_IP --port $env:CONTROL_PORT --media-port $env:MEDIA_PORT --connect --no-gui > $log 2>&1"
+          $rc = $LASTEXITCODE
+          $txt = if (Test-Path $log) { Get-Content $log -Raw -Encoding utf8 } else { '' }
+          Get-Content $log -ErrorAction SilentlyContinue | Write-Host
+          "womic_exit=$rc" | Out-File probe-results/logs/g-womic-run.txt -Append
+          # OK 行契约（client/src/cli.c 无窗口冒烟模式）：
+          #   OK  帧=N 字节=M 注入=K 电平=x dB=y 解码=Opus 设备=就绪|未就绪 媒体端口=P(固定|随机)
+          $m = [regex]::Match($txt, 'OK\s+帧=(\d+)\s+字节=(\d+)\s+注入=(\d+).*?设备=(\S+)\s+媒体端口=(\d+)\((固定|随机)\)')
+          if ($rc -ne 0 -or -not $m.Success) {
+            Write-Host "::error::G: womic.exe 退出码=$rc 且未解析到 OK 行（跨网链路失败？）"
+            exit 1
+          }
+          $frames = [int]$m.Groups[1].Value
+          $bytes = [int]$m.Groups[2].Value
+          $injected = [int]$m.Groups[3].Value
+          $device = $m.Groups[4].Value
+          $mport = [int]$m.Groups[5].Value
+          $mode = $m.Groups[6].Value
+          Write-Host "G: 帧=$frames 字节=$bytes 注入=$injected 设备=$device 媒体端口=$mport($mode)"
+          if ($frames -le 0 -or $bytes -le 0) {
+            Write-Host "::error::G: 帧/字节为 0——没收到 UDP 媒体流"
+            exit 1
+          }
+          if ($mport -ne [int]$env:MEDIA_PORT -or $mode -ne '固定') {
+            Write-Host "::error::G: 媒体端口 $mport($mode) ≠ 期望 $env:MEDIA_PORT(固定)"
+            exit 1
+          }
+          if ($device -ne '就绪') {
+            Write-Host "::error::G: OK 行报告设备未就绪（驱动运行时异常）"
+            exit 1
+          }
+          if ($injected -le 0) {
+            Write-Host "::error::G: 注入字节为 0——解码音没灌进驱动"
+            exit 1
+          }
+          {
+            "womic_frames=$frames"
+            "womic_bytes=$bytes"
+            "womic_injected=$injected"
+            "womic_device=$device"
+            "womic_mport=$mport($mode)"
+          } | Out-File -FilePath $env:GITHUB_ENV -Append
+          exit 0
+
+      # ---------------------------------------------------------------
+      # H. 等录音 marker + 读录音判据。F 步的 30s 录音此刻应已收尾；
+      #    marker 由 bat 末尾写（PROBE_EXIT=N），最多轮 4 分钟。
+      #    判据同 windows-e2e f 步：probe_exit=0 且日志含 RESULT=PASS。
+      # ---------------------------------------------------------------
+      - name: H. 读取录音取证判据（waveIn 440Hz）
+        timeout-minutes: 6
+        run: |
+          $ws = $env:GITHUB_WORKSPACE
+          $marker = "$ws\probe-results\rec_exit.txt"
+          try {
+            $deadline = (Get-Date).AddMinutes(4)
+            while (-not (Test-Path $marker) -and (Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 3
+            }
+            if (-not (Test-Path $marker)) {
+              Write-Host "::error::H: 录音探针 4 分钟超时（marker 未出现）"
+              & schtasks /query /tn WomicDualRec /fo LIST /v 2>&1 | Out-String | Write-Host
+              exit 1
+            }
+            $m = [regex]::Match((Get-Content $marker -Raw), 'PROBE_EXIT=(\d+)')
+            $probeExit = if ($m.Success) { [int]$m.Groups[1].Value } else { -1 }
+            $log = "$ws\probe-results\logs\f-record-probe.txt"
+            $txt = if (Test-Path $log) { Get-Content $log -Raw -Encoding utf8 } else { '' }
+            Get-Content $log -ErrorAction SilentlyContinue | Write-Host
+            if ($probeExit -eq 0 -and $txt -match 'RESULT=PASS') {
+              Write-Host "H: 录音取证 PASS（waveIn 录到 440Hz 调试音，设备/句柄/RMS/主峰/SNR 全过）"
+              "record_result=PASS" | Out-File -FilePath $env:GITHUB_ENV -Append
+            } else {
+              Write-Host "::error::H: 录音取证未 PASS（probe_exit=$probeExit）——见 f-record-probe.txt 与 record/summary.json"
+              "record_result=FAIL" | Out-File -FilePath $env:GITHUB_ENV -Append
+              exit 1
+            }
+          } finally {
+            # 失败路径也删：避免残留任务定义（成功路径此刻探针已跑完，删除安全）
+            & schtasks /delete /tn WomicDualRec /f 2>&1 | Out-Null
+          }
+          exit 0
+
+      # ---------------------------------------------------------------
+      # I. 汇总判定（B 侧）——双证据链互为独立：
+      #   womic.exe 的 OK 行（协议面：握手/推流/解码/灌驱动/端口固定）
+      #   + 录音探针 RESULT=PASS（音频面：440Hz 真的出了声）。
+      #   任缺一则失败。写 Step Summary 供汇报直接引用。
+      # ---------------------------------------------------------------
+      - name: I. 汇总判定（双证据链）
+        timeout-minutes: 3
+        run: |
+          # G/H 步通过才会到这里（它们失败即作业失败），env 必然已写；
+          # 仍用 TryParse 防御空值/异常值，不让判定步自己崩。
+          $frames = 0; $injected = 0
+          [void][int]::TryParse("$env:womic_frames", [ref]$frames)
+          [void][int]::TryParse("$env:womic_injected", [ref]$injected)
+          $ok = ($env:record_result -eq 'PASS') -and ($frames -gt 0) -and ($injected -gt 0)
+          $sumPath = "$env:GITHUB_WORKSPACE\probe-results\record\summary.json"
+          $rms = ''; $peak = ''; $snr = ''
+          if (Test-Path $sumPath) {
+            try {
+              $s = Get-Content $sumPath -Raw -Encoding utf8 | ConvertFrom-Json
+              $rms = "$($s.detail.analysis.rms)"
+              $peak = "$($s.detail.analysis.peak_freq)Hz"
+              $snr = "$($s.detail.analysis.snr)"
+            } catch { }
+          }
+          @(
+            "### windows-client（job B）判定：$(if ($ok) { 'PASS' } else { 'FAIL' })",
+            "",
+            "| 项 | 值 |",
+            "|---|---|",
+            "| A tailnet IP | ``$env:A_IP`` |",
+            "| B tailnet IP | ``$env:B_IP`` |",
+            "| womic OK 行 | 帧=$env:womic_frames 字节=$env:womic_bytes 注入=$env:womic_injected 设备=$env:womic_device 端口=$env:womic_mport |",
+            "| 录音判据 | RESULT=$env:record_result |",
+            "| 录音 RMS / 主峰 / SNR | $rms / $peak / $snr |",
+            "",
+            "音频原始文件：artifact ``dual-evidence-windows`` → probe-results/record/capture.wav"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          if (-not $ok) {
+            Write-Host "::error::I: 双证据链不完整（record=$env:record_result frames=$env:womic_frames injected=$env:womic_injected）"
+            exit 1
+          }
+          Write-Host "I: PASS —— 真 womic.exe ↔ 真 app 跨网全链路 + 440Hz 音频取证"
+          exit 0
+
+      - name: 上传证据（dual-evidence-windows）
+        if: always()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v7
+        with:
+          name: dual-evidence-windows
+          path: probe-results/
+          if-no-files-found: warn
+          retention-days: 7
+
+      # 收尾：退网（ephemeral 节点由控制面自动删除，不残留长期 auth key）
+      - name: 收尾（退网）
+        if: always()
+        timeout-minutes: 3
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (Test-Path $ts) {
+            & $ts down 2>&1 | Out-Null
+            Write-Host "windows-client 已退网（ephemeral 节点由控制面清理）"
+          }
+          exit 0
