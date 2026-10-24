@@ -14,6 +14,13 @@
 另覆盖：/proc/net/udp(6) 解析（大小写不敏感 / udp6 / 老内核分列 / rx_queue）、
 ps 噪声过滤（D 项）、C05 restart 自救（C 项）、restart 清死亡状态。
 
+E 项（C05 真正根因回归，2026-10-24）：`adb shell` 在设备端分配 PTY，ONLCR
+把输出中每个 0x0A 改写成 0D 0A——Opus 二进制帧被毁，160 字节帧不含 0x0A
+的概率仅 (255/256)^160 ≈ 53%，C05 因此约一半概率红（历史上所有"C05 抖动"
+的根因，与 app 代码无关）。修复是 tap 改走 `adb exec-out`（无 PTY）。本文件
+用三层断言钉死"不许回退到 shell"：Popen argv 静态断言、按 argv 决定是否开
+ONLCR 的端到端假通道（旧实现红/新实现绿）、parser 级 ONLCR 特征化。
+
 运行：
     python3 test_pc_client.py            # 或 python3 -m unittest -v
 """
@@ -134,6 +141,21 @@ class FakePopen:
         self.stdout.stop.set()
 
 
+class FakeProc:
+    """mock subprocess 完成对象（`Adb.run/shell` 返回值的形态）。
+
+    `_probe_udp_listen` 用 `adb.shell()`（而非 shell_text）读
+    /proc/net/udp(6)——需要退出码与 stderr 定位"读不到"的原因，
+    因此 mock 必须返回 proc 形态（returncode/stdout/stderr），
+    不能返回 None。
+    """
+
+    def __init__(self, returncode=0, stdout=b"", stderr=b""):
+        self.returncode = returncode
+        self.stdout = stdout if isinstance(stdout, bytes) else stdout.encode("utf-8")
+        self.stderr = stderr if isinstance(stderr, bytes) else stderr.encode("utf-8")
+
+
 class MockAdb:
     """mock Adb：记录 shell 命令，按 provider 返回 /proc/net/udp 内容。
 
@@ -152,7 +174,13 @@ class MockAdb:
     def shell(self, command, timeout=120, check=True):
         self.shell_calls.append(command)
         self.events.append("shell:" + command)
-        return None
+        # _probe_udp_listen 走 shell() 读 /proc/net/udp(6)：按 udp_provider
+        # 供给内容（rc=0 + 非空 stdout = 读到了内容）；其余命令（pkill 等）
+        # 一律"执行成功、无输出"。
+        if "/proc/net/udp" in command and self.udp_provider is not None:
+            text = self.udp_provider(command, len(self.shell_calls))
+            return FakeProc(returncode=0, stdout=text, stderr=b"")
+        return FakeProc(returncode=0, stdout=b"", stderr=b"")
 
     def shell_text(self, command, timeout=120, check=True):
         self.shell_calls.append(command)
@@ -172,6 +200,9 @@ def mock_popen_sequence(procs):
 
     def fake_popen(*args, **kwargs):
         proc = next(it)
+        # 记录本次 Popen 的完整 argv（E 项回归：tap 必须走 exec-out 而非 shell）
+        argv = args[0] if args else kwargs.get("args")
+        proc.popen_argv = list(argv) if argv else []
         created.append(proc)
         return proc
 
@@ -515,6 +546,147 @@ class FmtExitCodeTest(unittest.TestCase):
         self.assertEqual(pc_client.fmt_exit_code(None), "未知")
         self.assertEqual(pc_client.fmt_exit_code(1), "1")
         self.assertIn("信号 15", pc_client.fmt_exit_code(-15))
+
+
+# ---------------------------------------------------------------------------
+# E 项：exec-out 通道回归（C05 真正根因：adb shell 的 PTY/ONLCR 毁二进制帧）
+# ---------------------------------------------------------------------------
+
+class OnlcrAwareStdout(FakeStdout):
+    """按通道类型模拟 ONLCR 的 mock stdout（E 项）。
+
+    pty=True 模拟 `adb shell` 的设备侧 PTY：读出的每个 0x0A 被改写成
+    0x0D 0x0A（毁帧，字节数增加、内容错位）；pty=False 模拟 `adb exec-out`：
+    字节原样回传。
+    """
+
+    def __init__(self, script=None, pty=False, block_after=False):
+        super().__init__(script=script, block_after=block_after)
+        self.pty = pty
+
+    def read(self, n=-1):
+        chunk = super().read(n)
+        if chunk and self.pty:
+            chunk = chunk.replace(b"\x0a", b"\x0d\x0a")
+        return chunk
+
+
+@contextlib.contextmanager
+def mock_popen_channel(factory):
+    """把 Popen 换成按 argv 决定通道行为的假实现（E 项）。
+
+    factory(argv) 返回 proc。用来把"旧实现走 shell（PTY/ONLCR 毁帧）/
+    新实现走 exec-out（字节原样）"的差异直接编进测试：
+    `_start_process()` 一旦回退到 shell，factory 就会给 stdout 开 ONLCR，
+    端到端断言随之转红。
+    """
+    created = []
+
+    def fake_popen(*args, **kwargs):
+        argv = args[0] if args else kwargs.get("args")
+        proc = factory(list(argv) if argv else [])
+        created.append(proc)
+        return proc
+
+    orig = pc_client.subprocess.Popen
+    pc_client.subprocess.Popen = fake_popen
+    try:
+        yield created
+    finally:
+        pc_client.subprocess.Popen = orig
+
+
+class ExecOutChannelTest(unittest.TestCase):
+    """E 项：tap 必须走 exec-out；ONLCR 通道毁帧、原样通道字节级还原。"""
+
+    def test_tap_starts_with_exec_out_not_shell(self):
+        """tap 启动必须用 `adb exec-out`（官方二进制通道，无 PTY）。
+
+        shell 会在设备端分配 PTY，ONLCR 把每个 0x0A 改写成 0D 0A——Opus
+        帧被毁，C05 约一半概率红（根因见 AdbUdpTap 文档字符串）。这里对
+        Popen 的 argv 做断言：实现回退到 shell 本用例即红。
+        """
+        adb = MockAdb(udp_provider=lambda cmd, n: UDP_HAS_LINE)
+        tap = make_tap(adb, [FakePopen("alive", stdout=FakeStdout(block_after=True))])
+        try:
+            argv = getattr(tap.proc, "popen_argv", [])
+            self.assertEqual(argv[1], "exec-out",
+                             "tap 必须走 exec-out，实得 argv=%s" % argv)
+            self.assertNotIn("shell", argv,
+                             "nc 二进制回传绝不走 shell（PTY/ONLCR 毁帧）")
+            self.assertEqual(argv[-1], "toybox nc -u -l -p %d" % PORT)
+            # 文本命令（/proc/net/udp 探测）仍走 shell：不受 ONLCR 致命影响，
+            # 且不扩大验证面——防止"修复"被过度执行成全部改 exec-out
+            self.assertTrue(any(c.startswith("cat /proc/net/udp")
+                                for c in adb.shell_calls))
+        finally:
+            release_tap(tap)
+
+    def test_pty_channel_destroys_frame_exec_out_survives(self):
+        """端到端 ONLCR 场景（旧实现红/新实现绿的判据）。
+
+        假通道按 argv 决定是否开 ONLCR：含 "shell" → PTY 毁帧（旧实现），
+        含 "exec-out" → 字节原样（新实现）。喂入一个含 0x0A 的合法格式 C
+        帧，read_packet 必须字节级还原。`_start_process()` 若回退到
+        shell，ONLCR 会把帧毁掉，assertEqual 转红。
+        """
+        payload = b"\x10\x0A\x20\x0D\x30\x0A\x40"  # 含两个 0x0A
+        frame = pc_client.build_format_c(0x002A, 0x01020304, payload, volume=5)
+        self.assertIn(b"\x0a", frame)  # 前提：帧里确有 0x0A
+
+        def factory(argv):
+            # 旧实现：adb shell → 设备侧 PTY 开 ONLCR；新实现：exec-out → 原样
+            return FakePopen("alive", stdout=OnlcrAwareStdout(
+                script=[frame], pty=("shell" in argv), block_after=True))
+
+        adb = MockAdb(udp_provider=lambda cmd, n: UDP_HAS_LINE)
+        with mock_popen_channel(factory):
+            tap = pc_client.AdbUdpTap(adb, PORT, bind_timeout=2.0,
+                                      bind_poll_interval=0.02)
+        try:
+            pkt = tap.read_packet(timeout=1.0)
+            self.assertIsNotNone(pkt, "exec-out 通道下必须能收到帧")
+            self.assertEqual(pkt, frame,
+                             "exec-out 通道必须字节级还原（ONLCR 会毁帧）")
+            hdr = pc_client.parse_format_c(pkt)
+            self.assertEqual(hdr["payload"], payload)
+        finally:
+            release_tap(tap)
+
+    def test_parser_on_onlcr_channel_fails_on_raw_channel_succeeds(self):
+        """机制证明：ONLCR 假通道毁帧（内容级 + 结构级），原样通道还原。
+
+        内容级：0x0A 落在 payload——帧被改写/截断，还原结果必不等于原帧；
+        结构级：0x0A 落在长度前缀低位（len=266=0x010A）——ONLCR 把 len 读成
+        0x010D，total 凭空变大，parser 永远等不齐字节 → pop() 返回 None。
+        """
+        # (a) 内容级：0x0A 落在 payload
+        payload = bytes(range(1, 41))  # 含 0x0A
+        frame = pc_client.build_format_c(0x1234, 0xDEADBEEF, payload, volume=5)
+        parser = pc_client.FormatCParser()
+        parser.feed(frame.replace(b"\x0a", b"\x0d\x0a"))  # ONLCR 假通道
+        pkt = parser.pop()
+        self.assertNotEqual(pkt, frame,
+                            "ONLCR 通道必须毁帧（0x0A → 0D 0A，内容错位）")
+        # 原样通道（exec-out）：字节级还原
+        parser2 = pc_client.FormatCParser()
+        parser2.feed(frame)
+        pkt2 = parser2.pop()
+        self.assertEqual(pkt2, frame)
+        self.assertEqual(pc_client.parse_format_c(pkt2)["payload"], payload)
+
+        # (b) 结构级：0x0A 落在长度前缀低位（payload 全 0x41，保证全帧只有
+        # 长度字段这一个 0x0A）
+        big = b"\x41" * 259  # payload_len=259 → len=266=0x010A
+        frame2 = pc_client.build_format_c(0x0001, 0x11223344, big, volume=5)
+        self.assertEqual(pc_client.u16be(frame2, 2), 266)
+        parser3 = pc_client.FormatCParser()
+        parser3.feed(frame2.replace(b"\x0a", b"\x0d\x0a"))
+        self.assertIsNone(parser3.pop(),
+                          "0x0A 进长度前缀时 ONLCR 通道必须解析失败（等不齐字节）")
+        parser4 = pc_client.FormatCParser()
+        parser4.feed(frame2)
+        self.assertEqual(parser4.pop(), frame2)
 
 
 if __name__ == "__main__":

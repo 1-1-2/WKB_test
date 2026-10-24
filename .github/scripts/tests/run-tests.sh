@@ -255,7 +255,13 @@ REPO_ROOT="$(cd "$SCRIPTS/../.." && pwd)"
 TAP_STUB="$TMP/bin/adb-tap"
 cat > "$TAP_STUB" <<'STUB_EOF'
 #!/usr/bin/env bash
-# 假 adb：专供 T14~T19 验证 AdbUdpTap 的启动/restart 行为契约。
+# 假 adb：专供 T14~T21 验证 AdbUdpTap 的启动/restart 行为契约。
+#
+# 子命令分面：pc_client 的 UDP tap 走 `adb exec-out` 回收二进制 Opus 流
+# （shell 会在设备端分配 PTY，ONLCR 把 0x0A 改写成 0D 0A 毁帧——C05 根因，
+# 见 pc_client AdbUdpTap 文档字符串）；文本命令（cat/ps/pkill）仍走 shell。
+# 本 stub 不模拟 PTY 时对两者行为一致（原样字节）；FAKE_ADB_FORCE_PTY=1
+# 时强制按 PTY 通道处理（T21c 验证"通道若是 PTY 帧必被毁"）。
 #
 # FAKE_ADB_NC_FAILS_ON: 空格分隔的调用序号列表，命中序号的 nc 调用立即退出
 #   （模拟"旧 nc 还没释放端口/新 nc 绑定失败"）；其余 nc 调用常驻（sleep）。
@@ -271,6 +277,11 @@ cat > "$TAP_STUB" <<'STUB_EOF'
 #   没有媒体端口行——验证"读得到但没 bind 上"不得误降级）。
 state_file="${FAKE_ADB_NC_STATE:-/tmp/fake_adb_tap_state}"
 
+# 记录每次调用的子命令与参数（T20：tap 必须走 exec-out，nc 绝不走 shell）
+if [ "${FAKE_ADB_ARGV_LOG:-}" ]; then
+  printf '%s %s\n' "${1:-}" "${2:-}" >> "$FAKE_ADB_ARGV_LOG"
+fi
+
 # 端口释放（pkill 命中）：从状态文件移除该端口，与 /proc/net/udp 保持一致
 port_release() {
   local port="$1" tmp="$state_file.tmp"
@@ -280,8 +291,13 @@ port_release() {
   [ -s "$state_file" ] || rm -f "$state_file"
 }
 
-if [ "${1:-}" = "shell" ]; then
-  shift
+# exec-out 与 shell 等价放行（tap 走 exec-out，文本命令走 shell；PTY 差异
+# 由 FAKE_ADB_FORCE_PTY 在 nc 分支按通道模拟，见下）
+subcmd="${1:-}"
+case "$subcmd" in
+  shell|exec-out) shift ;;
+  *) exit 0 ;;
+esac
   # pkill 的模式串里也含 "nc -u -l" 字样，必须先于 nc 匹配退出，否则挂起
   case "$*" in
     pkill*)
@@ -306,6 +322,17 @@ if [ "${1:-}" = "shell" ]; then
       for a in $*; do port="$a"; done
       port="${port//[!0-9]/}"
       [ -n "$port" ] && echo "$port" >> "$state_file"
+      # 模拟 app 发来一个二进制格式 C 帧（FAKE_ADB_NC_EMIT_FILE 指定时）：
+      # shell 通道 = 设备侧 PTY 开 ONLCR，每个 0x0A 被改写成 0D 0A（毁帧）；
+      # exec-out 无 PTY，字节原样。FAKE_ADB_FORCE_PTY=1 可强制走 ONLCR
+      # （T21c：证明"通道若是 PTY，帧必被毁"——旧实现红的证据）。
+      if [ -n "${FAKE_ADB_NC_EMIT_FILE:-}" ] && [ -f "$FAKE_ADB_NC_EMIT_FILE" ]; then
+        if [ "$subcmd" = "shell" ] || [ -n "${FAKE_ADB_FORCE_PTY:-}" ]; then
+          python3 -c 'import sys; sys.stdout.buffer.write(sys.stdin.buffer.read().replace(b"\x0a", b"\x0d\x0a"))' < "$FAKE_ADB_NC_EMIT_FILE"
+        else
+          cat "$FAKE_ADB_NC_EMIT_FILE"
+        fi
+      fi
       exec sleep 600 ;;
     "cat /proc/net/udp"|"cat /proc/net/udp6")
       case "${FAKE_ADB_UDP_PROC_MODE:-normal}" in
@@ -333,7 +360,6 @@ if [ "${1:-}" = "shell" ]; then
       exit 0 ;;
     *) exit 0 ;;
   esac
-fi
 exit 0
 STUB_EOF
 chmod +x "$TAP_STUB"
@@ -441,6 +467,78 @@ out=$(FAKE_ADB_NC_STATE="$TMP/nc_state19" FAKE_ADB_UDP_PROC_MODE=unreadable \
 [ "$rc" -ne 0 ] && ok "T19a 退出码非 0" || bad "T19a 退出码非 0" "实得 $rc"
 assert_contains "$out" "设备上 UDP 监听未就绪" "T19b 明确报告未就绪"
 assert_not_contains "$out" "降级" "T19c 进程已退出时不得降级（优先级高于 blind）"
+
+# ---------------------------------------------------------------------------
+# T20/T21：exec-out 通道回归（C05 真正根因：adb shell 的 PTY/ONLCR 毁二进制帧）
+#
+# 背景（2026-10-24 沙箱实验钉死）：`adb shell` 在设备端分配 PTY，ONLCR 把
+# 输出中每个 0x0A 改写成 0x0D 0x0A——Opus 二进制帧被毁，160 字节帧不含
+# 0x0A 的概率仅 (255/256)^160 ≈ 53%，C05 因此约一半概率红（历史上所有
+# "C05 抖动"的根因，与 app 代码改动无关）。修复：tap 改走 `adb exec-out`
+# （官方二进制通道，无 PTY，字节原样）。T20 断言子命令是 exec-out（stub
+# 记录 argv）；T21 端到端验证字节级回传，并证明"通道若是 PTY 帧必被毁"
+# （旧实现红的证据）。三层判据与 test_pc_client.py 的 ExecOutChannelTest
+# 对应：实现一旦回退到 shell，这些用例转红。
+# ---------------------------------------------------------------------------
+echo "== T20 tap 必须走 exec-out 而非 shell（C05 PTY/ONLCR 根因回归）=="
+rm -f "$TMP/nc_state20" "$TMP/argv20.log"
+out=$(FAKE_ADB_NC_STATE="$TMP/nc_state20" FAKE_ADB_ARGV_LOG="$TMP/argv20.log" \
+      python3 "$TMP/tap_start_test.py" "$REPO_ROOT/android/verify/integration" "$TAP_STUB" 2>&1); rc=$?
+assert_eq "$rc" "0" "T20a tap 启动成功（exec-out 通道）"
+assert_contains "$out" "TAP-OK" "T20b nc 进程存活"
+argv_log="$(cat "$TMP/argv20.log" 2>/dev/null)"
+assert_contains "$argv_log" "exec-out toybox nc" "T20c tap 的 nc 调用走 exec-out（无 PTY）"
+assert_not_contains "$argv_log" "shell toybox nc" "T20d nc 绝不走 shell（PTY/ONLCR 毁帧）"
+assert_contains "$argv_log" "shell cat /proc/net/udp" "T20e 文本探测仍走 shell（未被误改）"
+
+cat > "$TMP/tap_bytes_test.py" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+import pc_client
+
+# argv[2]=stub adb 路径；argv[3]=期望字节级一致的格式 C 帧文件。
+# 断言 tap 回收到的首包与文件内容字节级一致——通道若是 PTY（ONLCR 把
+# 0x0A 改写成 0D 0A）则必然不符（C05 根因的端到端判据）。
+adb = pc_client.Adb(sys.argv[2])
+tap = pc_client.AdbUdpTap(adb, 5004)
+try:
+    pkt = tap.read_packet(timeout=3.0)
+    expected = open(sys.argv[3], "rb").read()
+    assert pkt is not None, "未收到任何 UDP 包"
+    assert pkt == expected, (
+        "字节流被通道破坏（PTY/ONLCR 毁帧）：期望 %s，实得 %s"
+        % (expected.hex(), pkt.hex()))
+    print("TAP-BYTES-OK %d" % len(pkt))
+finally:
+    tap.close()
+PY
+
+echo "== T21 tap 字节级回传：exec-out 原样还原；PTY 通道必毁帧 =="
+FRAME_FILE="$TMP/opus_frame.bin"
+EMIT_FILE="$TMP/opus_emit.bin"
+PYTHONPATH="$REPO_ROOT/android/verify/integration" python3 - "$FRAME_FILE" "$EMIT_FILE" <<'PY'
+import sys
+import pc_client
+# 一个含 0x0A 的合法格式 C 帧（len=14，payload = 10 0A 20 0D 30 0A 40）
+frame = pc_client.build_format_c(0x002A, 0x01020304, b"\x10\x0a\x20\x0d\x30\x0a\x40", volume=5)
+open(sys.argv[1], "wb").write(frame)
+# emit 文件 = 帧重复 5000 份（90KB > 64KB）：tap 的 pump 用
+# read(65536)（BufferedReader 语义：凑满 65536 或 EOF 才返回），只发一帧
+# 会让 read 永久阻塞。断言只看 stream 的**首个包**（见 tap_bytes_test.py）。
+open(sys.argv[2], "wb").write(frame * 5000)
+PY
+rm -f "$TMP/nc_state21a"
+out=$(FAKE_ADB_NC_STATE="$TMP/nc_state21a" FAKE_ADB_NC_EMIT_FILE="$EMIT_FILE" \
+      python3 "$TMP/tap_bytes_test.py" "$REPO_ROOT/android/verify/integration" "$TAP_STUB" "$FRAME_FILE" 2>&1); rc=$?
+assert_eq "$rc" "0" "T21a exec-out 通道字节级还原首包（新实现绿）"
+assert_contains "$out" "TAP-BYTES-OK" "T21b 报告还原字节数"
+
+rm -f "$TMP/nc_state21c"
+out=$(FAKE_ADB_NC_STATE="$TMP/nc_state21c" FAKE_ADB_NC_EMIT_FILE="$EMIT_FILE" FAKE_ADB_FORCE_PTY=1 \
+      python3 "$TMP/tap_bytes_test.py" "$REPO_ROOT/android/verify/integration" "$TAP_STUB" "$FRAME_FILE" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "T21c 通道若是 PTY 帧必被毁（旧实现红的证据：字节级还原失败）" \
+    || bad "T21c 通道若是 PTY 帧必被毁" "PTY 通道下竟还原出了原帧？"
+assert_contains "$out" "字节流被通道破坏" "T21d 毁帧原因可定位（PTY/ONLCR）"
 
 # ---------------------------------------------------------------------------
 echo

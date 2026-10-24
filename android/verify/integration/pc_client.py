@@ -21,7 +21,8 @@ CI 拓扑（adb forward，app 看到的 TCP 对端是设备侧 127.0.0.1）：
 
     127.0.0.1:18125 ──adb forward──► 模拟器 127.0.0.1:8125（app TCP server）
     app 的 UDP 目标 = TCP 对端地址 = 127.0.0.1 → 发往 127.0.0.1:<media-port>
-    → 由模拟器内 `toybox nc -u -l -p <media-port>` 回收，字节流经 adb stdout 回传本脚本
+    → 由模拟器内 `toybox nc -u -l -p <media-port>` 回收，字节流经 adb exec-out
+      （无 PTY、不经 ONLCR，见 AdbUdpTap 文档字符串）回传本脚本
 
 用法（workflow 已装好 app 并启动服务后）：
 
@@ -86,7 +87,7 @@ EXIT_FAILED = 1
 EXIT_ENV = 2
 
 # UDP tap 的 bind 就绪探测（A 项；run 40049236444 C05 红轮根因修复）：
-# 旧实现 sleep(0.6) + proc.poll() is None 只能证明 adb shell 进程活着，不能
+# 旧实现 sleep(0.6) + proc.poll() is None 只能证明 adb 进程活着，不能
 # 证明 nc 已 bind 媒体端口（shell fork 慢/系统繁忙时会误判"启动成功"，随后 tap
 # 静默死亡，C05 红轮被误导向"app 没发包"）。现在以 /proc/net/udp(6) 出现媒体
 # 端口 hex 监听行为准（5004 → 138C）。
@@ -466,8 +467,25 @@ class AdbUdpTap:
     ICMP port-unreachable 上报给发送方，但监听就绪再 START 更接近真实场景
     （真实 PC 客户端总是先占住媒体端口）。
 
+    **为什么必须 exec-out 而不是 shell（C05 偶发失败的真正根因，2026-10-24
+    沙箱实验钉死）**：`adb shell` 会在设备端为命令分配 **PTY**，PTY 默认开启
+    **ONLCR**——输出中的每个 `0x0A` 字节都被改写成 `0x0D 0x0A`（一个字节变
+    两个，后续内容全部错位）。沙箱实测（host `nc -u -l` + python pty，发包
+    `0a 0d 41 0a 42 00 ff`）：PTY 后 `0d0a0d410d0a4200ff`（字节数增加、内容
+    错位），PIPE 后 `0a0d410a4200ff`（字节一致）。Opus 是二进制流：单个
+    160 字节帧不含 `0x0A` 的概率约 (255/256)^160 ≈ **53%**——即约 **47% 的
+    首包必然含 `0x0A`**，帧的长度前缀与实际内容错位，`FormatCParser` 解析
+    失败。这解释了历史上所有的"C05 抖动"（10-21 全绿、10-23 连续红、10-24
+    一红一绿）：同代码一红一绿，**与 android/ 的代码改动毫无关系**（UI 改造
+    是巧合，不是原因），"链路抖动""模拟器麦克风无声"等解释均为错误方向。
+    `adb exec-out` 是官方为二进制流设计的通道，不在设备端分配 PTY，字节原样
+    回传（其 stderr 不走 stdout，本类本就 `stderr=subprocess.DEVNULL`，无
+    影响）。**结论：C05 的偶发失败是 harness 缺陷，从来不是 app 缺陷。**
+    回归判据：`test_pc_client.py` 的 `ExecOutChannelTest` 与 `run-tests.sh`
+    的 T20/T21——`_start_process()` 一旦回退到 shell，这些用例转红。
+
     **bind 就绪探测（run 40049236444 根因修复）**：`sleep(0.6)` + `poll()`
-    只能证明 adb shell 进程活着，不能证明 nc 已 bind 媒体端口——shell fork
+    只能证明 adb 进程活着，不能证明 nc 已 bind 媒体端口——adb fork
     慢/系统繁忙时会误判"启动成功"，随后 tap 静默死亡，C05 红轮被误导向
     "app 没发包"。`_start_process()` 现在轮询 `/proc/net/udp(6)`，直到出现
     媒体端口的 hex 监听行（5004 → 138C）且 nc 进程存活；累计 10s 未就绪的
@@ -548,8 +566,13 @@ class AdbUdpTap:
         last_diag = "未尝试任何候选命令"
         for cmd in candidates:
             try:
+                # exec-out 而非 shell：adb shell 会在设备端分配 PTY，PTY 默认
+                # 开启 ONLCR——输出中每个 0x0A 字节被改写成 0x0D 0x0A，Opus
+                # 二进制帧被毁（C05 偶发失败的真正根因，详见类文档字符串）。
+                # exec-out 是官方为二进制流设计的通道，不在设备端分配 PTY，
+                # 字节原样回传；其 stderr 不走 stdout，本就走 DEVNULL，无影响。
                 proc = subprocess.Popen(
-                    self.adb.base + ["shell", cmd],
+                    self.adb.base + ["exec-out", cmd],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                     stdin=subprocess.DEVNULL,
@@ -736,9 +759,19 @@ class AdbUdpTap:
     # ---- 数据泵：EOF 即 tap 死亡（B 项）----
 
     def _pump(self, proc, generation):
+        # read1（单次语义）而非 read（凑满语义）：proc.stdout 是二进制管道上的
+        # io.BufferedReader，read(n) 会阻塞直到凑满 n 字节或 EOF——tap 回传实测
+        # 约 8.5KB/s，凑满 64KB 需约 7.7s，每轮阻塞都会拖过 C05 断言的 10s
+        # 观察窗；推流速率一旦掉到 <6.5KB/s，C05 即假红（帧其实到了，只是没在
+        # 窗口期内被读出）。read1 最多做一次底层 raw read，有数据即返回、不凑满，
+        # 单次语义不会拖过观察窗。FormatCParser 本就是流式重分帧，短读无副作用。
+        # getattr 回退：真实管道恒为 BufferedReader（必有 read1）；单测 mock 流
+        # 只实现 read，回退让 mock 不因缺方法炸线程，生产语义不变。
+        stream = proc.stdout
+        read_chunk = getattr(stream, "read1", stream.read)
         while True:
             try:
-                chunk = proc.stdout.read(65536)
+                chunk = read_chunk(65536)
             except OSError as e:
                 self._mark_dead("stdout 读取错误：%s" % e, proc, generation)
                 return
@@ -759,7 +792,7 @@ class AdbUdpTap:
             return
         code = proc.poll()
         if code is None:
-            # EOF 后 adb shell 可能还没退出：最多再等 1s 拿真实退出码
+            # EOF 后 adb exec-out 可能还没退出：最多再等 1s 拿真实退出码
             try:
                 code = proc.wait(timeout=1.0)
             except (subprocess.TimeoutExpired, OSError, ValueError):
