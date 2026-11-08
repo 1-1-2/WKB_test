@@ -1,0 +1,152 @@
+name: windows-e2e
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug_minutes:
+        description: 'Window length in minutes (clamped to 1-120)'
+        required: false
+        default: '15'
+        type: string
+      debug_before_a:
+        description: 'Open a window before stage A'
+        required: false
+        default: false
+        type: boolean
+      debug_before_d:
+        description: 'Open a window before stage D'
+        required: false
+        default: false
+        type: boolean
+      debug_before_g:
+        description: 'Open a window before stage G'
+        required: false
+        default: false
+        type: boolean
+      debug_after_g:
+        description: 'Open a window after stage G'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  windows-debug:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      WKB_WORKSPACE: D:\a\WKB_test\WKB_test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Debug window before A
+        if: ${{ inputs.debug_before_a }}
+        uses: ./.github/actions/tailnet-debug
+        with:
+          label: before-a
+          debug_minutes: ${{ inputs.debug_minutes }}
+          run_id: ${{ github.run_id }}
+          ts_oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts_oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
+          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
+
+      - name: Stage A - runner baseline
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "run_id      : $env:GITHUB_RUN_ID"
+          Write-Host "ref         : $env:GITHUB_REF"
+          Write-Host "workspace   : $env:GITHUB_WORKSPACE"
+          Write-Host "pwsh        : $($PSVersionTable.PSVersion)"
+          [System.Environment]::OSVersion.VersionString
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free
+
+      - name: Stage B - toolchain probe
+        shell: pwsh
+        run: |
+          foreach ($tool in @('git.exe','curl.exe','pwsh.exe','ssh.exe','scp.exe','msiexec.exe')) {
+            $c = Get-Command $tool -ErrorAction SilentlyContinue
+            if ($c) { Write-Host ("{0,-12} {1}" -f $tool, $c.Source) }
+            else    { Write-Host ("{0,-12} MISSING" -f $tool) }
+          }
+
+      - name: Stage C - prepare workspace
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          "stage=c" | Set-Content -Path (Join-Path $out 'stage.txt') -Encoding ascii
+          Get-ChildItem $out | Select-Object Name, Length
+
+      - name: Debug window before D
+        if: ${{ inputs.debug_before_d }}
+        uses: ./.github/actions/tailnet-debug
+        with:
+          label: before-d
+          debug_minutes: ${{ inputs.debug_minutes }}
+          run_id: ${{ github.run_id }}
+          ts_oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts_oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
+          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
+
+      - name: Stage D - artifact staging
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+          Get-ChildItem Env:GITHUB_* | Sort-Object Name |
+            ForEach-Object { Write-Host "$($_.Name)=$($_.Value)" }
+          "stage=d" | Add-Content -Path (Join-Path $out 'stage.txt') -Encoding ascii
+
+      - name: Stage E/F
+        shell: pwsh
+        run: |
+          Write-Host 'placeholder'
+
+      - name: Debug window before G
+        if: ${{ inputs.debug_before_g }}
+        uses: ./.github/actions/tailnet-debug
+        with:
+          label: before-g
+          debug_minutes: ${{ inputs.debug_minutes }}
+          run_id: ${{ github.run_id }}
+          ts_oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts_oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
+          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
+
+      - name: Stage G
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($ctx in @('ctx-1','ctx-2','ctx-3','ctx-4')) {
+            foreach ($case in @('case-a','case-b')) {
+              Write-Host ("probe {0,-20} {1,-8} -> PLACEHOLDER" -f $ctx, $case)
+            }
+          }
+          $out = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+          "stage=g" | Add-Content -Path (Join-Path $out 'stage.txt') -Encoding ascii
+
+      - name: Debug window after G
+        if: ${{ inputs.debug_after_g }}
+        uses: ./.github/actions/tailnet-debug
+        with:
+          label: after-g
+          debug_minutes: ${{ inputs.debug_minutes }}
+          run_id: ${{ github.run_id }}
+          ts_oauth_client_id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          ts_oauth_secret: ${{ secrets.TS_OAUTH_SECRET }}
+          debug_pubkey: ${{ vars.UPTERM_DEBUG_PUBKEY }}
+
+      - name: Stage H - finalize
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+          Get-Content (Join-Path $out 'stage.txt')
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Value '## windows-e2e finished'
+          Write-Host 'done'

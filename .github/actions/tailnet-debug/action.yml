@@ -1,0 +1,202 @@
+name: 'Tailnet Debug Window'
+description: 'Time-boxed runner debug window.'
+
+inputs:
+  label:
+    description: 'Insertion point label, used in the node hostname'
+    required: true
+  debug_minutes:
+    description: 'How long to keep the SSH window open (clamped to 1-120)'
+    required: false
+    default: '15'
+  run_id:
+    description: 'GitHub run id, used in the node hostname'
+    required: true
+  ts_oauth_client_id:
+    description: 'Tailscale CI OAuth client id (Actions Secret)'
+    required: true
+  ts_oauth_secret:
+    description: 'Tailscale CI OAuth client secret (Actions Secret)'
+    required: true
+  debug_pubkey:
+    description: 'ED25519 public key authorized on the runner (Actions Variable)'
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # ---------------------------------------------------------------- 1. Tailscale
+    - name: Install Tailscale (silent MSI)
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $exe = 'C:\Program Files\Tailscale\tailscale.exe'
+        if (-not (Test-Path $exe)) {
+          $msi = Join-Path $env:RUNNER_TEMP 'tailscale-setup.msi'
+          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' `
+                            -OutFile $msi -UseBasicParsing
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait -PassThru
+          if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
+            throw "tailscale MSI install failed with exit code $($p.ExitCode)"
+          }
+          for ($i = 0; $i -lt 30; $i++) {
+            if (Test-Path $exe) { break }
+            Start-Sleep -Seconds 2
+          }
+        }
+        if (-not (Test-Path $exe)) { throw 'tailscale.exe not found after install' }
+        & $exe version
+
+    # ---------------------------------------------------------------- 2. short-lived key
+    - name: Mint ephemeral tag:ci auth key
+      id: mint
+      shell: pwsh
+      env:
+        TS_ID: ${{ inputs.ts_oauth_client_id }}
+        TS_SEC: ${{ inputs.ts_oauth_secret }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $form = "client_id=$([uri]::EscapeDataString($env:TS_ID))&client_secret=$([uri]::EscapeDataString($env:TS_SEC))"
+        $tok = (Invoke-RestMethod -Method Post -Uri 'https://api.tailscale.com/api/v2/oauth/token' `
+                 -ContentType 'application/x-www-form-urlencoded' -Body $form).access_token
+        if (-not $tok) { throw 'failed to exchange Tailscale OAuth token' }
+        # tags must equal exactly what the CI OAuth client is allowed to mint: [tag:ci]
+        $body = @{
+          capabilities = @{ devices = @{ create = @{
+              reusable = $false
+              ephemeral = $true
+              tags      = @('tag:ci')
+          } } }
+          expirySeconds = 3600
+          description   = "womic debug window ${{ inputs.run_id }}"
+        } | ConvertTo-Json -Depth 10
+        $resp = Invoke-RestMethod -Method Post -Uri 'https://api.tailscale.com/api/v2/tailnet/-/keys' `
+                 -Headers @{ Authorization = "Bearer $tok" } `
+                 -ContentType 'application/json' -Body $body
+        if (-not $resp.key) { throw "no auth key returned: $($resp | ConvertTo-Json -Compress)" }
+        Write-Host "::add-mask::$($resp.key)"
+        "key=$($resp.key)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+    # ---------------------------------------------------------------- 3. join tailnet
+    - name: Join tailnet and wait for 100.x address
+      id: join
+      shell: pwsh
+      env:
+        TS_KEY: ${{ steps.mint.outputs.key }}
+        LABEL: ${{ inputs.label }}
+        RUN_ID: ${{ inputs.run_id }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $exe = 'C:\Program Files\Tailscale\tailscale.exe'
+        $nodeName = "womic-dbg-$env:LABEL-$env:RUN_ID"
+        & $exe up --authkey="$env:TS_KEY" --hostname="$nodeName" --accept-dns=false --unattended
+        if ($LASTEXITCODE -ne 0) { throw "tailscale up failed ($LASTEXITCODE)" }
+        # `up` does not wait for address assignment; poll up to 60s
+        $ip = ''
+        for ($i = 0; $i -lt 30; $i++) {
+          $candidate = (& $exe ip -4 2>$null | Select-Object -First 1)
+          if ($candidate) { $ip = "$candidate".Trim() }
+          if ($ip -match '^100\.') { break }
+          Start-Sleep -Seconds 2
+        }
+        if ($ip -notmatch '^100\.') { throw "no tailnet IPv4 after 60s (last='$ip')" }
+        Write-Host "runner tailnet ip: $ip  hostname: $nodeName"
+        "ip=$ip" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+        "hostname=$nodeName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+    # ---------------------------------------------------------------- 4. OpenSSH Server
+    - name: Enable OpenSSH Server and authorize debug key
+      shell: pwsh
+      env:
+        PUBKEY: ${{ inputs.debug_pubkey }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        if (-not $env:PUBKEY) { throw 'UPTERM_DEBUG_PUBKEY variable is empty' }
+        $cap = Get-WindowsCapability -Online | Where-Object { $_.Name -like 'OpenSSH.Server*' } | Select-Object -First 1
+        if (-not $cap) { throw 'OpenSSH.Server capability not found' }
+        if ($cap.State -ne 'Installed') {
+          Add-WindowsCapability -Online -Name $cap.Name | Out-Null
+        }
+        Set-Service -Name sshd -StartupType Automatic
+        Start-Service sshd
+        $sshDir = Join-Path $env:ProgramData 'ssh'
+        if (-not (Test-Path $sshDir)) { New-Item -ItemType Directory -Path $sshDir -Force | Out-Null }
+        $ak = Join-Path $sshDir 'administrators_authorized_keys'
+        Set-Content -Path $ak -Value $env:PUBKEY -Encoding ascii
+        # Windows OpenSSH requires a strict ACL on administrators_authorized_keys
+        & icacls $ak /inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F' | Out-Null
+        Restart-Service sshd
+        Get-Service sshd | Select-Object Name, Status
+
+    - name: Restrict inbound SSH to tailnet range
+      shell: pwsh
+      run: |
+        New-NetFirewallRule -DisplayName 'WKB debug SSH (tailnet only)' -Direction Inbound `
+          -Protocol TCP -LocalPort 22 -RemoteAddress '100.64.0.0/10' -Action Allow `
+          -ErrorAction SilentlyContinue | Out-Null
+        Get-NetFirewallRule -DisplayName 'WKB debug SSH (tailnet only)' | Select-Object DisplayName, Enabled
+
+    # ---------------------------------------------------------------- 5. publish + hold
+    - name: Publish SSH connection info
+      shell: pwsh
+      env:
+        IP: ${{ steps.join.outputs.ip }}
+        NODE: ${{ steps.join.outputs.hostname }}
+        MINS: ${{ inputs.debug_minutes }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $lines = @(
+          "## Windows debug window (${{ inputs.label }})"
+          ""
+          "| item | value |"
+          "| --- | --- |"
+          "| node | $env:NODE |"
+          "| tailnet IPv4 | $env:IP |"
+          "| window | $env:MINS min |"
+          "| user | runneradmin |"
+          ""
+          "Sandbox join: ``bash ts-sandbox-up.sh $env:IP``"
+          ""
+          "SSH from sandbox:"
+          '```bash'
+          "ssh -o `"ProxyCommand=tailscale --socket=/tmp/tsstate/sock nc %h %p`" \"
+          "    -o StrictHostKeyChecking=accept-new -i ~/.ssh/womic_ci_debug \"
+          "    runneradmin@$env:IP"
+          '```'
+          ""
+          "Runner workspace: ``D:\a\WKB_test\WKB_test``"
+          ""
+          "Use ``pwsh`` for .ps1 files; Windows PowerShell 5.1 reads BOM-less UTF-8 as GBK."
+        )
+        $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+        $lines | ForEach-Object { Write-Host $_ }
+
+    - name: Hold the window open
+      shell: pwsh
+      env:
+        MINS: ${{ inputs.debug_minutes }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $mins = [Math]::Max(1, [Math]::Min(120, [int]$env:MINS))
+        $end = (Get-Date).ToUniversalTime().AddMinutes($mins)
+        Write-Host "window open for $mins min, closes at $($end.ToString('o'))"
+        while ((Get-Date).ToUniversalTime() -lt $end) {
+          $left = [Math]::Ceiling(($end - (Get-Date).ToUniversalTime()).TotalMinutes)
+          Write-Host "  alive, $left min left (utc $((Get-Date).ToUniversalTime().ToString('o')))"
+          Start-Sleep -Seconds 60
+        }
+        Write-Host 'window closed, continuing workflow'
+
+    # ---------------------------------------------------------------- 6. cleanup
+    # No `always()` here: status functions are unreliable inside composite steps.
+    # If an earlier step fails the hosted VM is discarded anyway, and the
+    # ephemeral node deregisters itself, so cleanup is not safety-critical.
+    - name: Leave tailnet
+      shell: pwsh
+      run: |
+        $exe = 'C:\Program Files\Tailscale\tailscale.exe'
+        if (Test-Path $exe) {
+          & $exe down 2>$null
+          & $exe logout 2>$null
+          Write-Host 'tailscale node logged out (ephemeral node auto-removed)'
+        }
